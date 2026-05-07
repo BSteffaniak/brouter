@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use brouter_config_models::BrouterConfig;
+use brouter_config_models::{BrouterConfig, ProviderKind};
 use brouter_provider_models::{ModelId, ProviderId, RouteableModel};
 use brouter_router_models::{RoutingObjective, RoutingRule, ScoringWeights};
 use thiserror::Error;
@@ -77,6 +77,230 @@ pub fn validate_config(config: &BrouterConfig) -> Result<(), ConfigError> {
         }
     }
     Ok(())
+}
+
+/// Configuration validation warning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigWarning {
+    UnknownModelCapability {
+        model_id: String,
+        capability: String,
+    },
+    ModelMissingChatCapability {
+        model_id: String,
+    },
+    OpenAiCompatibleProviderMissingBaseUrl {
+        provider_id: String,
+    },
+    ProviderApiKeyEnvMissing {
+        provider_id: String,
+        env_var: String,
+    },
+    UnknownRuleIntent {
+        rule_name: String,
+        intent: String,
+    },
+    UnknownDefaultObjective {
+        objective: String,
+    },
+    DefaultLocalOnlyWithoutLocalModel,
+    UnknownRuleObjective {
+        rule_name: String,
+        objective: String,
+    },
+    UnknownRuleCapability {
+        rule_name: String,
+        capability: String,
+    },
+    LocalOnlyRuleWithoutLocalModel {
+        rule_name: String,
+    },
+}
+
+impl std::fmt::Display for ConfigWarning {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownModelCapability {
+                model_id,
+                capability,
+            } => {
+                write!(
+                    formatter,
+                    "model {model_id} declares unknown capability {capability}"
+                )
+            }
+            Self::ModelMissingChatCapability { model_id } => {
+                write!(
+                    formatter,
+                    "model {model_id} does not declare chat capability"
+                )
+            }
+            Self::OpenAiCompatibleProviderMissingBaseUrl { provider_id } => write!(
+                formatter,
+                "open-ai-compatible provider {provider_id} is missing base_url"
+            ),
+            Self::ProviderApiKeyEnvMissing {
+                provider_id,
+                env_var,
+            } => write!(
+                formatter,
+                "provider {provider_id} references missing environment variable {env_var}"
+            ),
+            Self::UnknownRuleIntent { rule_name, intent } => {
+                write!(
+                    formatter,
+                    "rule {rule_name} declares unknown intent {intent}"
+                )
+            }
+            Self::UnknownDefaultObjective { objective } => {
+                write!(
+                    formatter,
+                    "router declares unknown default objective {objective}"
+                )
+            }
+            Self::DefaultLocalOnlyWithoutLocalModel => write!(
+                formatter,
+                "router default objective can select local_only but no model declares local capability"
+            ),
+            Self::UnknownRuleObjective {
+                rule_name,
+                objective,
+            } => write!(
+                formatter,
+                "rule {rule_name} declares unknown objective {objective}"
+            ),
+            Self::UnknownRuleCapability {
+                rule_name,
+                capability,
+            } => write!(
+                formatter,
+                "rule {rule_name} declares unknown capability {capability}"
+            ),
+            Self::LocalOnlyRuleWithoutLocalModel { rule_name } => write!(
+                formatter,
+                "rule {rule_name} can select local_only but no model declares local capability"
+            ),
+        }
+    }
+}
+
+/// Returns non-fatal configuration validation warnings.
+#[must_use]
+pub fn validate_config_warnings(config: &BrouterConfig) -> Vec<ConfigWarning> {
+    let mut warnings = Vec::new();
+    collect_provider_warnings(config, &mut warnings);
+    collect_model_warnings(config, &mut warnings);
+    collect_rule_warnings(config, &mut warnings);
+    warnings
+}
+
+fn collect_provider_warnings(config: &BrouterConfig, warnings: &mut Vec<ConfigWarning>) {
+    for (provider_id, provider) in &config.providers {
+        if matches!(provider.kind, ProviderKind::OpenAiCompatible) && provider.base_url.is_none() {
+            warnings.push(ConfigWarning::OpenAiCompatibleProviderMissingBaseUrl {
+                provider_id: provider_id.clone(),
+            });
+        }
+        if let Some(env_var) = &provider.api_key_env
+            && std::env::var_os(env_var).is_none()
+        {
+            warnings.push(ConfigWarning::ProviderApiKeyEnvMissing {
+                provider_id: provider_id.clone(),
+                env_var: env_var.clone(),
+            });
+        }
+    }
+}
+
+fn collect_model_warnings(config: &BrouterConfig, warnings: &mut Vec<ConfigWarning>) {
+    for (model_id, model) in &config.models {
+        let mut has_chat = false;
+        for capability in &model.capabilities {
+            match capability.parse() {
+                Ok(brouter_provider_models::ModelCapability::Chat) => has_chat = true,
+                Ok(_) => {}
+                Err(_) => warnings.push(ConfigWarning::UnknownModelCapability {
+                    model_id: model_id.clone(),
+                    capability: capability.clone(),
+                }),
+            }
+        }
+        if !has_chat {
+            warnings.push(ConfigWarning::ModelMissingChatCapability {
+                model_id: model_id.clone(),
+            });
+        }
+    }
+}
+
+fn collect_rule_warnings(config: &BrouterConfig, warnings: &mut Vec<ConfigWarning>) {
+    let has_local_model = config.models.values().any(|model| {
+        model
+            .capabilities
+            .iter()
+            .any(|capability| capability == "local")
+    });
+    if !is_known_objective(&config.router.default_objective) {
+        warnings.push(ConfigWarning::UnknownDefaultObjective {
+            objective: config.router.default_objective.clone(),
+        });
+    }
+    if matches!(
+        config.router.default_objective.as_str(),
+        "local_only" | "local-only" | "local"
+    ) && !has_local_model
+    {
+        warnings.push(ConfigWarning::DefaultLocalOnlyWithoutLocalModel);
+    }
+    for rule in &config.router.rules {
+        if let Some(intent) = &rule.intent
+            && intent
+                .parse::<brouter_router_models::PromptIntent>()
+                .is_err()
+        {
+            warnings.push(ConfigWarning::UnknownRuleIntent {
+                rule_name: rule.name.clone(),
+                intent: intent.clone(),
+            });
+        }
+        if let Some(objective) = &rule.objective {
+            if !is_known_objective(objective) {
+                warnings.push(ConfigWarning::UnknownRuleObjective {
+                    rule_name: rule.name.clone(),
+                    objective: objective.clone(),
+                });
+            }
+            if matches!(objective.as_str(), "local_only" | "local-only" | "local")
+                && !has_local_model
+            {
+                warnings.push(ConfigWarning::LocalOnlyRuleWithoutLocalModel {
+                    rule_name: rule.name.clone(),
+                });
+            }
+        }
+        for capability in rule
+            .prefer_capabilities
+            .iter()
+            .chain(rule.require_capabilities.iter())
+        {
+            if capability
+                .parse::<brouter_provider_models::ModelCapability>()
+                .is_err()
+            {
+                warnings.push(ConfigWarning::UnknownRuleCapability {
+                    rule_name: rule.name.clone(),
+                    capability: capability.clone(),
+                });
+            }
+        }
+    }
+}
+
+fn is_known_objective(value: &str) -> bool {
+    matches!(
+        value,
+        "cheapest" | "fastest" | "balanced" | "strongest" | "local_only" | "local-only" | "local"
+    )
 }
 
 /// Converts router scoring configuration into concrete scoring weights.
@@ -200,7 +424,7 @@ fn inferred_quality(capabilities: &[String]) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use brouter_config_models::{ModelConfig, ProviderConfig, ProviderKind};
+    use brouter_config_models::{ModelConfig, ProviderConfig, ProviderKind, RouterRuleConfig};
 
     use super::*;
 
@@ -229,5 +453,62 @@ mod tests {
         );
 
         validate_config(&config).expect("config should be valid");
+    }
+
+    #[test]
+    fn reports_non_fatal_config_warnings() {
+        let mut config = BrouterConfig::default();
+        config.providers.insert(
+            "local".to_string(),
+            ProviderConfig {
+                kind: ProviderKind::OpenAiCompatible,
+                base_url: None,
+                api_key_env: None,
+            },
+        );
+        config.models.insert(
+            "fast".to_string(),
+            ModelConfig {
+                provider: "local".to_string(),
+                model: "llama".to_string(),
+                context_window: 8_192,
+                input_cost_per_million: 0.0,
+                output_cost_per_million: 0.0,
+                quality: None,
+                capabilities: vec!["made_up".to_string()],
+            },
+        );
+        config.router.rules.push(RouterRuleConfig {
+            name: "private".to_string(),
+            objective: Some("local_only".to_string()),
+            require_capabilities: vec!["also_made_up".to_string()],
+            ..RouterRuleConfig::default()
+        });
+
+        let warnings = validate_config_warnings(&config);
+
+        assert!(
+            warnings.contains(&ConfigWarning::OpenAiCompatibleProviderMissingBaseUrl {
+                provider_id: "local".to_string(),
+            })
+        );
+        assert!(warnings.contains(&ConfigWarning::UnknownModelCapability {
+            model_id: "fast".to_string(),
+            capability: "made_up".to_string(),
+        }));
+        assert!(
+            warnings.contains(&ConfigWarning::ModelMissingChatCapability {
+                model_id: "fast".to_string(),
+            })
+        );
+        assert!(warnings.contains(&ConfigWarning::UnknownRuleCapability {
+            rule_name: "private".to_string(),
+            capability: "also_made_up".to_string(),
+        }));
+        assert!(
+            warnings.contains(&ConfigWarning::LocalOnlyRuleWithoutLocalModel {
+                rule_name: "private".to_string(),
+            })
+        );
     }
 }

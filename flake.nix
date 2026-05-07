@@ -1,5 +1,5 @@
 {
-  description = "brouter development environment";
+  description = "brouter local LLM router";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -29,6 +29,17 @@
           inherit system;
           overlays = [ (import rust-overlay) ];
         };
+        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+          extensions = [
+            "rustfmt"
+            "clippy"
+            "rust-src"
+          ];
+        };
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = rustToolchain;
+          rustc = rustToolchain;
+        };
         cargoMachete = pkgs.rustPlatform.buildRustPackage {
           pname = "cargo-machete";
           version = "ignored-dirs";
@@ -38,15 +49,55 @@
           };
           doCheck = false;
         };
-        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-          extensions = [
-            "rustfmt"
-            "clippy"
-            "rust-src"
+        brouterPackage = rustPlatform.buildRustPackage {
+          pname = "brouter";
+          version = "0.1.0";
+          src = ./.;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            allowBuiltinFetchGit = true;
+          };
+          nativeBuildInputs = with pkgs; [ pkg-config ];
+          buildInputs =
+            with pkgs;
+            [ openssl ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [ libiconv ];
+          cargoBuildFlags = [
+            "-p"
+            "brouter_cli"
+          ];
+          cargoTestFlags = [
+            "--workspace"
           ];
         };
       in
       {
+        packages = {
+          default = brouterPackage;
+          brouter = brouterPackage;
+        };
+
+        apps =
+          let
+            app = {
+              type = "app";
+              program = "${brouterPackage}/bin/brouter";
+              meta.description = "Run the brouter CLI";
+            };
+          in
+          {
+            default = app;
+            brouter = app;
+          };
+
+        checks = {
+          package = brouterPackage;
+          example-config = pkgs.runCommand "brouter-example-config-check" { } ''
+            OPENAI_API_KEY=dummy ${brouterPackage}/bin/brouter check-config --strict --config ${./brouter.example.toml}
+            touch $out
+          '';
+        };
+
         devShells.default = pkgs.mkShell {
           buildInputs =
             with pkgs;
@@ -81,5 +132,9 @@
           '';
         };
       }
-    );
+    )
+    // {
+      nixosModules.default = import ./nix/modules/brouter.nix { inherit self; };
+      homeManagerModules.default = import ./nix/home-manager/brouter.nix { inherit self; };
+    };
 }

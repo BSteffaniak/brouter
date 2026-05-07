@@ -6,9 +6,11 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use brouter_api_models::{ChatCompletionRequest, ChatMessage, MessageContent};
-use brouter_config::{load_config, routeable_models, routing_rules, scoring_weights};
+use brouter_config::{
+    load_config, routeable_models, routing_rules, scoring_weights, validate_config_warnings,
+};
 use brouter_router::Router;
 use brouter_router_models::RoutingObjective;
 use clap::{Parser, Subcommand};
@@ -24,7 +26,7 @@ pub async fn run_cli() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve { config } => serve(&config).await,
-        Command::CheckConfig { config } => check_config(&config),
+        Command::CheckConfig { config, strict } => check_config(&config, strict),
         Command::Route {
             config,
             prompt,
@@ -49,13 +51,24 @@ async fn serve(config: &Path) -> Result<()> {
     Ok(())
 }
 
-fn check_config(config: &Path) -> Result<()> {
+fn check_config(config: &Path, strict: bool) -> Result<()> {
     let config = load_config(config)?;
+    let warnings = validate_config_warnings(&config);
     println!(
-        "config ok: {} providers, {} models",
+        "config ok: {} providers, {} models, {} warnings",
         config.providers.len(),
-        config.models.len()
+        config.models.len(),
+        warnings.len()
     );
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
+    }
+    if strict && !warnings.is_empty() {
+        bail!(
+            "strict config check failed with {} warnings",
+            warnings.len()
+        );
+    }
     Ok(())
 }
 
@@ -123,6 +136,9 @@ enum Command {
         /// Path to the brouter TOML config.
         #[arg(long, default_value = "brouter.toml")]
         config: PathBuf,
+        /// Treat validation warnings as errors.
+        #[arg(long)]
+        strict: bool,
     },
     /// Explains how a prompt would be routed.
     Route {
