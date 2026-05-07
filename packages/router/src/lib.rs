@@ -9,7 +9,7 @@ use std::cmp::Ordering;
 use brouter_api_models::ChatCompletionRequest;
 use brouter_provider_models::{ModelCapability, RouteableModel};
 use brouter_router_models::{
-    PromptFeatures, PromptIntent, ReasoningLevel, RoutingDecision, RoutingObjective,
+    PromptFeatures, PromptIntent, ReasoningLevel, RoutingDecision, RoutingObjective, RoutingRule,
     ScoredCandidate, ScoringWeights,
 };
 use thiserror::Error;
@@ -27,6 +27,7 @@ pub struct Router {
     models: Vec<RouteableModel>,
     objective: RoutingObjective,
     weights: ScoringWeights,
+    rules: Vec<RoutingRule>,
 }
 
 impl Router {
@@ -47,6 +48,23 @@ impl Router {
             models,
             objective,
             weights,
+            rules: Vec::new(),
+        }
+    }
+
+    /// Creates a deterministic router with custom scoring weights and rules.
+    #[must_use]
+    pub const fn new_with_rules(
+        models: Vec<RouteableModel>,
+        objective: RoutingObjective,
+        weights: ScoringWeights,
+        rules: Vec<RoutingRule>,
+    ) -> Self {
+        Self {
+            models,
+            objective,
+            weights,
+            rules,
         }
     }
 
@@ -68,8 +86,9 @@ impl Router {
         is_first_message: bool,
     ) -> Result<RoutingDecision, RouterError> {
         let prompt = request_prompt_text(request);
-        let features = analyze_prompt(&prompt, request, is_first_message);
-        self.route_features(features)
+        let mut features = analyze_prompt(&prompt, request, is_first_message);
+        let objective = self.apply_rules(&prompt.to_lowercase(), &mut features);
+        self.route_features_with_objective(features, objective)
     }
 
     /// Selects a model for precomputed prompt features.
@@ -79,26 +98,62 @@ impl Router {
     /// Returns an error when no configured model satisfies the requested
     /// capabilities and context window.
     pub fn route_features(&self, features: PromptFeatures) -> Result<RoutingDecision, RouterError> {
-        let mut candidates = self.scored_candidates(&features);
+        let mut features = features;
+        let objective = self.apply_rules("", &mut features);
+        self.route_features_with_objective(features, objective)
+    }
+
+    fn route_features_with_objective(
+        &self,
+        features: PromptFeatures,
+        objective: RoutingObjective,
+    ) -> Result<RoutingDecision, RouterError> {
+        let mut candidates = self.scored_candidates(&features, objective);
         candidates.sort_by(compare_candidate_scores);
         let selected = candidates.first().ok_or(RouterError::NoCandidate)?;
         let selected_model = selected.model_id.clone();
         let reasons = selected.reasons.clone();
         Ok(RoutingDecision {
             selected_model,
-            objective: self.objective,
+            objective,
             features,
             reasons,
             candidates,
         })
     }
 
-    fn scored_candidates(&self, features: &PromptFeatures) -> Vec<ScoredCandidate> {
+    fn scored_candidates(
+        &self,
+        features: &PromptFeatures,
+        objective: RoutingObjective,
+    ) -> Vec<ScoredCandidate> {
         self.models
             .iter()
-            .filter(|model| model_satisfies_features(model, features, self.objective))
-            .map(|model| score_model(model, features, self.objective, self.weights))
+            .filter(|model| model_satisfies_features(model, features, objective))
+            .map(|model| score_model(model, features, objective, self.weights))
             .collect()
+    }
+
+    fn apply_rules(&self, lower_prompt: &str, features: &mut PromptFeatures) -> RoutingObjective {
+        let mut objective = self.objective;
+        for rule in &self.rules {
+            if !rule_matches(rule, lower_prompt, features.intent) {
+                continue;
+            }
+            features.matched_rules.push(rule.name.clone());
+            append_unique_capabilities(
+                &mut features.required_capabilities,
+                &rule.require_capabilities,
+            );
+            append_unique_capabilities(
+                &mut features.preferred_capabilities,
+                &rule.prefer_capabilities,
+            );
+            if let Some(rule_objective) = rule.objective {
+                objective = rule_objective;
+            }
+        }
+        objective
     }
 }
 
@@ -145,6 +200,8 @@ fn analyze_prompt(
         reasoning,
         estimated_input_tokens: estimate_tokens(prompt),
         required_capabilities,
+        preferred_capabilities: Vec::new(),
+        matched_rules: Vec::new(),
         is_first_message,
     }
 }
@@ -214,6 +271,27 @@ fn required_capabilities(intent: PromptIntent, reasoning: ReasoningLevel) -> Vec
     capabilities
 }
 
+fn rule_matches(rule: &RoutingRule, lower_prompt: &str, intent: PromptIntent) -> bool {
+    let intent_matches = rule.intent.is_none_or(|rule_intent| rule_intent == intent);
+    let contains_matches = rule.when_contains.is_empty()
+        || rule
+            .when_contains
+            .iter()
+            .any(|needle| lower_prompt.contains(needle));
+    intent_matches && contains_matches
+}
+
+fn append_unique_capabilities(
+    capabilities: &mut Vec<ModelCapability>,
+    additions: &[ModelCapability],
+) {
+    for capability in additions {
+        if !capabilities.contains(capability) {
+            capabilities.push(*capability);
+        }
+    }
+}
+
 fn contains_any(prompt: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| prompt.contains(needle))
 }
@@ -259,6 +337,7 @@ fn score_model(
         &mut score,
         &mut reasons,
     );
+    apply_preferred_capabilities(model, features, weights, &mut score, &mut reasons);
     apply_session_bias(features, weights, &mut score, &mut reasons);
 
     ScoredCandidate {
@@ -325,6 +404,21 @@ fn apply_objective(
     }
 }
 
+fn apply_preferred_capabilities(
+    model: &RouteableModel,
+    features: &PromptFeatures,
+    weights: ScoringWeights,
+    score: &mut f64,
+    reasons: &mut Vec<String>,
+) {
+    for capability in &features.preferred_capabilities {
+        if model.has_capability(*capability) {
+            *score += weights.reasoning_bonus / 2.0;
+            reasons.push(format!("matched preferred capability {capability:?}"));
+        }
+    }
+}
+
 fn apply_session_bias(
     features: &PromptFeatures,
     weights: ScoringWeights,
@@ -363,11 +457,44 @@ mod tests {
     #[test]
     fn chooses_code_model_for_rust_prompt() {
         let router = Router::new(test_models(), RoutingObjective::Balanced);
-        let request = ChatCompletionRequest {
+        let decision = router
+            .route_chat(&chat_request("debug this Rust compile error"), true)
+            .expect("router should choose a model");
+
+        assert_eq!(decision.selected_model, ModelId::new("coder"));
+    }
+
+    #[test]
+    fn rule_can_force_local_only_for_private_prompts() {
+        let router = Router::new_with_rules(
+            test_models(),
+            RoutingObjective::Balanced,
+            ScoringWeights::default(),
+            vec![RoutingRule {
+                name: "private-local".to_string(),
+                when_contains: vec!["secret".to_string()],
+                intent: None,
+                objective: Some(RoutingObjective::LocalOnly),
+                prefer_capabilities: Vec::new(),
+                require_capabilities: vec![ModelCapability::Local],
+            }],
+        );
+
+        let decision = router
+            .route_chat(&chat_request("summarize this secret"), true)
+            .expect("router should choose local model");
+
+        assert_eq!(decision.selected_model, ModelId::new("general"));
+        assert_eq!(decision.objective, RoutingObjective::LocalOnly);
+        assert_eq!(decision.features.matched_rules, vec!["private-local"]);
+    }
+
+    fn chat_request(prompt: &str) -> ChatCompletionRequest {
+        ChatCompletionRequest {
             model: "auto".to_string(),
             messages: vec![ChatMessage {
                 role: "user".to_string(),
-                content: MessageContent::Text("debug this Rust compile error".to_string()),
+                content: MessageContent::Text(prompt.to_string()),
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -380,13 +507,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             metadata: None,
-        };
-
-        let decision = router
-            .route_chat(&request, true)
-            .expect("router should choose a model");
-
-        assert_eq!(decision.selected_model, ModelId::new("coder"));
+        }
     }
 
     fn test_models() -> Vec<RouteableModel> {

@@ -16,6 +16,17 @@ first_message_reasoning_bonus = 8.0
 code_bonus = 15.0
 reasoning_bonus = 20.0
 
+[[router.rules]]
+name = "private-local"
+when_contains = ["secret", "private key", "credentials"]
+objective = "local_only"
+require_capabilities = ["local"]
+
+[[router.rules]]
+name = "debug-code-reasoning"
+intent = "debugging"
+prefer_capabilities = ["reasoning"]
+
 [telemetry]
 database_path = "brouter.db"
 

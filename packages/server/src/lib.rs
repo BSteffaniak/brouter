@@ -15,7 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router as AxumRouter};
 use brouter_api_models::{ChatCompletionRequest, ErrorResponse, ModelListResponse, ModelObject};
-use brouter_config::{ConfigError, routeable_models, scoring_weights};
+use brouter_config::{ConfigError, routeable_models, routing_rules, scoring_weights};
 use brouter_config_models::BrouterConfig;
 use brouter_provider::{ProviderClient, ProviderRegistry};
 use brouter_provider_models::{ModelId, RouteableModel};
@@ -90,8 +90,12 @@ pub async fn serve(config: BrouterConfig) -> Result<(), ServerError> {
 
 fn build_app(config: &BrouterConfig, telemetry: TelemetryStore) -> AxumRouter {
     let objective = RoutingObjective::from_name(&config.router.default_objective);
-    let router =
-        Router::new_with_scoring(routeable_models(config), objective, scoring_weights(config));
+    let router = Router::new_with_rules(
+        routeable_models(config),
+        objective,
+        scoring_weights(config),
+        routing_rules(config),
+    );
     let state = AppState {
         router,
         providers: ProviderRegistry::from_config(config),

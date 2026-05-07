@@ -8,7 +8,7 @@ use std::path::Path;
 
 use brouter_config_models::BrouterConfig;
 use brouter_provider_models::{ModelId, ProviderId, RouteableModel};
-use brouter_router_models::ScoringWeights;
+use brouter_router_models::{RoutingObjective, RoutingRule, ScoringWeights};
 use thiserror::Error;
 
 /// Configuration loading and validation error.
@@ -125,6 +125,39 @@ pub fn scoring_weights(config: &BrouterConfig) -> ScoringWeights {
             .reasoning_bonus
             .unwrap_or(defaults.reasoning_bonus),
     }
+}
+
+/// Converts configured router rules into runtime routing rules.
+#[must_use]
+pub fn routing_rules(config: &BrouterConfig) -> Vec<RoutingRule> {
+    config
+        .router
+        .rules
+        .iter()
+        .map(|rule| RoutingRule {
+            name: rule.name.clone(),
+            when_contains: rule
+                .when_contains
+                .iter()
+                .map(|value| value.to_lowercase())
+                .collect(),
+            intent: rule
+                .intent
+                .as_deref()
+                .and_then(|intent| intent.parse().ok()),
+            objective: rule.objective.as_deref().map(RoutingObjective::from_name),
+            prefer_capabilities: rule
+                .prefer_capabilities
+                .iter()
+                .filter_map(|capability| capability.parse().ok())
+                .collect(),
+            require_capabilities: rule
+                .require_capabilities
+                .iter()
+                .filter_map(|capability| capability.parse().ok())
+                .collect(),
+        })
+        .collect()
 }
 
 /// Converts configured models into router candidates.

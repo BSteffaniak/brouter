@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use brouter_api_models::{ChatCompletionRequest, ChatMessage, MessageContent};
-use brouter_config::{load_config, routeable_models, scoring_weights};
+use brouter_config::{load_config, routeable_models, routing_rules, scoring_weights};
 use brouter_router::Router;
 use brouter_router_models::RoutingObjective;
 use clap::{Parser, Subcommand};
@@ -70,10 +70,11 @@ fn explain_route(
         || RoutingObjective::from_name(&config.router.default_objective),
         RoutingObjective::from_name,
     );
-    let router = Router::new_with_scoring(
+    let router = Router::new_with_rules(
         routeable_models(&config),
         objective,
         scoring_weights(&config),
+        routing_rules(&config),
     );
     let decision = router.route_chat(&prompt_request(prompt), first_message)?;
     println!("{}", serde_json::to_string_pretty(&decision)?);

@@ -67,6 +67,8 @@ pub struct RouterConfig {
     #[serde(default)]
     pub scoring: ScoringConfig,
     #[serde(default)]
+    pub rules: Vec<RouterRuleConfig>,
+    #[serde(default)]
     pub classifier: Option<ClassifierConfig>,
 }
 
@@ -76,6 +78,7 @@ impl Default for RouterConfig {
             default_objective: default_objective(),
             debug_headers: false,
             scoring: ScoringConfig::default(),
+            rules: Vec::new(),
             classifier: None,
         }
     }
@@ -104,6 +107,22 @@ pub struct ScoringConfig {
     pub code_bonus: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_bonus: Option<f64>,
+}
+
+/// Configurable router rule.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouterRuleConfig {
+    pub name: String,
+    #[serde(default)]
+    pub when_contains: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    #[serde(default)]
+    pub prefer_capabilities: Vec<String>,
+    #[serde(default)]
+    pub require_capabilities: Vec<String>,
 }
 
 /// Optional prompt classifier configuration.

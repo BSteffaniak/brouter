@@ -42,6 +42,37 @@ pub enum RoutingObjective {
     LocalOnly,
 }
 
+impl std::str::FromStr for PromptIntent {
+    type Err = ParsePromptIntentError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "general" => Ok(Self::General),
+            "coding" | "code" => Ok(Self::Coding),
+            "debugging" | "debug" => Ok(Self::Debugging),
+            "summarization" | "summary" => Ok(Self::Summarization),
+            "extraction" | "extract" => Ok(Self::Extraction),
+            "planning" | "plan" => Ok(Self::Planning),
+            "creative" => Ok(Self::Creative),
+            "math" => Ok(Self::Math),
+            "agentic" | "agent" => Ok(Self::Agentic),
+            _ => Err(ParsePromptIntentError),
+        }
+    }
+}
+
+/// Error returned when parsing a prompt intent fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsePromptIntentError;
+
+impl std::fmt::Display for ParsePromptIntentError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("unknown prompt intent")
+    }
+}
+
+impl std::error::Error for ParsePromptIntentError {}
+
 impl RoutingObjective {
     /// Parses a routing objective from configuration or CLI input.
     #[must_use]
@@ -84,6 +115,17 @@ impl Default for ScoringWeights {
     }
 }
 
+/// Configurable routing rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutingRule {
+    pub name: String,
+    pub when_contains: Vec<String>,
+    pub intent: Option<PromptIntent>,
+    pub objective: Option<RoutingObjective>,
+    pub prefer_capabilities: Vec<ModelCapability>,
+    pub require_capabilities: Vec<ModelCapability>,
+}
+
 /// Prompt features extracted before candidate scoring.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptFeatures {
@@ -91,6 +133,8 @@ pub struct PromptFeatures {
     pub reasoning: ReasoningLevel,
     pub estimated_input_tokens: u32,
     pub required_capabilities: Vec<ModelCapability>,
+    pub preferred_capabilities: Vec<ModelCapability>,
+    pub matched_rules: Vec<String>,
     pub is_first_message: bool,
 }
 

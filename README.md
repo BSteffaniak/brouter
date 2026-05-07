@@ -26,7 +26,8 @@ patterns used by the sibling projects in this checkout.
 
 `/v1/chat/completions` supports non-streaming and streaming OpenAI-compatible
 upstreams, fallback attempts for retryable failures, Anthropic non-streaming
-conversion, and optional SQLite telemetry via `switchy_database`.
+conversion, configurable scoring/routing rules, and optional SQLite telemetry via
+`switchy_database`.
 
 ## Development
 
