@@ -8,6 +8,7 @@ use std::path::Path;
 
 use brouter_config_models::BrouterConfig;
 use brouter_provider_models::{ModelId, ProviderId, RouteableModel};
+use brouter_router_models::ScoringWeights;
 use thiserror::Error;
 
 /// Configuration loading and validation error.
@@ -76,6 +77,54 @@ pub fn validate_config(config: &BrouterConfig) -> Result<(), ConfigError> {
         }
     }
     Ok(())
+}
+
+/// Converts router scoring configuration into concrete scoring weights.
+#[must_use]
+pub fn scoring_weights(config: &BrouterConfig) -> ScoringWeights {
+    let defaults = ScoringWeights::default();
+    ScoringWeights {
+        quality_weight: config
+            .router
+            .scoring
+            .quality_weight
+            .unwrap_or(defaults.quality_weight),
+        balanced_cost_weight: config
+            .router
+            .scoring
+            .balanced_cost_weight
+            .unwrap_or(defaults.balanced_cost_weight),
+        cheapest_cost_weight: config
+            .router
+            .scoring
+            .cheapest_cost_weight
+            .unwrap_or(defaults.cheapest_cost_weight),
+        local_bonus: config
+            .router
+            .scoring
+            .local_bonus
+            .unwrap_or(defaults.local_bonus),
+        strongest_quality_weight: config
+            .router
+            .scoring
+            .strongest_quality_weight
+            .unwrap_or(defaults.strongest_quality_weight),
+        first_message_reasoning_bonus: config
+            .router
+            .scoring
+            .first_message_reasoning_bonus
+            .unwrap_or(defaults.first_message_reasoning_bonus),
+        code_bonus: config
+            .router
+            .scoring
+            .code_bonus
+            .unwrap_or(defaults.code_bonus),
+        reasoning_bonus: config
+            .router
+            .scoring
+            .reasoning_bonus
+            .unwrap_or(defaults.reasoning_bonus),
+    }
 }
 
 /// Converts configured models into router candidates.

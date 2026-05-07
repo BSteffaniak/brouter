@@ -56,6 +56,34 @@ impl RoutingObjective {
     }
 }
 
+/// Candidate scoring weights.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ScoringWeights {
+    pub quality_weight: f64,
+    pub balanced_cost_weight: f64,
+    pub cheapest_cost_weight: f64,
+    pub local_bonus: f64,
+    pub strongest_quality_weight: f64,
+    pub first_message_reasoning_bonus: f64,
+    pub code_bonus: f64,
+    pub reasoning_bonus: f64,
+}
+
+impl Default for ScoringWeights {
+    fn default() -> Self {
+        Self {
+            quality_weight: 1.0,
+            balanced_cost_weight: 20.0,
+            cheapest_cost_weight: 100.0,
+            local_bonus: 10.0,
+            strongest_quality_weight: 0.5,
+            first_message_reasoning_bonus: 8.0,
+            code_bonus: 15.0,
+            reasoning_bonus: 20.0,
+        }
+    }
+}
+
 /// Prompt features extracted before candidate scoring.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptFeatures {

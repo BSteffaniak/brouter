@@ -6,6 +6,16 @@ port = 8080
 default_objective = "balanced"
 debug_headers = true
 
+[router.scoring]
+quality_weight = 1.0
+balanced_cost_weight = 20.0
+cheapest_cost_weight = 100.0
+local_bonus = 10.0
+strongest_quality_weight = 0.5
+first_message_reasoning_bonus = 8.0
+code_bonus = 15.0
+reasoning_bonus = 20.0
+
 [telemetry]
 database_path = "brouter.db"
 

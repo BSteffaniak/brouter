@@ -14,7 +14,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router as AxumRouter};
 use brouter_api_models::{ChatCompletionRequest, ErrorResponse, ModelListResponse, ModelObject};
-use brouter_config::{ConfigError, routeable_models};
+use brouter_config::{ConfigError, routeable_models, scoring_weights};
 use brouter_config_models::BrouterConfig;
 use brouter_provider::{ProviderClient, ProviderRegistry};
 use brouter_provider_models::{ModelId, RouteableModel};
@@ -77,7 +77,8 @@ pub async fn serve(config: BrouterConfig) -> Result<(), ServerError> {
 
 fn build_app(config: &BrouterConfig, telemetry: TelemetryStore) -> AxumRouter {
     let objective = RoutingObjective::from_name(&config.router.default_objective);
-    let router = Router::new(routeable_models(config), objective);
+    let router =
+        Router::new_with_scoring(routeable_models(config), objective, scoring_weights(config));
     let state = AppState {
         router,
         providers: ProviderRegistry::from_config(config),
@@ -198,7 +199,7 @@ async fn forward_streaming_with_fallbacks(
                 }
 
                 if status.is_success() || !should_try_fallback(status) {
-                    let mut response_headers = HeaderMap::new();
+                    let mut response_headers = route_headers(&model, &candidate.model_id, decision);
                     response_headers.insert(
                         header::CONTENT_TYPE,
                         HeaderValue::from_static("text/event-stream"),
@@ -274,7 +275,9 @@ async fn forward_with_fallbacks(
                 }
 
                 if status.is_success() || !should_try_fallback(status) {
-                    return (status, Json(provider_response.body)).into_response();
+                    let response_headers = route_headers(&model, &candidate.model_id, decision);
+                    return (status, response_headers, Json(provider_response.body))
+                        .into_response();
                 }
                 last_response = Some((status, provider_response.body));
             }
@@ -328,6 +331,41 @@ fn model_by_id(
 
 fn should_try_fallback(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+fn route_headers(
+    model: &RouteableModel,
+    attempted_model_id: &ModelId,
+    decision: &RoutingDecision,
+) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    insert_header(&mut headers, "x-brouter-selected-model", model.id.as_str());
+    insert_header(&mut headers, "x-brouter-provider", model.provider.as_str());
+    insert_header(
+        &mut headers,
+        "x-brouter-upstream-model",
+        &model.upstream_model,
+    );
+    insert_header(
+        &mut headers,
+        "x-brouter-fallback-used",
+        fallback_used(attempted_model_id, decision),
+    );
+    headers
+}
+
+fn fallback_used(attempted_model_id: &ModelId, decision: &RoutingDecision) -> &'static str {
+    if attempted_model_id == &decision.selected_model {
+        "false"
+    } else {
+        "true"
+    }
+}
+
+fn insert_header(headers: &mut HeaderMap, name: &'static str, value: &str) {
+    if let Ok(value) = HeaderValue::from_str(value) {
+        headers.insert(name, value);
+    }
 }
 
 async fn route_request(

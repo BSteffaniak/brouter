@@ -440,6 +440,7 @@ version = "0.1.0"
 dependencies = [
  "brouter_config_models",
  "brouter_provider_models",
+ "brouter_router_models",
  "thiserror",
  "toml",
 ]
@@ -455,12 +456,14 @@ dependencies = [
 name = "brouter_provider"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "brouter_api_models",
  "brouter_config_models",
  "brouter_provider_models",
  "reqwest",
  "serde_json",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

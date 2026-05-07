@@ -22,6 +22,11 @@ patterns used by the sibling projects in this checkout.
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 - `POST /v1/brouter/route/explain`
+- `GET /v1/brouter/usage`
+
+`/v1/chat/completions` supports non-streaming and streaming OpenAI-compatible
+upstreams, fallback attempts for retryable failures, Anthropic non-streaming
+conversion, and optional SQLite telemetry via `switchy_database`.
 
 ## Development
 

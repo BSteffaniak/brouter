@@ -10,7 +10,7 @@ use brouter_api_models::ChatCompletionRequest;
 use brouter_provider_models::{ModelCapability, RouteableModel};
 use brouter_router_models::{
     PromptFeatures, PromptIntent, ReasoningLevel, RoutingDecision, RoutingObjective,
-    ScoredCandidate,
+    ScoredCandidate, ScoringWeights,
 };
 use thiserror::Error;
 
@@ -26,13 +26,28 @@ pub enum RouterError {
 pub struct Router {
     models: Vec<RouteableModel>,
     objective: RoutingObjective,
+    weights: ScoringWeights,
 }
 
 impl Router {
     /// Creates a deterministic router.
     #[must_use]
-    pub const fn new(models: Vec<RouteableModel>, objective: RoutingObjective) -> Self {
-        Self { models, objective }
+    pub fn new(models: Vec<RouteableModel>, objective: RoutingObjective) -> Self {
+        Self::new_with_scoring(models, objective, ScoringWeights::default())
+    }
+
+    /// Creates a deterministic router with custom scoring weights.
+    #[must_use]
+    pub const fn new_with_scoring(
+        models: Vec<RouteableModel>,
+        objective: RoutingObjective,
+        weights: ScoringWeights,
+    ) -> Self {
+        Self {
+            models,
+            objective,
+            weights,
+        }
     }
 
     /// Returns configured routeable models.
@@ -82,7 +97,7 @@ impl Router {
         self.models
             .iter()
             .filter(|model| model_satisfies_features(model, features, self.objective))
-            .map(|model| score_model(model, features, self.objective))
+            .map(|model| score_model(model, features, self.objective, self.weights))
             .collect()
     }
 }
@@ -230,13 +245,21 @@ fn score_model(
     model: &RouteableModel,
     features: &PromptFeatures,
     objective: RoutingObjective,
+    weights: ScoringWeights,
 ) -> ScoredCandidate {
     let estimated_cost = estimate_cost(model, features.estimated_input_tokens);
-    let mut score = base_quality_score(model, features);
+    let mut score = base_quality_score(model, features, weights);
     let mut reasons = vec![format!("quality score {}", model.quality)];
 
-    apply_objective(model, objective, estimated_cost, &mut score, &mut reasons);
-    apply_session_bias(features, &mut score, &mut reasons);
+    apply_objective(
+        model,
+        objective,
+        estimated_cost,
+        weights,
+        &mut score,
+        &mut reasons,
+    );
+    apply_session_bias(features, weights, &mut score, &mut reasons);
 
     ScoredCandidate {
         model_id: model.id.clone(),
@@ -246,20 +269,24 @@ fn score_model(
     }
 }
 
-fn base_quality_score(model: &RouteableModel, features: &PromptFeatures) -> f64 {
-    let mut score = f64::from(model.quality);
+fn base_quality_score(
+    model: &RouteableModel,
+    features: &PromptFeatures,
+    weights: ScoringWeights,
+) -> f64 {
+    let mut score = f64::from(model.quality) * weights.quality_weight;
     if model.has_capability(ModelCapability::Code)
         && matches!(
             features.intent,
             PromptIntent::Coding | PromptIntent::Debugging
         )
     {
-        score += 15.0;
+        score += weights.code_bonus;
     }
     if model.has_capability(ModelCapability::Reasoning)
         && matches!(features.reasoning, ReasoningLevel::High)
     {
-        score += 20.0;
+        score += weights.reasoning_bonus;
     }
     score
 }
@@ -268,38 +295,44 @@ fn apply_objective(
     model: &RouteableModel,
     objective: RoutingObjective,
     estimated_cost: f64,
+    weights: ScoringWeights,
     score: &mut f64,
     reasons: &mut Vec<String>,
 ) {
     match objective {
         RoutingObjective::Cheapest => {
-            *score -= estimated_cost * 100.0;
+            *score -= estimated_cost * weights.cheapest_cost_weight;
             reasons.push("cheapest objective penalized cost".to_string());
         }
         RoutingObjective::Fastest => {
             if model.has_capability(ModelCapability::Local) {
-                *score += 10.0;
+                *score += weights.local_bonus;
                 reasons.push("fastest objective preferred local model".to_string());
             }
         }
         RoutingObjective::Strongest => {
-            *score += f64::from(model.quality) / 2.0;
+            *score += f64::from(model.quality) * weights.strongest_quality_weight;
             reasons.push("strongest objective boosted quality".to_string());
         }
         RoutingObjective::LocalOnly => {
-            *score += 5.0;
+            *score += weights.local_bonus / 2.0;
             reasons.push("local-only objective matched local model".to_string());
         }
         RoutingObjective::Balanced => {
-            *score -= estimated_cost * 20.0;
+            *score -= estimated_cost * weights.balanced_cost_weight;
             reasons.push("balanced objective considered cost".to_string());
         }
     }
 }
 
-fn apply_session_bias(features: &PromptFeatures, score: &mut f64, reasons: &mut Vec<String>) {
+fn apply_session_bias(
+    features: &PromptFeatures,
+    weights: ScoringWeights,
+    score: &mut f64,
+    reasons: &mut Vec<String>,
+) {
     if features.is_first_message && features.reasoning >= ReasoningLevel::Medium {
-        *score += 8.0;
+        *score += weights.first_message_reasoning_bonus;
         reasons.push("first complex message favored stronger model".to_string());
     }
 }

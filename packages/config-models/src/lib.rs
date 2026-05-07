@@ -58,12 +58,14 @@ const fn default_port() -> u16 {
 }
 
 /// Router behavior configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RouterConfig {
     #[serde(default = "default_objective")]
     pub default_objective: String,
     #[serde(default)]
     pub debug_headers: bool,
+    #[serde(default)]
+    pub scoring: ScoringConfig,
     #[serde(default)]
     pub classifier: Option<ClassifierConfig>,
 }
@@ -73,6 +75,7 @@ impl Default for RouterConfig {
         Self {
             default_objective: default_objective(),
             debug_headers: false,
+            scoring: ScoringConfig::default(),
             classifier: None,
         }
     }
@@ -80,6 +83,27 @@ impl Default for RouterConfig {
 
 fn default_objective() -> String {
     "balanced".to_string()
+}
+
+/// Router scoring overrides.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ScoringConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality_weight: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balanced_cost_weight: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cheapest_cost_weight: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_bonus: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strongest_quality_weight: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_message_reasoning_bonus: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_bonus: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_bonus: Option<f64>,
 }
 
 /// Optional prompt classifier configuration.

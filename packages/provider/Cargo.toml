@@ -18,6 +18,10 @@ reqwest                 = { workspace = true, features = ["json", "rustls-tls", 
 serde_json              = { workspace = true, features = ["std"] }
 thiserror               = { workspace = true }
 
+[dev-dependencies]
+axum  = { workspace = true, features = ["http1", "json", "tokio"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+
 [features]
 default = []
 fail-on-warnings = [
