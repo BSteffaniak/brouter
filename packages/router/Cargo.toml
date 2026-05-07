@@ -1,0 +1,25 @@
+[package]
+authors     = { workspace = true }
+categories  = ["algorithms"]
+description = "Prompt analysis and model routing engine for brouter"
+edition     = { workspace = true }
+keywords    = ["llm", "router", "routing"]
+license     = { workspace = true }
+name        = "brouter_router"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+brouter_api_models      = { workspace = true }
+brouter_provider_models = { workspace = true }
+brouter_router_models   = { workspace = true }
+thiserror               = { workspace = true }
+
+[features]
+default = []
+fail-on-warnings = [
+    "brouter_api_models/fail-on-warnings",
+    "brouter_provider_models/fail-on-warnings",
+    "brouter_router_models/fail-on-warnings",
+]

@@ -1,0 +1,41 @@
+[package]
+authors     = { workspace = true }
+categories  = ["web-programming"]
+description = "HTTP server for brouter"
+edition     = { workspace = true }
+keywords    = ["http", "llm", "router"]
+license     = { workspace = true }
+name        = "brouter_server"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+axum                     = { workspace = true, features = ["http1", "json", "tokio"] }
+brouter_api_models       = { workspace = true }
+brouter_config           = { workspace = true }
+brouter_config_models    = { workspace = true }
+brouter_provider         = { workspace = true }
+brouter_provider_models  = { workspace = true }
+brouter_router           = { workspace = true }
+brouter_router_models    = { workspace = true }
+brouter_telemetry        = { workspace = true }
+brouter_telemetry_models = { workspace = true }
+serde                    = { workspace = true, features = ["derive", "std"] }
+thiserror                = { workspace = true }
+tokio                    = { workspace = true, features = ["net"] }
+tracing                  = { workspace = true }
+
+[features]
+default = []
+fail-on-warnings = [
+    "brouter_api_models/fail-on-warnings",
+    "brouter_config/fail-on-warnings",
+    "brouter_config_models/fail-on-warnings",
+    "brouter_provider/fail-on-warnings",
+    "brouter_provider_models/fail-on-warnings",
+    "brouter_router/fail-on-warnings",
+    "brouter_router_models/fail-on-warnings",
+    "brouter_telemetry/fail-on-warnings",
+    "brouter_telemetry_models/fail-on-warnings",
+]

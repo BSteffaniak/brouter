@@ -1,0 +1,19 @@
+[package]
+authors     = { workspace = true }
+categories  = ["api-bindings", "web-programming"]
+description = "OpenAI-compatible API models for brouter"
+edition     = { workspace = true }
+keywords    = ["api", "llm", "models", "openai"]
+license     = { workspace = true }
+name        = "brouter_api_models"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde      = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+
+[features]
+default          = []
+fail-on-warnings = []

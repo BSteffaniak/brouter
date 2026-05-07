@@ -1,0 +1,46 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-utilities", "development-tools"]
+description = "Command-line interface for brouter"
+edition     = { workspace = true }
+keywords    = ["cli", "llm", "router"]
+license     = { workspace = true }
+name        = "brouter_cli"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+name = "brouter_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "brouter"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true, features = ["std"] }
+brouter_api_models = { workspace = true }
+brouter_config = { workspace = true }
+brouter_router = { workspace = true }
+brouter_router_models = { workspace = true }
+brouter_server = { workspace = true }
+clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
+serde_json = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { workspace = true, features = [
+    "ansi",
+    "env-filter",
+    "fmt",
+    "std",
+] }
+
+[features]
+default = []
+fail-on-warnings = [
+    "brouter_api_models/fail-on-warnings",
+    "brouter_config/fail-on-warnings",
+    "brouter_router/fail-on-warnings",
+    "brouter_router_models/fail-on-warnings",
+    "brouter_server/fail-on-warnings",
+]

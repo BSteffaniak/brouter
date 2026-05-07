@@ -1,0 +1,7 @@
+target/
+.DS_Store
+.direnv/
+.env
+.env*.local
+*.db
+*.bak

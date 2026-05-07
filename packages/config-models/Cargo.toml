@@ -1,0 +1,18 @@
+[package]
+authors     = { workspace = true }
+categories  = ["config"]
+description = "Configuration data models for brouter"
+edition     = { workspace = true }
+keywords    = ["config", "llm", "models"]
+license     = { workspace = true }
+name        = "brouter_config_models"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std"] }
+
+[features]
+default          = []
+fail-on-warnings = []

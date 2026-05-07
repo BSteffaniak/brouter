@@ -1,0 +1,57 @@
+[workspace]
+members = [
+    "packages/api-models",
+    "packages/brouter",
+    "packages/cli",
+    "packages/config",
+    "packages/config-models",
+    "packages/provider",
+    "packages/provider-models",
+    "packages/router",
+    "packages/router-models",
+    "packages/server",
+    "packages/telemetry",
+    "packages/telemetry-models",
+]
+resolver = "2"
+
+[profile.release]
+codegen-units = 1
+lto           = false
+opt-level     = 3
+strip         = "symbols"
+
+[workspace.package]
+authors    = ["Braden Steffaniak"]
+edition    = "2024"
+license    = "MPL-2.0"
+repository = "https://github.com/BSteffaniak/brouter"
+version    = "0.1.0"
+
+[workspace.dependencies]
+# Internal brouter packages
+brouter                  = { version = "0.1.0", default-features = false, path = "packages/brouter" }
+brouter_api_models       = { version = "0.1.0", default-features = false, path = "packages/api-models" }
+brouter_cli              = { version = "0.1.0", default-features = false, path = "packages/cli" }
+brouter_config           = { version = "0.1.0", default-features = false, path = "packages/config" }
+brouter_config_models    = { version = "0.1.0", default-features = false, path = "packages/config-models" }
+brouter_provider         = { version = "0.1.0", default-features = false, path = "packages/provider" }
+brouter_provider_models  = { version = "0.1.0", default-features = false, path = "packages/provider-models" }
+brouter_router           = { version = "0.1.0", default-features = false, path = "packages/router" }
+brouter_router_models    = { version = "0.1.0", default-features = false, path = "packages/router-models" }
+brouter_server           = { version = "0.1.0", default-features = false, path = "packages/server" }
+brouter_telemetry        = { version = "0.1.0", default-features = false, path = "packages/telemetry" }
+brouter_telemetry_models = { version = "0.1.0", default-features = false, path = "packages/telemetry-models" }
+
+# External dependencies
+anyhow             = { version = "1.0.98", default-features = false }
+axum               = { version = "0.8.4", default-features = false }
+clap               = { version = "4.5.40", default-features = false }
+reqwest            = { version = "0.12.28", default-features = false }
+serde              = { version = "1.0.219", default-features = false }
+serde_json         = { version = "1.0.143", default-features = false }
+thiserror          = { version = "2.0.12", default-features = false }
+tokio              = { version = "1.45.1", default-features = false }
+toml               = { version = "0.8.23", default-features = false }
+tracing            = { version = "0.1.44", default-features = false }
+tracing-subscriber = { version = "0.3.20", default-features = false }

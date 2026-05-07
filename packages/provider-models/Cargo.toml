@@ -1,0 +1,18 @@
+[package]
+authors     = { workspace = true }
+categories  = ["api-bindings"]
+description = "Provider and model metadata types for brouter"
+edition     = { workspace = true }
+keywords    = ["llm", "models", "provider"]
+license     = { workspace = true }
+name        = "brouter_provider_models"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std"] }
+
+[features]
+default          = []
+fail-on-warnings = []

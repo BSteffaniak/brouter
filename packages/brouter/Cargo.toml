@@ -1,0 +1,60 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Umbrella crate for brouter"
+edition     = { workspace = true }
+keywords    = ["llm", "router"]
+license     = { workspace = true }
+name        = "brouter"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+brouter_api_models       = { workspace = true, optional = true }
+brouter_config           = { workspace = true, optional = true }
+brouter_config_models    = { workspace = true, optional = true }
+brouter_provider         = { workspace = true, optional = true }
+brouter_provider_models  = { workspace = true, optional = true }
+brouter_router           = { workspace = true, optional = true }
+brouter_router_models    = { workspace = true, optional = true }
+brouter_server           = { workspace = true, optional = true }
+brouter_telemetry        = { workspace = true, optional = true }
+brouter_telemetry_models = { workspace = true, optional = true }
+
+[features]
+all = [
+    "api-models",
+    "config",
+    "config-models",
+    "provider",
+    "provider-models",
+    "router",
+    "router-models",
+    "server",
+    "telemetry",
+    "telemetry-models",
+]
+api-models = ["dep:brouter_api_models"]
+config = ["dep:brouter_config"]
+config-models = ["dep:brouter_config_models"]
+default = ["all"]
+fail-on-warnings = [
+    "brouter_api_models?/fail-on-warnings",
+    "brouter_config?/fail-on-warnings",
+    "brouter_config_models?/fail-on-warnings",
+    "brouter_provider?/fail-on-warnings",
+    "brouter_provider_models?/fail-on-warnings",
+    "brouter_router?/fail-on-warnings",
+    "brouter_router_models?/fail-on-warnings",
+    "brouter_server?/fail-on-warnings",
+    "brouter_telemetry?/fail-on-warnings",
+    "brouter_telemetry_models?/fail-on-warnings",
+]
+provider = ["dep:brouter_provider"]
+provider-models = ["dep:brouter_provider_models"]
+router = ["dep:brouter_router"]
+router-models = ["dep:brouter_router_models"]
+server = ["dep:brouter_server"]
+telemetry = ["dep:brouter_telemetry"]
+telemetry-models = ["dep:brouter_telemetry_models"]

@@ -1,0 +1,19 @@
+[package]
+authors     = { workspace = true }
+categories  = ["algorithms"]
+description = "Routing decision models for brouter"
+edition     = { workspace = true }
+keywords    = ["llm", "router", "routing"]
+license     = { workspace = true }
+name        = "brouter_router_models"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+brouter_provider_models = { workspace = true }
+serde                   = { workspace = true, features = ["derive", "std"] }
+
+[features]
+default          = []
+fail-on-warnings = ["brouter_provider_models/fail-on-warnings"]

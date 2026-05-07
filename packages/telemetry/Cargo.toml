@@ -1,0 +1,18 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Telemetry storage primitives for brouter"
+edition     = { workspace = true }
+keywords    = ["llm", "telemetry", "usage"]
+license     = { workspace = true }
+name        = "brouter_telemetry"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+brouter_telemetry_models = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = ["brouter_telemetry_models/fail-on-warnings"]
