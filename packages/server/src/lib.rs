@@ -6,6 +6,7 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::State;
@@ -52,6 +53,18 @@ struct AppState {
     providers: ProviderRegistry,
     provider_client: ProviderClient,
     telemetry: TelemetryStore,
+}
+
+#[derive(Debug, Clone)]
+struct AttemptTelemetry {
+    model_id: ModelId,
+    estimated_cost: f64,
+    latency_ms: Option<u64>,
+    status_code: Option<u16>,
+    provider_error: Option<String>,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    success: bool,
 }
 
 /// Starts the brouter HTTP server.
@@ -178,6 +191,7 @@ async fn forward_streaming_with_fallbacks(
             Err(error) => return error.into_response(),
         };
 
+        let started_at = Instant::now();
         match state
             .provider_client
             .chat_completions_response(&state.providers, &model, request)
@@ -189,9 +203,16 @@ async fn forward_streaming_with_fallbacks(
                     state,
                     headers,
                     request,
-                    &candidate.model_id,
-                    candidate.estimated_cost,
-                    status.is_success(),
+                    AttemptTelemetry {
+                        model_id: candidate.model_id.clone(),
+                        estimated_cost: candidate.estimated_cost,
+                        latency_ms: Some(elapsed_millis(started_at)),
+                        status_code: Some(status.as_u16()),
+                        provider_error: None,
+                        prompt_tokens: None,
+                        completion_tokens: None,
+                        success: status.is_success(),
+                    },
                 )
                 .await
                 {
@@ -214,19 +235,27 @@ async fn forward_streaming_with_fallbacks(
                 last_status = Some(status);
             }
             Err(error) => {
+                let error = error.to_string();
                 if let Err(telemetry_error) = record_model_attempt(
                     state,
                     headers,
                     request,
-                    &candidate.model_id,
-                    candidate.estimated_cost,
-                    false,
+                    AttemptTelemetry {
+                        model_id: candidate.model_id.clone(),
+                        estimated_cost: candidate.estimated_cost,
+                        latency_ms: Some(elapsed_millis(started_at)),
+                        status_code: None,
+                        provider_error: Some(error.clone()),
+                        prompt_tokens: None,
+                        completion_tokens: None,
+                        success: false,
+                    },
                 )
                 .await
                 {
                     return telemetry_error_response(&telemetry_error).into_response();
                 }
-                last_error = Some(error.to_string());
+                last_error = Some(error);
             }
         }
     }
@@ -254,6 +283,7 @@ async fn forward_with_fallbacks(
             Err(error) => return error.into_response(),
         };
 
+        let started_at = Instant::now();
         match state
             .provider_client
             .chat_completions(&state.providers, &model, request)
@@ -265,9 +295,16 @@ async fn forward_with_fallbacks(
                     state,
                     headers,
                     request,
-                    &candidate.model_id,
-                    candidate.estimated_cost,
-                    status.is_success(),
+                    AttemptTelemetry {
+                        model_id: candidate.model_id.clone(),
+                        estimated_cost: candidate.estimated_cost,
+                        latency_ms: Some(elapsed_millis(started_at)),
+                        status_code: Some(status.as_u16()),
+                        provider_error: None,
+                        prompt_tokens: prompt_tokens(&provider_response.body),
+                        completion_tokens: completion_tokens(&provider_response.body),
+                        success: status.is_success(),
+                    },
                 )
                 .await
                 {
@@ -282,19 +319,27 @@ async fn forward_with_fallbacks(
                 last_response = Some((status, provider_response.body));
             }
             Err(error) => {
+                let error = error.to_string();
                 if let Err(telemetry_error) = record_model_attempt(
                     state,
                     headers,
                     request,
-                    &candidate.model_id,
-                    candidate.estimated_cost,
-                    false,
+                    AttemptTelemetry {
+                        model_id: candidate.model_id.clone(),
+                        estimated_cost: candidate.estimated_cost,
+                        latency_ms: Some(elapsed_millis(started_at)),
+                        status_code: None,
+                        provider_error: Some(error.clone()),
+                        prompt_tokens: None,
+                        completion_tokens: None,
+                        success: false,
+                    },
                 )
                 .await
                 {
                     return telemetry_error_response(&telemetry_error).into_response();
                 }
-                last_error = Some(error.to_string());
+                last_error = Some(error);
             }
         }
     }
@@ -416,23 +461,41 @@ fn provider_status(status: u16) -> StatusCode {
     StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY)
 }
 
+fn elapsed_millis(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn prompt_tokens(body: &serde_json::Value) -> Option<u64> {
+    body.get("usage")
+        .and_then(|usage| usage.get("prompt_tokens"))
+        .and_then(serde_json::Value::as_u64)
+}
+
+fn completion_tokens(body: &serde_json::Value) -> Option<u64> {
+    body.get("usage")
+        .and_then(|usage| usage.get("completion_tokens"))
+        .and_then(serde_json::Value::as_u64)
+}
+
 async fn record_model_attempt(
     state: &AppState,
     headers: &HeaderMap,
     request: &ChatCompletionRequest,
-    model_id: &ModelId,
-    estimated_cost: f64,
-    success: bool,
+    attempt: AttemptTelemetry,
 ) -> Result<(), TelemetryError> {
     state
         .telemetry
         .record(&UsageEvent {
             timestamp_ms: now_millis(),
             session_id: session_id(headers, request),
-            selected_model: ModelId::new(model_id.as_str()),
-            estimated_cost,
-            latency_ms: None,
-            success,
+            selected_model: ModelId::new(attempt.model_id.as_str()),
+            estimated_cost: attempt.estimated_cost,
+            latency_ms: attempt.latency_ms,
+            status_code: attempt.status_code,
+            provider_error: attempt.provider_error,
+            prompt_tokens: attempt.prompt_tokens,
+            completion_tokens: attempt.completion_tokens,
+            success: attempt.success,
         })
         .await
 }
@@ -457,4 +520,236 @@ fn metadata_session_id(request: &ChatCompletionRequest) -> Option<String> {
 #[derive(Debug, Clone, Serialize)]
 struct HealthResponse {
     ok: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::net::SocketAddr;
+
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Method, Request};
+    use axum::routing::post;
+    use axum::{Json, Router as AxumRouter};
+    use brouter_config_models::{ModelConfig, ProviderConfig, ProviderKind};
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn chat_completion_falls_back_and_sets_route_headers() {
+        let failing_upstream = spawn_status_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let healthy_upstream = spawn_echo_upstream().await;
+        let config = fallback_config(failing_upstream, healthy_upstream);
+        let app = build_app(&config, TelemetryStore::memory());
+
+        let response = app
+            .clone()
+            .oneshot(chat_request("debug this Rust error", false))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-brouter-selected-model"),
+            Some(&HeaderValue::from_static("cheap_cloud"))
+        );
+        assert_eq!(
+            response.headers().get("x-brouter-fallback-used"),
+            Some(&HeaderValue::from_static("true"))
+        );
+        let body = response_json(response).await;
+        assert_eq!(body["model"], "cheap-upstream");
+
+        let usage_response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/brouter/usage")
+                    .body(Body::empty())
+                    .expect("usage request should build"),
+            )
+            .await
+            .expect("usage request should complete");
+        let usage = response_json(usage_response).await;
+        assert_eq!(usage.as_array().map_or(0, Vec::len), 2);
+    }
+
+    #[tokio::test]
+    async fn streaming_completion_sets_route_headers() {
+        let upstream = spawn_streaming_upstream().await;
+        let config = single_provider_config(upstream);
+        let app = build_app(&config, TelemetryStore::memory());
+
+        let response = app
+            .oneshot(chat_request("hello", true))
+            .await
+            .expect("streaming request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/event-stream"))
+        );
+        assert_eq!(
+            response.headers().get("x-brouter-selected-model"),
+            Some(&HeaderValue::from_static("cheap_cloud"))
+        );
+        let bytes = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("stream body should read");
+        let body = String::from_utf8(bytes.to_vec()).expect("stream should be utf8");
+        assert!(body.contains("[DONE]"));
+    }
+
+    async fn spawn_echo_upstream() -> String {
+        async fn echo(Json(body): Json<Value>) -> Json<Value> {
+            Json(json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "model": body["model"].clone(),
+                "choices": []
+            }))
+        }
+        spawn_upstream(AxumRouter::new().route("/v1/chat/completions", post(echo))).await
+    }
+
+    async fn spawn_streaming_upstream() -> String {
+        async fn stream() -> (HeaderMap, &'static str) {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            (headers, "data: {\"choices\":[]}\n\ndata: [DONE]\n\n")
+        }
+        spawn_upstream(AxumRouter::new().route("/v1/chat/completions", post(stream))).await
+    }
+
+    async fn spawn_status_upstream(status: StatusCode) -> String {
+        async fn fail() -> StatusCode {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        spawn_upstream(AxumRouter::new().route("/v1/chat/completions", post(fail))).await
+    }
+
+    async fn spawn_upstream(app: AxumRouter) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("address should be available");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("fake upstream should serve");
+        });
+        base_url(address)
+    }
+
+    fn base_url(address: SocketAddr) -> String {
+        format!("http://{address}/v1")
+    }
+
+    async fn response_json(response: Response) -> Value {
+        let bytes = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("response body should read");
+        serde_json::from_slice(&bytes).expect("response body should be json")
+    }
+
+    fn chat_request(prompt: &str, stream: bool) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "brouter/auto",
+                    "stream": stream,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "metadata": {"session_id": "test-session"}
+                })
+                .to_string(),
+            ))
+            .expect("chat request should build")
+    }
+
+    fn single_provider_config(base_url: String) -> BrouterConfig {
+        let mut config = BrouterConfig::default();
+        config.providers.insert(
+            "healthy".to_string(),
+            ProviderConfig {
+                kind: ProviderKind::OpenAiCompatible,
+                base_url: Some(base_url),
+                api_key_env: None,
+            },
+        );
+        config.models.insert(
+            "cheap_cloud".to_string(),
+            ModelConfig {
+                provider: "healthy".to_string(),
+                model: "cheap-upstream".to_string(),
+                context_window: 128_000,
+                input_cost_per_million: 0.15,
+                output_cost_per_million: 0.60,
+                quality: Some(70),
+                capabilities: vec!["chat".to_string()],
+            },
+        );
+        config
+    }
+
+    fn fallback_config(failing_base_url: String, healthy_base_url: String) -> BrouterConfig {
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "failing".to_string(),
+            ProviderConfig {
+                kind: ProviderKind::OpenAiCompatible,
+                base_url: Some(failing_base_url),
+                api_key_env: None,
+            },
+        );
+        providers.insert(
+            "healthy".to_string(),
+            ProviderConfig {
+                kind: ProviderKind::OpenAiCompatible,
+                base_url: Some(healthy_base_url),
+                api_key_env: None,
+            },
+        );
+
+        let mut models = BTreeMap::new();
+        models.insert(
+            "strong_cloud".to_string(),
+            ModelConfig {
+                provider: "failing".to_string(),
+                model: "strong-upstream".to_string(),
+                context_window: 128_000,
+                input_cost_per_million: 2.0,
+                output_cost_per_million: 8.0,
+                quality: Some(90),
+                capabilities: vec!["chat".to_string(), "code".to_string()],
+            },
+        );
+        models.insert(
+            "cheap_cloud".to_string(),
+            ModelConfig {
+                provider: "healthy".to_string(),
+                model: "cheap-upstream".to_string(),
+                context_window: 128_000,
+                input_cost_per_million: 0.15,
+                output_cost_per_million: 0.60,
+                quality: Some(70),
+                capabilities: vec!["chat".to_string(), "code".to_string()],
+            },
+        );
+
+        BrouterConfig {
+            providers,
+            models,
+            ..BrouterConfig::default()
+        }
+    }
 }

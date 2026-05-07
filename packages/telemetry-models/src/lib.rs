@@ -15,5 +15,9 @@ pub struct UsageEvent {
     pub selected_model: ModelId,
     pub estimated_cost: f64,
     pub latency_ms: Option<u64>,
+    pub status_code: Option<u16>,
+    pub provider_error: Option<String>,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
     pub success: bool,
 }

@@ -506,8 +506,10 @@ dependencies = [
  "brouter_telemetry",
  "brouter_telemetry_models",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
+ "tower",
  "tracing",
 ]
 

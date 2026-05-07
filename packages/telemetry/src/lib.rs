@@ -84,6 +84,10 @@ impl TelemetryStore {
                             DatabaseValue::String(event.selected_model.to_string()),
                             DatabaseValue::Real64(event.estimated_cost),
                             optional_u64_value(event.latency_ms),
+                            optional_u16_value(event.status_code),
+                            optional_string_value(event.provider_error.as_deref()),
+                            optional_u64_value(event.prompt_tokens),
+                            optional_u64_value(event.completion_tokens),
                             DatabaseValue::Bool(event.success),
                         ],
                     )
@@ -162,16 +166,22 @@ CREATE TABLE IF NOT EXISTS usage_events (\
     selected_model TEXT NOT NULL,\
     estimated_cost REAL NOT NULL,\
     latency_ms INTEGER NULL,\
+    status_code INTEGER NULL,\
+    provider_error TEXT NULL,\
+    prompt_tokens INTEGER NULL,\
+    completion_tokens INTEGER NULL,\
     success INTEGER NOT NULL\
 )";
 
 const INSERT_USAGE_EVENT: &str = "\
 INSERT INTO usage_events (\
-    timestamp_ms, session_id, selected_model, estimated_cost, latency_ms, success\
-) VALUES (?, ?, ?, ?, ?, ?)";
+    timestamp_ms, session_id, selected_model, estimated_cost, latency_ms,\
+    status_code, provider_error, prompt_tokens, completion_tokens, success\
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
 const SELECT_USAGE_EVENTS: &str = "\
-SELECT timestamp_ms, session_id, selected_model, estimated_cost, latency_ms, success \
+SELECT timestamp_ms, session_id, selected_model, estimated_cost, latency_ms, \
+    status_code, provider_error, prompt_tokens, completion_tokens, success \
 FROM usage_events ORDER BY id ASC";
 
 const SELECT_SESSION_EXISTS: &str = "\
@@ -185,6 +195,10 @@ fn optional_u64_value(value: Option<u64>) -> DatabaseValue {
     DatabaseValue::Int64Opt(value.map(|value| i64::try_from(value).unwrap_or(i64::MAX)))
 }
 
+fn optional_u16_value(value: Option<u16>) -> DatabaseValue {
+    DatabaseValue::Int64Opt(value.map(i64::from))
+}
+
 fn row_to_usage_event(row: &Row) -> UsageEvent {
     UsageEvent {
         timestamp_ms: get_u64(row, "timestamp_ms"),
@@ -196,14 +210,26 @@ fn row_to_usage_event(row: &Row) -> UsageEvent {
             .get("estimated_cost")
             .and_then(|value| value.as_f64())
             .unwrap_or(0.0),
-        latency_ms: row
-            .get("latency_ms")
+        latency_ms: optional_u64_column(row, "latency_ms"),
+        status_code: row
+            .get("status_code")
             .and_then(|value| value.as_i64())
-            .and_then(|value| u64::try_from(value).ok()),
+            .and_then(|value| u16::try_from(value).ok()),
+        provider_error: row
+            .get("provider_error")
+            .and_then(|value| value.as_str().map(ToOwned::to_owned)),
+        prompt_tokens: optional_u64_column(row, "prompt_tokens"),
+        completion_tokens: optional_u64_column(row, "completion_tokens"),
         success: row
             .get("success")
             .is_some_and(|value| value.as_bool().unwrap_or_else(|| value.as_i64() == Some(1))),
     }
+}
+
+fn optional_u64_column(row: &Row, column: &str) -> Option<u64> {
+    row.get(column)
+        .and_then(|value| value.as_i64())
+        .and_then(|value| u64::try_from(value).ok())
 }
 
 fn get_string(row: &Row, column: &str) -> String {
@@ -235,6 +261,10 @@ mod tests {
             selected_model: ModelId::new("model-a"),
             estimated_cost: 0.25,
             latency_ms: Some(42),
+            status_code: Some(200),
+            provider_error: None,
+            prompt_tokens: Some(3),
+            completion_tokens: Some(2),
             success: true,
         };
 

@@ -22,9 +22,14 @@ brouter_router_models    = { workspace = true }
 brouter_telemetry        = { workspace = true }
 brouter_telemetry_models = { workspace = true }
 serde                    = { workspace = true, features = ["derive", "std"] }
+serde_json               = { workspace = true, features = ["std"] }
 thiserror                = { workspace = true }
 tokio                    = { workspace = true, features = ["net"] }
 tracing                  = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+tower = { workspace = true, features = ["util"] }
 
 [features]
 default = []
