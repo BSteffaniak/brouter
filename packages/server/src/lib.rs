@@ -5,20 +5,22 @@
 //! HTTP server for brouter.
 
 use std::net::SocketAddr;
+use std::path::Path;
 
+use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router as AxumRouter};
 use brouter_api_models::{ChatCompletionRequest, ErrorResponse, ModelListResponse, ModelObject};
 use brouter_config::{ConfigError, routeable_models};
 use brouter_config_models::BrouterConfig;
-use brouter_provider::{ProviderClient, ProviderError, ProviderRegistry};
+use brouter_provider::{ProviderClient, ProviderRegistry};
 use brouter_provider_models::{ModelId, RouteableModel};
 use brouter_router::{Router, RouterError};
 use brouter_router_models::{RoutingDecision, RoutingObjective};
-use brouter_telemetry::TelemetryStore;
+use brouter_telemetry::{TelemetryError, TelemetryStore, now_millis};
 use brouter_telemetry_models::UsageEvent;
 use serde::Serialize;
 use thiserror::Error;
@@ -38,6 +40,8 @@ pub enum ServerError {
         address: SocketAddr,
         source: std::io::Error,
     },
+    #[error("telemetry error: {0}")]
+    Telemetry(#[from] TelemetryError),
     #[error("HTTP server error: {0}")]
     Serve(#[from] std::io::Error),
 }
@@ -61,7 +65,8 @@ pub async fn serve(config: BrouterConfig) -> Result<(), ServerError> {
     brouter_config::validate_config(&config)?;
     let bind_address = config.server.bind_address();
     let address = parse_bind_address(&bind_address)?;
-    let app = build_app(&config);
+    let telemetry = telemetry_store(&config).await?;
+    let app = build_app(&config, telemetry);
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .map_err(|source| ServerError::Bind { address, source })?;
@@ -70,14 +75,14 @@ pub async fn serve(config: BrouterConfig) -> Result<(), ServerError> {
     axum::serve(listener, app).await.map_err(ServerError::Serve)
 }
 
-fn build_app(config: &BrouterConfig) -> AxumRouter {
+fn build_app(config: &BrouterConfig, telemetry: TelemetryStore) -> AxumRouter {
     let objective = RoutingObjective::from_name(&config.router.default_objective);
     let router = Router::new(routeable_models(config), objective);
     let state = AppState {
         router,
         providers: ProviderRegistry::from_config(config),
         provider_client: ProviderClient::new(),
-        telemetry: TelemetryStore::default(),
+        telemetry,
     };
 
     AxumRouter::new()
@@ -87,6 +92,14 @@ fn build_app(config: &BrouterConfig) -> AxumRouter {
         .route("/v1/brouter/route/explain", post(route_explain))
         .route("/v1/brouter/usage", get(usage))
         .with_state(state)
+}
+
+async fn telemetry_store(config: &BrouterConfig) -> Result<TelemetryStore, TelemetryError> {
+    if let Some(path) = &config.telemetry.database_path {
+        TelemetryStore::sqlite(Path::new(path)).await
+    } else {
+        Ok(TelemetryStore::memory())
+    }
 }
 
 fn parse_bind_address(address: &str) -> Result<SocketAddr, ServerError> {
@@ -117,12 +130,19 @@ async fn route_explain(
     headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Result<Json<RoutingDecision>, (StatusCode, Json<ErrorResponse>)> {
-    let decision = route_request(&state, &headers, &request)?;
+    let decision = route_request(&state, &headers, &request).await?;
     Ok(Json(decision))
 }
 
-async fn usage(State(state): State<AppState>) -> Json<Vec<UsageEvent>> {
-    Json(state.telemetry.events())
+async fn usage(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<UsageEvent>>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .telemetry
+        .events()
+        .await
+        .map(Json)
+        .map_err(|error| telemetry_error_response(&error))
 }
 
 async fn chat_completions(
@@ -130,50 +150,172 @@ async fn chat_completions(
     headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Response {
-    if request.is_streaming() {
-        return error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "streaming provider forwarding is not implemented yet",
-            "not_implemented",
-        )
-        .into_response();
-    }
-
-    let decision = match route_request(&state, &headers, &request) {
+    let decision = match route_request(&state, &headers, &request).await {
         Ok(decision) => decision,
         Err(error) => return error.into_response(),
     };
-    let model = match selected_model(&state, &decision) {
-        Ok(model) => model,
-        Err(error) => return error.into_response(),
-    };
 
-    match state
-        .provider_client
-        .chat_completions(&state.providers, &model, &request)
-        .await
-    {
-        Ok(provider_response) => {
-            let status = provider_status(provider_response.status);
-            record_decision(&state, &headers, &request, &decision, status.is_success());
-            (status, Json(provider_response.body)).into_response()
-        }
-        Err(error) => {
-            record_decision(&state, &headers, &request, &decision, false);
-            provider_error_response(&error).into_response()
-        }
+    if request.is_streaming() {
+        forward_streaming_with_fallbacks(&state, &headers, &request, &decision).await
+    } else {
+        forward_with_fallbacks(&state, &headers, &request, &decision).await
     }
 }
 
-fn selected_model(
+async fn forward_streaming_with_fallbacks(
     state: &AppState,
+    headers: &HeaderMap,
+    request: &ChatCompletionRequest,
     decision: &RoutingDecision,
+) -> Response {
+    let mut last_error = None;
+    let mut last_status = None;
+
+    for candidate in &decision.candidates {
+        let model = match model_by_id(state, &candidate.model_id) {
+            Ok(model) => model,
+            Err(error) => return error.into_response(),
+        };
+
+        match state
+            .provider_client
+            .chat_completions_response(&state.providers, &model, request)
+            .await
+        {
+            Ok(response) => {
+                let status = provider_status(response.status().as_u16());
+                if let Err(error) = record_model_attempt(
+                    state,
+                    headers,
+                    request,
+                    &candidate.model_id,
+                    candidate.estimated_cost,
+                    status.is_success(),
+                )
+                .await
+                {
+                    return telemetry_error_response(&error).into_response();
+                }
+
+                if status.is_success() || !should_try_fallback(status) {
+                    let mut response_headers = HeaderMap::new();
+                    response_headers.insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("text/event-stream"),
+                    );
+                    return (
+                        status,
+                        response_headers,
+                        Body::from_stream(response.bytes_stream()),
+                    )
+                        .into_response();
+                }
+                last_status = Some(status);
+            }
+            Err(error) => {
+                if let Err(telemetry_error) = record_model_attempt(
+                    state,
+                    headers,
+                    request,
+                    &candidate.model_id,
+                    candidate.estimated_cost,
+                    false,
+                )
+                .await
+                {
+                    return telemetry_error_response(&telemetry_error).into_response();
+                }
+                last_error = Some(error.to_string());
+            }
+        }
+    }
+
+    error_response(
+        last_status.unwrap_or(StatusCode::BAD_GATEWAY),
+        last_error.unwrap_or_else(|| "all streaming provider attempts failed".to_string()),
+        "provider_error",
+    )
+    .into_response()
+}
+
+async fn forward_with_fallbacks(
+    state: &AppState,
+    headers: &HeaderMap,
+    request: &ChatCompletionRequest,
+    decision: &RoutingDecision,
+) -> Response {
+    let mut last_error = None;
+    let mut last_response = None;
+
+    for candidate in &decision.candidates {
+        let model = match model_by_id(state, &candidate.model_id) {
+            Ok(model) => model,
+            Err(error) => return error.into_response(),
+        };
+
+        match state
+            .provider_client
+            .chat_completions(&state.providers, &model, request)
+            .await
+        {
+            Ok(provider_response) => {
+                let status = provider_status(provider_response.status);
+                if let Err(error) = record_model_attempt(
+                    state,
+                    headers,
+                    request,
+                    &candidate.model_id,
+                    candidate.estimated_cost,
+                    status.is_success(),
+                )
+                .await
+                {
+                    return telemetry_error_response(&error).into_response();
+                }
+
+                if status.is_success() || !should_try_fallback(status) {
+                    return (status, Json(provider_response.body)).into_response();
+                }
+                last_response = Some((status, provider_response.body));
+            }
+            Err(error) => {
+                if let Err(telemetry_error) = record_model_attempt(
+                    state,
+                    headers,
+                    request,
+                    &candidate.model_id,
+                    candidate.estimated_cost,
+                    false,
+                )
+                .await
+                {
+                    return telemetry_error_response(&telemetry_error).into_response();
+                }
+                last_error = Some(error.to_string());
+            }
+        }
+    }
+
+    if let Some((status, body)) = last_response {
+        return (status, Json(body)).into_response();
+    }
+    error_response(
+        StatusCode::BAD_GATEWAY,
+        last_error.unwrap_or_else(|| "all provider attempts failed".to_string()),
+        "provider_error",
+    )
+    .into_response()
+}
+
+fn model_by_id(
+    state: &AppState,
+    model_id: &ModelId,
 ) -> Result<RouteableModel, (StatusCode, Json<ErrorResponse>)> {
     state
         .router
         .models()
         .iter()
-        .find(|model| model.id == decision.selected_model)
+        .find(|model| &model.id == model_id)
         .cloned()
         .ok_or_else(|| {
             error_response(
@@ -184,15 +326,25 @@ fn selected_model(
         })
 }
 
-fn route_request(
+fn should_try_fallback(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+async fn route_request(
     state: &AppState,
     headers: &HeaderMap,
     request: &ChatCompletionRequest,
 ) -> Result<RoutingDecision, (StatusCode, Json<ErrorResponse>)> {
     let session_id = session_id(headers, request);
-    let is_first_message = session_id
-        .as_deref()
-        .is_none_or(|id| !state.telemetry.has_session(id));
+    let has_session = match session_id.as_deref() {
+        Some(id) => state
+            .telemetry
+            .has_session(id)
+            .await
+            .map_err(|error| telemetry_error_response(&error))?,
+        None => false,
+    };
+    let is_first_message = !has_session;
     state
         .router
         .route_chat(request, is_first_message)
@@ -203,8 +355,12 @@ fn router_error_response(error: &RouterError) -> (StatusCode, Json<ErrorResponse
     error_response(StatusCode::BAD_REQUEST, error.to_string(), "routing_error")
 }
 
-fn provider_error_response(error: &ProviderError) -> (StatusCode, Json<ErrorResponse>) {
-    error_response(StatusCode::BAD_GATEWAY, error.to_string(), "provider_error")
+fn telemetry_error_response(error: &TelemetryError) -> (StatusCode, Json<ErrorResponse>) {
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        error.to_string(),
+        "telemetry_error",
+    )
 }
 
 fn error_response(
@@ -222,25 +378,25 @@ fn provider_status(status: u16) -> StatusCode {
     StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY)
 }
 
-fn record_decision(
+async fn record_model_attempt(
     state: &AppState,
     headers: &HeaderMap,
     request: &ChatCompletionRequest,
-    decision: &RoutingDecision,
+    model_id: &ModelId,
+    estimated_cost: f64,
     success: bool,
-) {
-    let estimated_cost = decision
-        .candidates
-        .iter()
-        .find(|candidate| candidate.model_id == decision.selected_model)
-        .map_or(0.0, |candidate| candidate.estimated_cost);
-    state.telemetry.record(UsageEvent {
-        session_id: session_id(headers, request),
-        selected_model: ModelId::new(decision.selected_model.as_str()),
-        estimated_cost,
-        latency_ms: None,
-        success,
-    });
+) -> Result<(), TelemetryError> {
+    state
+        .telemetry
+        .record(&UsageEvent {
+            timestamp_ms: now_millis(),
+            session_id: session_id(headers, request),
+            selected_model: ModelId::new(model_id.as_str()),
+            estimated_cost,
+            latency_ms: None,
+            success,
+        })
+        .await
 }
 
 fn session_id(headers: &HeaderMap, request: &ChatCompletionRequest) -> Option<String> {

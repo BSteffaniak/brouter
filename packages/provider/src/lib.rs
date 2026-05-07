@@ -81,6 +81,31 @@ impl ProviderClient {
         model: &RouteableModel,
         request: &ChatCompletionRequest,
     ) -> Result<ProviderResponse, ProviderError> {
+        let response = self
+            .chat_completions_response(registry, model, request)
+            .await?;
+        let status = response.status().as_u16();
+        let text = response.text().await?;
+        let body = parse_provider_body(&text);
+        Ok(ProviderResponse { status, body })
+    }
+
+    /// Forwards a chat completion request and returns the raw upstream response.
+    ///
+    /// This is used for streaming responses where the server must proxy the
+    /// upstream byte stream without buffering it first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected provider is missing, unsupported,
+    /// lacks required configuration, has a missing API key environment variable,
+    /// or the HTTP request fails.
+    pub async fn chat_completions_response(
+        &self,
+        registry: &ProviderRegistry,
+        model: &RouteableModel,
+        request: &ChatCompletionRequest,
+    ) -> Result<reqwest::Response, ProviderError> {
         let provider =
             registry
                 .provider(&model.provider)
@@ -104,7 +129,7 @@ impl ProviderClient {
         provider: &ProviderConfig,
         model: &RouteableModel,
         request: &ChatCompletionRequest,
-    ) -> Result<ProviderResponse, ProviderError> {
+    ) -> Result<reqwest::Response, ProviderError> {
         let base_url =
             provider
                 .base_url
@@ -125,11 +150,7 @@ impl ProviderClient {
             request_builder = request_builder.bearer_auth(api_key);
         }
 
-        let response = request_builder.send().await?;
-        let status = response.status().as_u16();
-        let text = response.text().await?;
-        let body = parse_provider_body(&text);
-        Ok(ProviderResponse { status, body })
+        Ok(request_builder.send().await?)
     }
 }
 

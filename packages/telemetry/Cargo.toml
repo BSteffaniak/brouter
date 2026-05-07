@@ -11,8 +11,20 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+brouter_provider_models = { workspace = true }
 brouter_telemetry_models = { workspace = true }
+switchy_database = { workspace = true, features = ["sqlite-rusqlite"] }
+switchy_database_connection = { workspace = true, features = [
+    "sqlite-rusqlite",
+] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [features]
-default          = []
-fail-on-warnings = ["brouter_telemetry_models/fail-on-warnings"]
+default = []
+fail-on-warnings = [
+    "brouter_provider_models/fail-on-warnings",
+    "brouter_telemetry_models/fail-on-warnings",
+]

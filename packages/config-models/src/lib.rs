@@ -16,6 +16,8 @@ pub struct BrouterConfig {
     #[serde(default)]
     pub router: RouterConfig,
     #[serde(default)]
+    pub telemetry: TelemetryConfig,
+    #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
     pub models: BTreeMap<String, ModelConfig>,
@@ -85,6 +87,13 @@ fn default_objective() -> String {
 pub struct ClassifierConfig {
     pub provider: String,
     pub model: String,
+}
+
+/// Telemetry storage configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelemetryConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_path: Option<String>,
 }
 
 /// Provider configuration.

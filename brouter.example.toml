@@ -6,6 +6,9 @@ port = 8080
 default_objective = "balanced"
 debug_headers = true
 
+[telemetry]
+database_path = "brouter.db"
+
 [providers.ollama]
 kind = "open-ai-compatible"
 base_url = "http://localhost:11434/v1"

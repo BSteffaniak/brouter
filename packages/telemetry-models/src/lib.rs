@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 /// Request telemetry captured after a routing decision.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UsageEvent {
+    pub timestamp_ms: u64,
     pub session_id: Option<String>,
     pub selected_model: ModelId,
     pub estimated_cost: f64,
