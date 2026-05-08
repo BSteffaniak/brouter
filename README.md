@@ -31,16 +31,30 @@ conversion, configurable scoring/routing rules, and optional SQLite telemetry vi
 
 ## Development
 
+A normal Rust toolchain is enough for development. Nix is supported, but not
+required.
+
 ```sh
-nix develop -c cargo fmt
-nix develop -c cargo clippy --all-targets -- -D warnings
-nix develop -c cargo test
+cargo fmt
+cargo clippy --all-targets -- -D warnings
+cargo test
 ```
 
-## Example
+## Build and run
+
+Copy the example config, edit providers/models for your environment, then start
+brouter:
 
 ```sh
-nix develop -c cargo run -p brouter_cli -- serve --config brouter.toml
+cp brouter.example.toml brouter.toml
+cargo run -p brouter_cli -- serve --config brouter.toml
+```
+
+For a release binary:
+
+```sh
+cargo build --release -p brouter_cli
+./target/release/brouter serve --config brouter.toml
 ```
 
 Then point an OpenAI-compatible client at:
@@ -49,7 +63,48 @@ Then point an OpenAI-compatible client at:
 http://127.0.0.1:8080/v1
 ```
 
-## Declarative/Nix usage
+## Config validation
+
+```sh
+cargo run -p brouter_cli -- check-config --config brouter.toml
+cargo run -p brouter_cli -- check-config --strict --config brouter.toml
+```
+
+`check-config` reports non-fatal warnings for suspicious settings, including
+unknown capabilities, missing provider environment variables, unknown rule
+intents/objectives, OpenAI-compatible providers without a `base_url`, and
+`local_only` rules without a local model. `--strict` turns those warnings into a
+non-zero exit.
+
+## Non-Nix service example
+
+A typical Linux deployment can keep declarative config in `/etc/brouter` and
+state in `/var/lib/brouter`:
+
+```ini
+[Unit]
+Description=brouter local LLM router
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/brouter serve --config /etc/brouter/brouter.toml
+EnvironmentFile=-/etc/brouter/brouter.env
+Restart=on-failure
+StateDirectory=brouter
+DynamicUser=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The same TOML config format is used everywhere. Nix modules only generate that
+TOML and systemd wiring for users who prefer declarative Nix deployments.
+
+## Nix usage
+
+Nix is a first-class, fully supported deployment path, but it is not required for
+building or running brouter.
 
 The flake exposes:
 
@@ -103,15 +158,11 @@ Runtime state, such as the telemetry database, should stay outside routing
 policy. The NixOS module creates a systemd state directory and expects paths like
 `/var/lib/brouter/brouter.db` for persisted telemetry.
 
-## Config validation
+For development with Nix, prefix the normal Cargo commands with `nix develop -c`:
 
 ```sh
-nix develop -c cargo run -p brouter_cli -- check-config --config brouter.toml
+nix develop -c cargo fmt
+nix develop -c cargo clippy --all-targets -- -D warnings
+nix develop -c cargo test
 nix develop -c cargo run -p brouter_cli -- check-config --strict --config brouter.toml
 ```
-
-`check-config` reports non-fatal warnings for suspicious declarative settings,
-including unknown capabilities, missing provider environment variables, unknown
-rule intents/objectives, OpenAI-compatible providers without a `base_url`, and
-`local_only` rules without a local model. `--strict` turns those warnings into a
-non-zero exit.
