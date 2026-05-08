@@ -19,18 +19,21 @@ patterns used by the sibling projects in this checkout.
 ## Current endpoints
 
 - `GET /health`
+- `GET /metrics`
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 - `POST /v1/embeddings`
 - `POST /v1/brouter/route/explain`
 - `GET /v1/brouter/usage`
+- `GET /v1/brouter/usage/summary`
 
 `/v1/chat/completions` supports non-streaming and streaming OpenAI-compatible
 upstreams, provider timeouts, fallback attempts for retryable failures,
 provider cooldowns after repeated failures, Anthropic non-streaming and streaming
 conversion, OpenAI-compatible embeddings forwarding, configurable scoring/routing rules, and optional SQLite telemetry via
 `switchy_database`. `/v1/brouter/usage` supports `session_id`, `model`,
-`success`, `since_ms`, and `until_ms` query filters.
+`success`, `since_ms`, and `until_ms` query filters. `/metrics` exposes basic
+Prometheus text metrics from telemetry events.
 
 ## Development
 
@@ -69,8 +72,9 @@ http://127.0.0.1:8080/v1
 ## Config validation
 
 ```sh
+cargo run -p brouter_cli -- print-example-config > brouter.toml
 cargo run -p brouter_cli -- check-config --config brouter.toml
-cargo run -p brouter_cli -- check-config --strict --config brouter.toml
+cargo run -p brouter_cli -- check-config --strict --json --config brouter.toml
 cargo run -p brouter_cli -- doctor --config brouter.toml
 ```
 
@@ -78,7 +82,8 @@ cargo run -p brouter_cli -- doctor --config brouter.toml
 unknown capabilities, missing provider environment variables, unknown rule
 intents/objectives, OpenAI-compatible providers without a `base_url`, and
 `local_only` rules without a local model. `--strict` turns those warnings into a
-non-zero exit. `doctor` also checks provider `/models` reachability.
+non-zero exit. `doctor` also checks provider `/models` reachability. The full
+configuration schema is documented in `docs/config.md`.
 
 ## Common setups
 
@@ -107,6 +112,13 @@ provider_cooldown_ms = 30000
 # Optional global per-request/session budgets using router cost estimates.
 # max_estimated_cost = 0.05
 # max_session_estimated_cost = 1.00
+
+[router.aliases]
+fast = "fast_local"
+strong = "strong_cloud"
+
+[router.groups]
+cloud = ["cheap_cloud", "strong_cloud"]
 
 [[router.rules]]
 name = "private-local"
@@ -143,6 +155,12 @@ api_key_env = "BROUTER_API_KEY"
 
 Authenticated requests must include either `Authorization: Bearer $BROUTER_API_KEY`
 or `x-api-key: $BROUTER_API_KEY`.
+
+For structured logs, set:
+
+```sh
+BROUTER_LOG_FORMAT=json RUST_LOG=info brouter serve --config brouter.toml
+```
 
 ## Non-Nix service example
 

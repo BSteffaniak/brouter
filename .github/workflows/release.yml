@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  binaries:
+    name: Build ${{ matrix.target }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p brouter_cli --target ${{ matrix.target }}
+      - run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/brouter dist/brouter-${{ matrix.target }}
+          tar -C dist -czf brouter-${{ matrix.target }}.tar.gz brouter-${{ matrix.target }}
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: brouter-${{ matrix.target }}.tar.gz
+
+  container:
+    name: Build container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - run: nix build .#container --no-link

@@ -29,7 +29,15 @@ pub async fn run_cli() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve { config } => serve(&config).await,
-        Command::CheckConfig { config, strict } => check_config(&config, strict),
+        Command::CheckConfig {
+            config,
+            strict,
+            json,
+        } => check_config(&config, strict, json),
+        Command::PrintExampleConfig => {
+            print_example_config();
+            Ok(())
+        }
         Command::Doctor { config } => doctor(&config).await,
         Command::Route {
             config,
@@ -41,12 +49,16 @@ pub async fn run_cli() -> Result<()> {
 }
 
 fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .try_init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    if std::env::var("BROUTER_LOG_FORMAT").is_ok_and(|value| value == "json") {
+        let _ = tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    }
 }
 
 async fn serve(config: &Path) -> Result<()> {
@@ -55,17 +67,29 @@ async fn serve(config: &Path) -> Result<()> {
     Ok(())
 }
 
-fn check_config(config: &Path, strict: bool) -> Result<()> {
+fn check_config(config: &Path, strict: bool, json_output: bool) -> Result<()> {
     let config = load_config(config)?;
     let warnings = validate_config_warnings(&config);
-    println!(
-        "config ok: {} providers, {} models, {} warnings",
-        config.providers.len(),
-        config.models.len(),
-        warnings.len()
-    );
-    for warning in &warnings {
-        eprintln!("warning: {warning}");
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": warnings.is_empty(),
+                "providers": config.providers.len(),
+                "models": config.models.len(),
+                "warnings": warnings.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            }))?
+        );
+    } else {
+        println!(
+            "config ok: {} providers, {} models, {} warnings",
+            config.providers.len(),
+            config.models.len(),
+            warnings.len()
+        );
+        for warning in &warnings {
+            eprintln!("warning: {warning}");
+        }
     }
     if strict && !warnings.is_empty() {
         bail!(
@@ -143,6 +167,10 @@ async fn check_provider(
     Ok(format!("reachable, {configured_models} configured models"))
 }
 
+fn print_example_config() {
+    print!("{}", include_str!("../../../brouter.example.toml"));
+}
+
 fn explain_route(
     config: &Path,
     prompt: &str,
@@ -211,7 +239,12 @@ enum Command {
         /// Treat validation warnings as errors.
         #[arg(long)]
         strict: bool,
+        /// Emit machine-readable JSON diagnostics.
+        #[arg(long)]
+        json: bool,
     },
+    /// Prints the example TOML config to stdout.
+    PrintExampleConfig,
     /// Validates config and checks provider reachability.
     Doctor {
         /// Path to the brouter TOML config.

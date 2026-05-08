@@ -118,6 +118,14 @@ pub enum ConfigWarning {
     LocalOnlyRuleWithoutLocalModel {
         rule_name: String,
     },
+    UnknownAliasTarget {
+        alias: String,
+        target: String,
+    },
+    UnknownGroupModel {
+        group: String,
+        model_id: String,
+    },
 }
 
 impl std::fmt::Display for ConfigWarning {
@@ -187,6 +195,15 @@ impl std::fmt::Display for ConfigWarning {
                 formatter,
                 "rule {rule_name} can select local_only but no model declares local capability"
             ),
+            Self::UnknownAliasTarget { alias, target } => {
+                write!(formatter, "alias {alias} references unknown model {target}")
+            }
+            Self::UnknownGroupModel { group, model_id } => {
+                write!(
+                    formatter,
+                    "group {group} references unknown model {model_id}"
+                )
+            }
         }
     }
 }
@@ -198,6 +215,7 @@ pub fn validate_config_warnings(config: &BrouterConfig) -> Vec<ConfigWarning> {
     collect_server_warnings(config, &mut warnings);
     collect_provider_warnings(config, &mut warnings);
     collect_model_warnings(config, &mut warnings);
+    collect_alias_warnings(config, &mut warnings);
     collect_rule_warnings(config, &mut warnings);
     warnings
 }
@@ -249,6 +267,27 @@ fn collect_model_warnings(config: &BrouterConfig, warnings: &mut Vec<ConfigWarni
             warnings.push(ConfigWarning::ModelMissingChatCapability {
                 model_id: model_id.clone(),
             });
+        }
+    }
+}
+
+fn collect_alias_warnings(config: &BrouterConfig, warnings: &mut Vec<ConfigWarning>) {
+    for (alias, target) in &config.router.aliases {
+        if !config.models.contains_key(target) {
+            warnings.push(ConfigWarning::UnknownAliasTarget {
+                alias: alias.clone(),
+                target: target.clone(),
+            });
+        }
+    }
+    for (group, models) in &config.router.groups {
+        for model_id in models {
+            if !config.models.contains_key(model_id) {
+                warnings.push(ConfigWarning::UnknownGroupModel {
+                    group: group.clone(),
+                    model_id: model_id.clone(),
+                });
+            }
         }
     }
 }
@@ -407,26 +446,39 @@ pub fn routing_rules(config: &BrouterConfig) -> Vec<RoutingRule> {
 /// Converts configured models into router candidates.
 #[must_use]
 pub fn routeable_models(config: &BrouterConfig) -> Vec<RouteableModel> {
-    config
+    let mut models = config
         .models
         .iter()
-        .map(|(id, model)| RouteableModel {
-            id: ModelId::new(id.clone()),
-            provider: ProviderId::new(model.provider.clone()),
-            upstream_model: model.model.clone(),
-            context_window: model.context_window,
-            input_cost_per_million: model.input_cost_per_million,
-            output_cost_per_million: model.output_cost_per_million,
-            quality: model
-                .quality
-                .unwrap_or_else(|| inferred_quality(&model.capabilities)),
-            capabilities: model
-                .capabilities
-                .iter()
-                .filter_map(|capability| capability.parse().ok())
-                .collect(),
-        })
-        .collect()
+        .map(|(id, model)| model_config_to_routeable(id, model))
+        .collect::<Vec<_>>();
+    for (alias, target) in &config.router.aliases {
+        if let Some(model) = config.models.get(target) {
+            models.push(model_config_to_routeable(alias, model));
+        }
+    }
+    models
+}
+
+fn model_config_to_routeable(
+    id: &str,
+    model: &brouter_config_models::ModelConfig,
+) -> RouteableModel {
+    RouteableModel {
+        id: ModelId::new(id.to_string()),
+        provider: ProviderId::new(model.provider.clone()),
+        upstream_model: model.model.clone(),
+        context_window: model.context_window,
+        input_cost_per_million: model.input_cost_per_million,
+        output_cost_per_million: model.output_cost_per_million,
+        quality: model
+            .quality
+            .unwrap_or_else(|| inferred_quality(&model.capabilities)),
+        capabilities: model
+            .capabilities
+            .iter()
+            .filter_map(|capability| capability.parse().ok())
+            .collect(),
+    }
 }
 
 fn inferred_quality(capabilities: &[String]) -> u8 {

@@ -58,5 +58,6 @@ thiserror                   = { version = "2.0.12", default-features = false }
 tokio                       = { version = "1.45.1", default-features = false }
 toml                        = { version = "0.8.23", default-features = false }
 tower                       = { version = "0.5.3", default-features = false }
+tower-http                  = { version = "0.6.10", default-features = false }
 tracing                     = { version = "0.1.44", default-features = false }
 tracing-subscriber          = { version = "0.3.20", default-features = false }

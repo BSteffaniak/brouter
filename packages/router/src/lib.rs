@@ -85,10 +85,32 @@ impl Router {
         request: &ChatCompletionRequest,
         is_first_message: bool,
     ) -> Result<RoutingDecision, RouterError> {
+        self.route_chat_for_models(request, is_first_message, None)
+    }
+
+    /// Selects a model for a chat completion request from a restricted model set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no allowed configured model satisfies the request.
+    pub fn route_chat_for_models(
+        &self,
+        request: &ChatCompletionRequest,
+        is_first_message: bool,
+        allowed_models: Option<&[brouter_provider_models::ModelId]>,
+    ) -> Result<RoutingDecision, RouterError> {
         let prompt = request_prompt_text(request);
         let mut features = analyze_prompt(&prompt, request, is_first_message);
         let objective = self.apply_rules(&prompt.to_lowercase(), &mut features);
-        self.route_features_with_objective(features, objective)
+        let explicit_model = if allowed_models.is_none() && !is_auto_model(&request.model) {
+            Some(vec![brouter_provider_models::ModelId::new(
+                request.model.clone(),
+            )])
+        } else {
+            None
+        };
+        let allowed_models = allowed_models.or(explicit_model.as_deref());
+        self.route_features_with_objective(features, objective, allowed_models)
     }
 
     /// Selects a model for precomputed prompt features.
@@ -100,15 +122,16 @@ impl Router {
     pub fn route_features(&self, features: PromptFeatures) -> Result<RoutingDecision, RouterError> {
         let mut features = features;
         let objective = self.apply_rules("", &mut features);
-        self.route_features_with_objective(features, objective)
+        self.route_features_with_objective(features, objective, None)
     }
 
     fn route_features_with_objective(
         &self,
         features: PromptFeatures,
         objective: RoutingObjective,
+        allowed_models: Option<&[brouter_provider_models::ModelId]>,
     ) -> Result<RoutingDecision, RouterError> {
-        let mut candidates = self.scored_candidates(&features, objective);
+        let mut candidates = self.scored_candidates(&features, objective, allowed_models);
         candidates.sort_by(compare_candidate_scores);
         let selected = candidates.first().ok_or(RouterError::NoCandidate)?;
         let selected_model = selected.model_id.clone();
@@ -126,9 +149,11 @@ impl Router {
         &self,
         features: &PromptFeatures,
         objective: RoutingObjective,
+        allowed_models: Option<&[brouter_provider_models::ModelId]>,
     ) -> Vec<ScoredCandidate> {
         self.models
             .iter()
+            .filter(|model| allowed_models.is_none_or(|allowed| allowed.contains(&model.id)))
             .filter(|model| model_satisfies_features(model, features, objective))
             .map(|model| score_model(model, features, objective, self.weights))
             .collect()
@@ -164,6 +189,10 @@ pub fn analyze_chat_request(
     is_first_message: bool,
 ) -> PromptFeatures {
     analyze_prompt(&request_prompt_text(request), request, is_first_message)
+}
+
+fn is_auto_model(model: &str) -> bool {
+    matches!(model, "auto" | "brouter/auto") || model.starts_with("group:")
 }
 
 fn request_prompt_text(request: &ChatCompletionRequest) -> String {

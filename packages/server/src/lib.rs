@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use axum::body::Body;
-use axum::extract::{Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::extract::{DefaultBodyLimit, Query, State};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router as AxumRouter};
@@ -29,6 +29,7 @@ use brouter_telemetry::{TelemetryError, TelemetryStore, now_millis};
 use brouter_telemetry_models::UsageEvent;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tower_http::cors::{Any, CorsLayer};
 
 /// HTTP server startup error.
 #[derive(Debug, Error)]
@@ -67,6 +68,7 @@ struct AppState {
     max_session_estimated_cost: Option<f64>,
     model_budgets: BTreeMap<ModelId, f64>,
     provider_budgets: BTreeMap<ProviderId, f64>,
+    groups: BTreeMap<String, Vec<ModelId>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -155,16 +157,54 @@ fn build_app_with_api_key(
                     .map(|budget| (ProviderId::new(id.clone()), budget))
             })
             .collect(),
+        groups: config
+            .router
+            .groups
+            .iter()
+            .map(|(group, models)| {
+                (
+                    group.clone(),
+                    models.iter().cloned().map(ModelId::new).collect(),
+                )
+            })
+            .collect(),
     };
 
-    AxumRouter::new()
+    let app = AxumRouter::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/brouter/route/explain", post(route_explain))
         .route("/v1/brouter/usage", get(usage))
-        .with_state(state)
+        .route("/v1/brouter/usage/summary", get(usage_summary))
+        .layer(DefaultBodyLimit::max(config.server.max_request_body_bytes))
+        .with_state(state);
+    apply_cors(app, &config.server.cors_allowed_origins)
+}
+
+fn apply_cors(app: AxumRouter, allowed_origins: &[String]) -> AxumRouter {
+    if allowed_origins.is_empty() {
+        return app;
+    }
+    let layer = if allowed_origins.iter().any(|origin| origin == "*") {
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+            .allow_headers(Any)
+    } else {
+        let mut layer = CorsLayer::new()
+            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+            .allow_headers(Any);
+        for origin in allowed_origins {
+            if let Ok(origin) = HeaderValue::from_str(origin) {
+                layer = layer.allow_origin(origin);
+            }
+        }
+        layer
+    };
+    app.layer(layer)
 }
 
 async fn telemetry_store(config: &BrouterConfig) -> Result<TelemetryStore, TelemetryError> {
@@ -237,6 +277,37 @@ async fn usage(
         .await
         .map(|events| Json(filter_usage_events(events, &query)))
         .map_err(|error| telemetry_error_response(&error))
+}
+
+async fn usage_summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<UsageQuery>,
+) -> Result<Json<UsageSummary>, (StatusCode, Json<ErrorResponse>)> {
+    authorize(&state, &headers)?;
+    state
+        .telemetry
+        .events()
+        .await
+        .map(|events| Json(summarize_usage(&filter_usage_events(events, &query))))
+        .map_err(|error| telemetry_error_response(&error))
+}
+
+async fn metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    authorize(&state, &headers)?;
+    let events = state
+        .telemetry
+        .events()
+        .await
+        .map_err(|error| telemetry_error_response(&error))?;
+    let summary = summarize_usage(&events);
+    Ok(format!(
+        "# TYPE brouter_requests_total counter\nbrouter_requests_total {}\n# TYPE brouter_request_success_total counter\nbrouter_request_success_total {}\n# TYPE brouter_estimated_cost_total counter\nbrouter_estimated_cost_total {}\n# TYPE brouter_latency_ms_sum counter\nbrouter_latency_ms_sum {}\n",
+        summary.requests, summary.successes, summary.estimated_cost, summary.latency_ms_sum,
+    ))
 }
 
 async fn chat_completions(
@@ -709,10 +780,16 @@ async fn route_request(
         None => false,
     };
     let is_first_message = !has_session;
+    let allowed_models = group_models(state, &request.model);
     state
         .router
-        .route_chat(request, is_first_message)
+        .route_chat_for_models(request, is_first_message, allowed_models.as_deref())
         .map_err(|error| router_error_response(&error))
+}
+
+fn group_models(state: &AppState, model: &str) -> Option<Vec<ModelId>> {
+    let group_name = model.strip_prefix("group:").unwrap_or(model);
+    state.groups.get(group_name).cloned()
 }
 
 fn authorize(
@@ -826,6 +903,17 @@ fn metadata_session_id(request: &ChatCompletionRequest) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+struct UsageSummary {
+    requests: u64,
+    successes: u64,
+    failures: u64,
+    estimated_cost: f64,
+    latency_ms_sum: u64,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 struct UsageQuery {
     session_id: Option<String>,
@@ -833,6 +921,23 @@ struct UsageQuery {
     success: Option<bool>,
     since_ms: Option<u64>,
     until_ms: Option<u64>,
+}
+
+fn summarize_usage(events: &[UsageEvent]) -> UsageSummary {
+    UsageSummary {
+        requests: u64::try_from(events.len()).unwrap_or(u64::MAX),
+        successes: u64::try_from(events.iter().filter(|event| event.success).count())
+            .unwrap_or(u64::MAX),
+        failures: u64::try_from(events.iter().filter(|event| !event.success).count())
+            .unwrap_or(u64::MAX),
+        estimated_cost: events.iter().map(|event| event.estimated_cost).sum(),
+        latency_ms_sum: events.iter().filter_map(|event| event.latency_ms).sum(),
+        prompt_tokens: events.iter().filter_map(|event| event.prompt_tokens).sum(),
+        completion_tokens: events
+            .iter()
+            .filter_map(|event| event.completion_tokens)
+            .sum(),
+    }
 }
 
 fn filter_usage_events(events: Vec<UsageEvent>, query: &UsageQuery) -> Vec<UsageEvent> {

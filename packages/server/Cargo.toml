@@ -25,6 +25,7 @@ serde                    = { workspace = true, features = ["derive", "std"] }
 serde_json               = { workspace = true, features = ["std"] }
 thiserror                = { workspace = true }
 tokio                    = { workspace = true, features = ["net"] }
+tower-http               = { workspace = true, features = ["cors"] }
 tracing                  = { workspace = true }
 
 [dev-dependencies]

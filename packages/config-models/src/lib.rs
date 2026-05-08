@@ -32,6 +32,10 @@ pub struct ServerConfig {
     pub port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    #[serde(default = "default_max_request_body_bytes")]
+    pub max_request_body_bytes: usize,
+    #[serde(default)]
+    pub cors_allowed_origins: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -40,6 +44,8 @@ impl Default for ServerConfig {
             host: default_host(),
             port: default_port(),
             api_key_env: None,
+            max_request_body_bytes: default_max_request_body_bytes(),
+            cors_allowed_origins: Vec::new(),
         }
     }
 }
@@ -60,6 +66,10 @@ const fn default_port() -> u16 {
     8080
 }
 
+const fn default_max_request_body_bytes() -> usize {
+    1_048_576
+}
+
 /// Router behavior configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RouterConfig {
@@ -71,6 +81,10 @@ pub struct RouterConfig {
     pub scoring: ScoringConfig,
     #[serde(default)]
     pub rules: Vec<RouterRuleConfig>,
+    #[serde(default)]
+    pub aliases: BTreeMap<String, String>,
+    #[serde(default)]
+    pub groups: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub classifier: Option<ClassifierConfig>,
     #[serde(default = "default_provider_failure_threshold")]
@@ -90,6 +104,8 @@ impl Default for RouterConfig {
             debug_headers: false,
             scoring: ScoringConfig::default(),
             rules: Vec::new(),
+            aliases: BTreeMap::new(),
+            groups: BTreeMap::new(),
             classifier: None,
             provider_failure_threshold: default_provider_failure_threshold(),
             provider_cooldown_ms: default_provider_cooldown_ms(),

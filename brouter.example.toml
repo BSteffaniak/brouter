@@ -3,6 +3,8 @@ host = "127.0.0.1"
 port = 8080
 # Optional local server auth. Requests must send Authorization: Bearer $BROUTER_API_KEY.
 # api_key_env = "BROUTER_API_KEY"
+max_request_body_bytes = 1048576
+# cors_allowed_origins = ["http://localhost:3000"]
 
 [router]
 default_objective = "balanced"
@@ -12,6 +14,13 @@ provider_cooldown_ms = 30000
 # Optional budget guards based on router cost estimates.
 # max_estimated_cost = 0.05
 # max_session_estimated_cost = 1.00
+
+[router.aliases]
+fast = "fast_local"
+strong = "strong_cloud"
+
+[router.groups]
+cloud = ["cheap_cloud", "strong_cloud"]
 
 [router.scoring]
 quality_weight = 1.0
