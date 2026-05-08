@@ -31,6 +31,8 @@ pub struct ChatCompletionRequest {
     pub response_format: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<BTreeMap<String, Value>>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 impl ChatCompletionRequest {
@@ -166,4 +168,28 @@ pub struct ErrorObject {
     #[serde(rename = "type")]
     pub error_type: String,
     pub code: u16,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn preserves_unknown_chat_request_fields() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "brouter/auto",
+            "messages": [],
+            "parallel_tool_calls": false
+        }))
+        .expect("request should deserialize");
+
+        assert_eq!(
+            request.extra.get("parallel_tool_calls"),
+            Some(&json!(false))
+        );
+        let serialized = serde_json::to_value(request).expect("request should serialize");
+        assert_eq!(serialized["parallel_tool_calls"], json!(false));
+    }
 }

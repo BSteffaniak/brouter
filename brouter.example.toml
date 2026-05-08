@@ -1,10 +1,16 @@
 [server]
 host = "127.0.0.1"
 port = 8080
+# Optional local server auth. Requests must send Authorization: Bearer $BROUTER_API_KEY.
+# api_key_env = "BROUTER_API_KEY"
 
 [router]
 default_objective = "balanced"
 debug_headers = true
+provider_failure_threshold = 3
+provider_cooldown_ms = 30000
+# Optional per-request budget guard based on the router's prompt cost estimate.
+# max_estimated_cost = 0.05
 
 [router.scoring]
 quality_weight = 1.0
@@ -33,11 +39,13 @@ database_path = "brouter.db"
 [providers.ollama]
 kind = "open-ai-compatible"
 base_url = "http://localhost:11434/v1"
+timeout_ms = 60000
 
 [providers.openai]
 kind = "open-ai-compatible"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
+timeout_ms = 60000
 
 [models.fast_local]
 provider = "ollama"

@@ -25,9 +25,11 @@ patterns used by the sibling projects in this checkout.
 - `GET /v1/brouter/usage`
 
 `/v1/chat/completions` supports non-streaming and streaming OpenAI-compatible
-upstreams, fallback attempts for retryable failures, Anthropic non-streaming
-conversion, configurable scoring/routing rules, and optional SQLite telemetry via
-`switchy_database`.
+upstreams, provider timeouts, fallback attempts for retryable failures,
+provider cooldowns after repeated failures, Anthropic non-streaming conversion,
+configurable scoring/routing rules, and optional SQLite telemetry via
+`switchy_database`. `/v1/brouter/usage` supports `session_id`, `model`,
+`success`, `since_ms`, and `until_ms` query filters.
 
 ## Development
 
@@ -68,13 +70,62 @@ http://127.0.0.1:8080/v1
 ```sh
 cargo run -p brouter_cli -- check-config --config brouter.toml
 cargo run -p brouter_cli -- check-config --strict --config brouter.toml
+cargo run -p brouter_cli -- doctor --config brouter.toml
 ```
 
 `check-config` reports non-fatal warnings for suspicious settings, including
 unknown capabilities, missing provider environment variables, unknown rule
 intents/objectives, OpenAI-compatible providers without a `base_url`, and
 `local_only` rules without a local model. `--strict` turns those warnings into a
-non-zero exit.
+non-zero exit. `doctor` also checks provider `/models` reachability.
+
+## Common setups
+
+Local Ollama-only:
+
+```toml
+[providers.ollama]
+kind = "open-ai-compatible"
+base_url = "http://localhost:11434/v1"
+timeout_ms = 60000
+
+[models.local]
+provider = "ollama"
+model = "qwen2.5-coder:7b"
+context_window = 32768
+capabilities = ["chat", "code", "local"]
+```
+
+OpenAI plus local fallback/private routing:
+
+```toml
+[router]
+default_objective = "balanced"
+provider_failure_threshold = 3
+provider_cooldown_ms = 30000
+
+[[router.rules]]
+name = "private-local"
+when_contains = ["secret", "private key", "credentials"]
+objective = "local_only"
+require_capabilities = ["local"]
+
+[providers.openai]
+kind = "open-ai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+timeout_ms = 60000
+```
+
+Optional local server auth:
+
+```toml
+[server]
+api_key_env = "BROUTER_API_KEY"
+```
+
+Authenticated requests must include either `Authorization: Bearer $BROUTER_API_KEY`
+or `x-api-key: $BROUTER_API_KEY`.
 
 ## Non-Nix service example
 
@@ -165,4 +216,5 @@ nix develop -c cargo fmt
 nix develop -c cargo clippy --all-targets -- -D warnings
 nix develop -c cargo test
 nix develop -c cargo run -p brouter_cli -- check-config --strict --config brouter.toml
+nix develop -c cargo run -p brouter_cli -- doctor --config brouter.toml
 ```

@@ -5,6 +5,7 @@
 //! Provider registry and forwarding primitives for brouter.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use brouter_api_models::{ChatCompletionRequest, MessageContent};
 use brouter_config_models::{BrouterConfig, ProviderConfig, ProviderKind};
@@ -142,6 +143,9 @@ impl ProviderClient {
             .post(url)
             .header("anthropic-version", "2023-06-01")
             .json(&anthropic_request);
+        if let Some(timeout) = provider_timeout(provider) {
+            request_builder = request_builder.timeout(timeout);
+        }
         if let Some(api_key_env) = &provider.api_key_env {
             let api_key = std::env::var(api_key_env).map_err(|_| ProviderError::MissingApiKey {
                 env_var: api_key_env.clone(),
@@ -181,6 +185,9 @@ impl ProviderClient {
         upstream_request.model.clone_from(&model.upstream_model);
 
         let mut request_builder = self.http.post(url).json(&upstream_request);
+        if let Some(timeout) = provider_timeout(provider) {
+            request_builder = request_builder.timeout(timeout);
+        }
         if let Some(api_key_env) = &provider.api_key_env {
             let api_key = std::env::var(api_key_env).map_err(|_| ProviderError::MissingApiKey {
                 env_var: api_key_env.clone(),
@@ -191,6 +198,10 @@ impl ProviderClient {
 
         Ok(request_builder.send().await?)
     }
+}
+
+fn provider_timeout(provider: &ProviderConfig) -> Option<Duration> {
+    provider.timeout_ms.map(Duration::from_millis)
 }
 
 /// Provider response payload.
@@ -501,6 +512,7 @@ mod tests {
                 kind: ProviderKind::Anthropic,
                 base_url: Some(base_url),
                 api_key_env: None,
+                timeout_ms: None,
             },
         );
         let mut models = BTreeMap::new();
@@ -531,6 +543,7 @@ mod tests {
                 kind: ProviderKind::OpenAiCompatible,
                 base_url: Some(base_url),
                 api_key_env: None,
+                timeout_ms: None,
             },
         );
         let mut models = BTreeMap::new();
@@ -571,6 +584,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             metadata: None,
+            extra: BTreeMap::new(),
         }
     }
 }

@@ -30,6 +30,8 @@ pub struct ServerConfig {
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -37,6 +39,7 @@ impl Default for ServerConfig {
         Self {
             host: default_host(),
             port: default_port(),
+            api_key_env: None,
         }
     }
 }
@@ -70,6 +73,12 @@ pub struct RouterConfig {
     pub rules: Vec<RouterRuleConfig>,
     #[serde(default)]
     pub classifier: Option<ClassifierConfig>,
+    #[serde(default = "default_provider_failure_threshold")]
+    pub provider_failure_threshold: u32,
+    #[serde(default = "default_provider_cooldown_ms")]
+    pub provider_cooldown_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_estimated_cost: Option<f64>,
 }
 
 impl Default for RouterConfig {
@@ -80,12 +89,23 @@ impl Default for RouterConfig {
             scoring: ScoringConfig::default(),
             rules: Vec::new(),
             classifier: None,
+            provider_failure_threshold: default_provider_failure_threshold(),
+            provider_cooldown_ms: default_provider_cooldown_ms(),
+            max_estimated_cost: None,
         }
     }
 }
 
 fn default_objective() -> String {
     "balanced".to_string()
+}
+
+const fn default_provider_failure_threshold() -> u32 {
+    3
+}
+
+const fn default_provider_cooldown_ms() -> u64 {
+    30_000
 }
 
 /// Router scoring overrides.
@@ -147,6 +167,8 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 /// Supported provider kinds.

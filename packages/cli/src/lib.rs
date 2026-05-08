@@ -4,13 +4,16 @@
 
 //! Command-line interface for brouter.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use brouter_api_models::{ChatCompletionRequest, ChatMessage, MessageContent};
 use brouter_config::{
     load_config, routeable_models, routing_rules, scoring_weights, validate_config_warnings,
 };
+use brouter_config_models::{BrouterConfig, ProviderConfig, ProviderKind};
 use brouter_router::Router;
 use brouter_router_models::RoutingObjective;
 use clap::{Parser, Subcommand};
@@ -27,6 +30,7 @@ pub async fn run_cli() -> Result<()> {
     match cli.command {
         Command::Serve { config } => serve(&config).await,
         Command::CheckConfig { config, strict } => check_config(&config, strict),
+        Command::Doctor { config } => doctor(&config).await,
         Command::Route {
             config,
             prompt,
@@ -72,6 +76,73 @@ fn check_config(config: &Path, strict: bool) -> Result<()> {
     Ok(())
 }
 
+async fn doctor(config: &Path) -> Result<()> {
+    let config = load_config(config)?;
+    let warnings = validate_config_warnings(&config);
+    println!(
+        "config ok: {} providers, {} models, {} warnings",
+        config.providers.len(),
+        config.models.len(),
+        warnings.len()
+    );
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let mut failures = 0_u32;
+    for (provider_id, provider) in &config.providers {
+        match check_provider(&client, &config, provider_id, provider).await {
+            Ok(message) => println!("provider {provider_id}: ok ({message})"),
+            Err(error) => {
+                failures = failures.saturating_add(1);
+                eprintln!("provider {provider_id}: failed ({error})");
+            }
+        }
+    }
+
+    if failures > 0 {
+        bail!("doctor failed: {failures} provider checks failed");
+    }
+    Ok(())
+}
+
+async fn check_provider(
+    client: &reqwest::Client,
+    config: &BrouterConfig,
+    provider_id: &str,
+    provider: &ProviderConfig,
+) -> Result<String> {
+    let base_url = provider.base_url.as_deref().unwrap_or(match provider.kind {
+        ProviderKind::OpenAiCompatible => bail!("missing base_url"),
+        ProviderKind::Anthropic => "https://api.anthropic.com/v1",
+    });
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let mut request = client.get(url);
+    if let Some(api_key_env) = &provider.api_key_env {
+        let api_key = std::env::var(api_key_env)?;
+        request = match provider.kind {
+            ProviderKind::OpenAiCompatible => request.bearer_auth(api_key),
+            ProviderKind::Anthropic => request
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01"),
+        };
+    }
+    let response = request.send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("GET /models returned {status}");
+    }
+    let configured_models = config
+        .models
+        .values()
+        .filter(|model| model.provider == provider_id)
+        .count();
+    Ok(format!("reachable, {configured_models} configured models"))
+}
+
 fn explain_route(
     config: &Path,
     prompt: &str,
@@ -112,6 +183,7 @@ fn prompt_request(prompt: &str) -> ChatCompletionRequest {
         tool_choice: None,
         response_format: None,
         metadata: None,
+        extra: BTreeMap::new(),
     }
 }
 
@@ -139,6 +211,12 @@ enum Command {
         /// Treat validation warnings as errors.
         #[arg(long)]
         strict: bool,
+    },
+    /// Validates config and checks provider reachability.
+    Doctor {
+        /// Path to the brouter TOML config.
+        #[arg(long, default_value = "brouter.toml")]
+        config: PathBuf,
     },
     /// Explains how a prompt would be routed.
     Route {

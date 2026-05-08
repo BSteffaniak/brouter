@@ -4,12 +4,14 @@
 
 //! HTTP server for brouter.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -18,12 +20,12 @@ use brouter_api_models::{ChatCompletionRequest, ErrorResponse, ModelListResponse
 use brouter_config::{ConfigError, routeable_models, routing_rules, scoring_weights};
 use brouter_config_models::BrouterConfig;
 use brouter_provider::{ProviderClient, ProviderRegistry};
-use brouter_provider_models::{ModelId, RouteableModel};
+use brouter_provider_models::{ModelId, ProviderId, RouteableModel};
 use brouter_router::{Router, RouterError};
 use brouter_router_models::{RoutingDecision, RoutingObjective};
 use brouter_telemetry::{TelemetryError, TelemetryStore, now_millis};
 use brouter_telemetry_models::UsageEvent;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// HTTP server startup error.
@@ -43,6 +45,8 @@ pub enum ServerError {
     },
     #[error("telemetry error: {0}")]
     Telemetry(#[from] TelemetryError),
+    #[error("server API key environment variable {env_var} is not set")]
+    MissingServerApiKey { env_var: String },
     #[error("HTTP server error: {0}")]
     Serve(#[from] std::io::Error),
 }
@@ -53,6 +57,17 @@ struct AppState {
     providers: ProviderRegistry,
     provider_client: ProviderClient,
     telemetry: TelemetryStore,
+    api_key: Option<String>,
+    provider_health: Arc<Mutex<BTreeMap<ProviderId, ProviderHealth>>>,
+    provider_failure_threshold: u32,
+    provider_cooldown_ms: u64,
+    max_estimated_cost: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProviderHealth {
+    consecutive_failures: u32,
+    cooldown_until: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,7 +94,8 @@ pub async fn serve(config: BrouterConfig) -> Result<(), ServerError> {
     let bind_address = config.server.bind_address();
     let address = parse_bind_address(&bind_address)?;
     let telemetry = telemetry_store(&config).await?;
-    let app = build_app(&config, telemetry);
+    let api_key = server_api_key(&config)?;
+    let app = build_app_with_api_key(&config, telemetry, api_key);
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .map_err(|source| ServerError::Bind { address, source })?;
@@ -88,7 +104,16 @@ pub async fn serve(config: BrouterConfig) -> Result<(), ServerError> {
     axum::serve(listener, app).await.map_err(ServerError::Serve)
 }
 
+#[cfg(test)]
 fn build_app(config: &BrouterConfig, telemetry: TelemetryStore) -> AxumRouter {
+    build_app_with_api_key(config, telemetry, None)
+}
+
+fn build_app_with_api_key(
+    config: &BrouterConfig,
+    telemetry: TelemetryStore,
+    api_key: Option<String>,
+) -> AxumRouter {
     let objective = RoutingObjective::from_name(&config.router.default_objective);
     let router = Router::new_with_rules(
         routeable_models(config),
@@ -101,6 +126,11 @@ fn build_app(config: &BrouterConfig, telemetry: TelemetryStore) -> AxumRouter {
         providers: ProviderRegistry::from_config(config),
         provider_client: ProviderClient::new(),
         telemetry,
+        api_key,
+        provider_health: Arc::new(Mutex::new(BTreeMap::new())),
+        provider_failure_threshold: config.router.provider_failure_threshold,
+        provider_cooldown_ms: config.router.provider_cooldown_ms,
+        max_estimated_cost: config.router.max_estimated_cost,
     };
 
     AxumRouter::new()
@@ -120,6 +150,19 @@ async fn telemetry_store(config: &BrouterConfig) -> Result<TelemetryStore, Telem
     }
 }
 
+fn server_api_key(config: &BrouterConfig) -> Result<Option<String>, ServerError> {
+    config
+        .server
+        .api_key_env
+        .as_ref()
+        .map(|env_var| {
+            std::env::var(env_var).map_err(|_| ServerError::MissingServerApiKey {
+                env_var: env_var.clone(),
+            })
+        })
+        .transpose()
+}
+
 fn parse_bind_address(address: &str) -> Result<SocketAddr, ServerError> {
     address.parse().map_err(|source| ServerError::AddressParse {
         address: address.to_string(),
@@ -131,7 +174,11 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { ok: true })
 }
 
-async fn models(State(state): State<AppState>) -> Json<ModelListResponse> {
+async fn models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ModelListResponse>, (StatusCode, Json<ErrorResponse>)> {
+    authorize(&state, &headers)?;
     let mut models = vec![ModelObject::new("brouter/auto", "brouter")];
     models.extend(
         state
@@ -140,7 +187,7 @@ async fn models(State(state): State<AppState>) -> Json<ModelListResponse> {
             .iter()
             .map(|model| ModelObject::new(model.id.as_str(), model.provider.as_str())),
     );
-    Json(ModelListResponse::model_list(models))
+    Ok(Json(ModelListResponse::model_list(models)))
 }
 
 async fn route_explain(
@@ -148,18 +195,22 @@ async fn route_explain(
     headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Result<Json<RoutingDecision>, (StatusCode, Json<ErrorResponse>)> {
+    authorize(&state, &headers)?;
     let decision = route_request(&state, &headers, &request).await?;
     Ok(Json(decision))
 }
 
 async fn usage(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<UsageQuery>,
 ) -> Result<Json<Vec<UsageEvent>>, (StatusCode, Json<ErrorResponse>)> {
+    authorize(&state, &headers)?;
     state
         .telemetry
         .events()
         .await
-        .map(Json)
+        .map(|events| Json(filter_usage_events(events, &query)))
         .map_err(|error| telemetry_error_response(&error))
 }
 
@@ -168,6 +219,10 @@ async fn chat_completions(
     headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Response {
+    if let Err(error) = authorize(&state, &headers) {
+        return error.into_response();
+    }
+
     let decision = match route_request(&state, &headers, &request).await {
         Ok(decision) => decision,
         Err(error) => return error.into_response(),
@@ -180,6 +235,7 @@ async fn chat_completions(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn forward_streaming_with_fallbacks(
     state: &AppState,
     headers: &HeaderMap,
@@ -194,6 +250,20 @@ async fn forward_streaming_with_fallbacks(
             Ok(model) => model,
             Err(error) => return error.into_response(),
         };
+
+        if !within_budget(state, candidate.estimated_cost) {
+            last_status = Some(StatusCode::PAYMENT_REQUIRED);
+            last_error = Some(format!(
+                "model {} exceeds configured max estimated cost",
+                candidate.model_id
+            ));
+            continue;
+        }
+        if provider_in_cooldown(state, &model.provider) {
+            last_status = Some(StatusCode::SERVICE_UNAVAILABLE);
+            last_error = Some(format!("provider {} is cooling down", model.provider));
+            continue;
+        }
 
         let started_at = Instant::now();
         match state
@@ -223,6 +293,12 @@ async fn forward_streaming_with_fallbacks(
                     return telemetry_error_response(&error).into_response();
                 }
 
+                if status.is_success() {
+                    mark_provider_success(state, &model.provider);
+                } else if should_try_fallback(status) {
+                    mark_provider_failure(state, &model.provider);
+                }
+
                 if status.is_success() || !should_try_fallback(status) {
                     let mut response_headers = route_headers(&model, &candidate.model_id, decision);
                     response_headers.insert(
@@ -239,6 +315,7 @@ async fn forward_streaming_with_fallbacks(
                 last_status = Some(status);
             }
             Err(error) => {
+                mark_provider_failure(state, &model.provider);
                 let error = error.to_string();
                 if let Err(telemetry_error) = record_model_attempt(
                     state,
@@ -287,6 +364,18 @@ async fn forward_with_fallbacks(
             Err(error) => return error.into_response(),
         };
 
+        if !within_budget(state, candidate.estimated_cost) {
+            last_error = Some(format!(
+                "model {} exceeds configured max estimated cost",
+                candidate.model_id
+            ));
+            continue;
+        }
+        if provider_in_cooldown(state, &model.provider) {
+            last_error = Some(format!("provider {} is cooling down", model.provider));
+            continue;
+        }
+
         let started_at = Instant::now();
         match state
             .provider_client
@@ -315,6 +404,12 @@ async fn forward_with_fallbacks(
                     return telemetry_error_response(&error).into_response();
                 }
 
+                if status.is_success() {
+                    mark_provider_success(state, &model.provider);
+                } else if should_try_fallback(status) {
+                    mark_provider_failure(state, &model.provider);
+                }
+
                 if status.is_success() || !should_try_fallback(status) {
                     let response_headers = route_headers(&model, &candidate.model_id, decision);
                     return (status, response_headers, Json(provider_response.body))
@@ -323,6 +418,7 @@ async fn forward_with_fallbacks(
                 last_response = Some((status, provider_response.body));
             }
             Err(error) => {
+                mark_provider_failure(state, &model.provider);
                 let error = error.to_string();
                 if let Err(telemetry_error) = record_model_attempt(
                     state,
@@ -382,6 +478,48 @@ fn should_try_fallback(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
+fn within_budget(state: &AppState, estimated_cost: f64) -> bool {
+    state
+        .max_estimated_cost
+        .is_none_or(|max_estimated_cost| estimated_cost <= max_estimated_cost)
+}
+
+fn provider_in_cooldown(state: &AppState, provider_id: &ProviderId) -> bool {
+    let Ok(mut health) = state.provider_health.lock() else {
+        return false;
+    };
+    let Some(provider_health) = health.get_mut(provider_id) else {
+        return false;
+    };
+    match provider_health.cooldown_until {
+        Some(until) if Instant::now() < until => true,
+        Some(_) => {
+            provider_health.cooldown_until = None;
+            provider_health.consecutive_failures = 0;
+            false
+        }
+        None => false,
+    }
+}
+
+fn mark_provider_success(state: &AppState, provider_id: &ProviderId) {
+    if let Ok(mut health) = state.provider_health.lock() {
+        health.remove(provider_id);
+    }
+}
+
+fn mark_provider_failure(state: &AppState, provider_id: &ProviderId) {
+    let Ok(mut health) = state.provider_health.lock() else {
+        return;
+    };
+    let provider_health = health.entry(provider_id.clone()).or_default();
+    provider_health.consecutive_failures = provider_health.consecutive_failures.saturating_add(1);
+    if provider_health.consecutive_failures >= state.provider_failure_threshold {
+        provider_health.cooldown_until =
+            Some(Instant::now() + std::time::Duration::from_millis(state.provider_cooldown_ms));
+    }
+}
+
 fn route_headers(
     model: &RouteableModel,
     attempted_model_id: &ModelId,
@@ -436,6 +574,34 @@ async fn route_request(
         .router
         .route_chat(request, is_first_message)
         .map_err(|error| router_error_response(&error))
+}
+
+fn authorize(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let Some(expected_key) = state.api_key.as_deref() else {
+        return Ok(());
+    };
+    if bearer_token(headers).is_some_and(|token| token == expected_key)
+        || header_value(headers, "x-api-key").is_some_and(|token| token == expected_key)
+    {
+        return Ok(());
+    }
+    Err(error_response(
+        StatusCode::UNAUTHORIZED,
+        "missing or invalid brouter API key",
+        "authentication_error",
+    ))
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = header_value(headers, header::AUTHORIZATION.as_str())?;
+    value.strip_prefix("Bearer ")
+}
+
+fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
 }
 
 fn router_error_response(error: &RouterError) -> (StatusCode, Json<ErrorResponse>) {
@@ -521,6 +687,44 @@ fn metadata_session_id(request: &ChatCompletionRequest) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+struct UsageQuery {
+    session_id: Option<String>,
+    model: Option<String>,
+    success: Option<bool>,
+    since_ms: Option<u64>,
+    until_ms: Option<u64>,
+}
+
+fn filter_usage_events(events: Vec<UsageEvent>, query: &UsageQuery) -> Vec<UsageEvent> {
+    events
+        .into_iter()
+        .filter(|event| {
+            query
+                .session_id
+                .as_ref()
+                .is_none_or(|session_id| event.session_id.as_ref() == Some(session_id))
+        })
+        .filter(|event| {
+            query
+                .model
+                .as_ref()
+                .is_none_or(|model| event.selected_model.as_str() == model)
+        })
+        .filter(|event| query.success.is_none_or(|success| event.success == success))
+        .filter(|event| {
+            query
+                .since_ms
+                .is_none_or(|since| event.timestamp_ms >= since)
+        })
+        .filter(|event| {
+            query
+                .until_ms
+                .is_none_or(|until| event.timestamp_ms <= until)
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct HealthResponse {
     ok: bool,
@@ -567,6 +771,7 @@ mod tests {
         assert_eq!(body["model"], "cheap-upstream");
 
         let usage_response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
@@ -578,6 +783,63 @@ mod tests {
             .expect("usage request should complete");
         let usage = response_json(usage_response).await;
         assert_eq!(usage.as_array().map_or(0, Vec::len), 2);
+
+        let second_response = app
+            .clone()
+            .oneshot(chat_request("debug this Rust error", false))
+            .await
+            .expect("second request should complete");
+        assert_eq!(second_response.status(), StatusCode::OK);
+
+        let usage_response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/brouter/usage?success=false")
+                    .body(Body::empty())
+                    .expect("usage request should build"),
+            )
+            .await
+            .expect("usage request should complete");
+        let usage = response_json(usage_response).await;
+        assert_eq!(usage.as_array().map_or(0, Vec::len), 1);
+    }
+
+    #[tokio::test]
+    async fn authenticated_routes_require_api_key() {
+        let upstream = spawn_echo_upstream().await;
+        let config = single_provider_config(upstream);
+        let app = build_app_with_api_key(
+            &config,
+            TelemetryStore::memory(),
+            Some("secret".to_string()),
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .expect("models request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/models")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::empty())
+                    .expect("models request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -688,6 +950,7 @@ mod tests {
                 kind: ProviderKind::OpenAiCompatible,
                 base_url: Some(base_url),
                 api_key_env: None,
+                timeout_ms: None,
             },
         );
         config.models.insert(
@@ -713,6 +976,7 @@ mod tests {
                 kind: ProviderKind::OpenAiCompatible,
                 base_url: Some(failing_base_url),
                 api_key_env: None,
+                timeout_ms: None,
             },
         );
         providers.insert(
@@ -721,6 +985,7 @@ mod tests {
                 kind: ProviderKind::OpenAiCompatible,
                 base_url: Some(healthy_base_url),
                 api_key_env: None,
+                timeout_ms: None,
             },
         );
 
@@ -750,10 +1015,12 @@ mod tests {
             },
         );
 
-        BrouterConfig {
+        let mut config = BrouterConfig {
             providers,
             models,
             ..BrouterConfig::default()
-        }
+        };
+        config.router.provider_failure_threshold = 1;
+        config
     }
 }

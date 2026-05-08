@@ -22,10 +22,12 @@ path = "src/main.rs"
 anyhow = { workspace = true, features = ["std"] }
 brouter_api_models = { workspace = true }
 brouter_config = { workspace = true }
+brouter_config_models = { workspace = true }
 brouter_router = { workspace = true }
 brouter_router_models = { workspace = true }
 brouter_server = { workspace = true }
 clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true, features = [
@@ -40,6 +42,7 @@ default = []
 fail-on-warnings = [
     "brouter_api_models/fail-on-warnings",
     "brouter_config/fail-on-warnings",
+    "brouter_config_models/fail-on-warnings",
     "brouter_router/fail-on-warnings",
     "brouter_router_models/fail-on-warnings",
     "brouter_server/fail-on-warnings",

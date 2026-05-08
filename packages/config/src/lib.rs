@@ -82,6 +82,9 @@ pub fn validate_config(config: &BrouterConfig) -> Result<(), ConfigError> {
 /// Configuration validation warning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigWarning {
+    ServerApiKeyEnvMissing {
+        env_var: String,
+    },
     UnknownModelCapability {
         model_id: String,
         capability: String,
@@ -120,6 +123,10 @@ pub enum ConfigWarning {
 impl std::fmt::Display for ConfigWarning {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ServerApiKeyEnvMissing { env_var } => write!(
+                formatter,
+                "server references missing API key environment variable {env_var}"
+            ),
             Self::UnknownModelCapability {
                 model_id,
                 capability,
@@ -188,10 +195,21 @@ impl std::fmt::Display for ConfigWarning {
 #[must_use]
 pub fn validate_config_warnings(config: &BrouterConfig) -> Vec<ConfigWarning> {
     let mut warnings = Vec::new();
+    collect_server_warnings(config, &mut warnings);
     collect_provider_warnings(config, &mut warnings);
     collect_model_warnings(config, &mut warnings);
     collect_rule_warnings(config, &mut warnings);
     warnings
+}
+
+fn collect_server_warnings(config: &BrouterConfig, warnings: &mut Vec<ConfigWarning>) {
+    if let Some(env_var) = &config.server.api_key_env
+        && std::env::var_os(env_var).is_none()
+    {
+        warnings.push(ConfigWarning::ServerApiKeyEnvMissing {
+            env_var: env_var.clone(),
+        });
+    }
 }
 
 fn collect_provider_warnings(config: &BrouterConfig, warnings: &mut Vec<ConfigWarning>) {
@@ -437,6 +455,7 @@ mod tests {
                 kind: ProviderKind::OpenAiCompatible,
                 base_url: Some("http://localhost:11434/v1".to_string()),
                 api_key_env: None,
+                timeout_ms: None,
             },
         );
         config.models.insert(
@@ -464,6 +483,7 @@ mod tests {
                 kind: ProviderKind::OpenAiCompatible,
                 base_url: None,
                 api_key_env: None,
+                timeout_ms: None,
             },
         );
         config.models.insert(

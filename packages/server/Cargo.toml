@@ -11,7 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-axum                     = { workspace = true, features = ["http1", "json", "tokio"] }
+axum                     = { workspace = true, features = ["http1", "json", "query", "tokio"] }
 brouter_api_models       = { workspace = true }
 brouter_config           = { workspace = true }
 brouter_config_models    = { workspace = true }

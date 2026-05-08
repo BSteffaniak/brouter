@@ -507,6 +507,7 @@ mod tests {
             tool_choice: None,
             response_format: None,
             metadata: None,
+            extra: std::collections::BTreeMap::new(),
         }
     }
 
