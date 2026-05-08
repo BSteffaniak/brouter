@@ -4,6 +4,8 @@
 
 //! Provider registry and forwarding primitives for brouter.
 
+mod openai_codex;
+
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::time::Duration;
@@ -97,6 +99,9 @@ impl ProviderClient {
                 self.anthropic_chat_completions(provider, model, request)
                     .await
             }
+            ProviderKind::OpenaiCodex => {
+                openai_codex::chat_completions(&self.http, provider, model, request).await
+            }
         }
     }
 
@@ -130,6 +135,9 @@ impl ProviderClient {
                     .await?;
                 Ok(anthropic_stream_response(response, &model.upstream_model))
             }
+            ProviderKind::OpenaiCodex => {
+                openai_codex::chat_completions_response(&self.http, provider, model, request).await
+            }
         }
     }
 
@@ -157,6 +165,10 @@ impl ProviderClient {
             ProviderKind::Anthropic => Err(ProviderError::UnsupportedProviderKind {
                 provider_id: model.provider.to_string(),
                 kind: "anthropic embeddings".to_string(),
+            }),
+            ProviderKind::OpenaiCodex => Err(ProviderError::UnsupportedProviderKind {
+                provider_id: model.provider.to_string(),
+                kind: "openai-codex embeddings".to_string(),
             }),
         }
     }
@@ -328,6 +340,11 @@ pub enum ProviderError {
     },
     #[error("provider {provider_id} kind {kind} is not implemented yet")]
     UnsupportedProviderKind { provider_id: String, kind: String },
+    #[error("provider {provider_id} authentication failed: {message}")]
+    Auth {
+        provider_id: String,
+        message: String,
+    },
     #[error("upstream HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
 }
@@ -356,7 +373,7 @@ fn parse_provider_body(text: &str) -> Value {
     serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string()))
 }
 
-fn raw_stream_response(response: reqwest::Response) -> ProviderStreamResponse {
+pub(crate) fn raw_stream_response(response: reqwest::Response) -> ProviderStreamResponse {
     let status = response.status().as_u16();
     let stream = response.bytes_stream().map_err(ProviderError::Http);
     ProviderStreamResponse {
@@ -746,6 +763,9 @@ mod tests {
                 api_key_env: None,
                 timeout_ms: None,
                 max_estimated_cost: None,
+                auth_backend: None,
+                auth_profile: None,
+                auth_vault_path: None,
             },
         );
         let mut models = BTreeMap::new();
@@ -779,6 +799,9 @@ mod tests {
                 api_key_env: None,
                 timeout_ms: None,
                 max_estimated_cost: None,
+                auth_backend: None,
+                auth_profile: None,
+                auth_vault_path: None,
             },
         );
         let mut models = BTreeMap::new();

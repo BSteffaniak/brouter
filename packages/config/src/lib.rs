@@ -511,6 +511,9 @@ mod tests {
                 api_key_env: None,
                 timeout_ms: None,
                 max_estimated_cost: None,
+                auth_backend: None,
+                auth_profile: None,
+                auth_vault_path: None,
             },
         );
         config.models.insert(
@@ -541,6 +544,9 @@ mod tests {
                 api_key_env: None,
                 timeout_ms: None,
                 max_estimated_cost: None,
+                auth_backend: None,
+                auth_profile: None,
+                auth_vault_path: None,
             },
         );
         config.models.insert(

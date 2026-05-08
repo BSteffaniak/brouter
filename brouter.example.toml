@@ -59,6 +59,15 @@ timeout_ms = 60000
 # Optional provider-level per-request estimated cost budget.
 # max_estimated_cost = 0.05
 
+# ChatGPT/Codex Max subscription auth through a brouter-owned sshenv vault.
+# Create credentials with browser OAuth: brouter auth openai-codex login --profile openai-max
+# [providers.openai_max]
+# kind = "openai-codex"
+# auth_backend = "sshenv"
+# auth_profile = "openai-max"
+# auth_vault_path = "~/.local/state/brouter/auth/vault"
+# timeout_ms = 60000
+
 [models.fast_local]
 provider = "ollama"
 model = "qwen2.5-coder:7b"

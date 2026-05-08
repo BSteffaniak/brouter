@@ -190,6 +190,12 @@ pub struct ProviderConfig {
     pub timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_estimated_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_vault_path: Option<String>,
 }
 
 /// Supported provider kinds.
@@ -198,6 +204,7 @@ pub struct ProviderConfig {
 pub enum ProviderKind {
     OpenAiCompatible,
     Anthropic,
+    OpenaiCodex,
 }
 
 /// Model configuration used by the router.

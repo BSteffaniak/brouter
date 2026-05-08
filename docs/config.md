@@ -49,11 +49,29 @@ All fields are optional floats:
 
 ## `[providers.<id>]`
 
-- `kind`: `open-ai-compatible` or `anthropic`
+- `kind`: `open-ai-compatible`, `anthropic`, or `openai-codex`
 - `base_url` optional string; required for OpenAI-compatible providers
 - `api_key_env` optional string
 - `timeout_ms` optional integer
 - `max_estimated_cost` optional float; provider-level per-request budget
+- `auth_backend` optional string; `openai-codex` currently supports `sshenv`
+- `auth_profile` optional string; sshenv profile containing ChatGPT/Codex tokens
+- `auth_vault_path` optional string; sshenv vault path. If omitted, brouter uses `$BROUTER_AUTH_VAULT` or `~/.local/state/brouter/auth/vault`.
+
+`openai-codex` expects brouter-owned sshenv keys such as
+`BROUTER_OPENAI_CODEX_ACCESS_TOKEN`, `BROUTER_OPENAI_CODEX_REFRESH_TOKEN`,
+`BROUTER_OPENAI_CODEX_EXPIRES_AT`, and `BROUTER_OPENAI_CODEX_ACCOUNT_ID`.
+Create them with browser OAuth:
+
+```sh
+brouter auth openai-codex login --profile openai-max
+```
+
+For headless machines, opt into Codex device-code auth:
+
+```sh
+brouter auth openai-codex login --profile openai-max --headless
+```
 
 ## `[models.<id>]`
 

@@ -20,6 +20,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }
+base64 = { workspace = true }
 brouter_api_models = { workspace = true }
 brouter_config = { workspace = true }
 brouter_config_models = { workspace = true }
@@ -27,9 +28,13 @@ brouter_router = { workspace = true }
 brouter_router_models = { workspace = true }
 brouter_server = { workspace = true }
 clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
+rand = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["std"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+sha2 = { workspace = true }
+sshenv_vault = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 tracing-subscriber = { workspace = true, features = [
     "ansi",
     "env-filter",
@@ -37,6 +42,7 @@ tracing-subscriber = { workspace = true, features = [
     "json",
     "std",
 ] }
+zeroize = { workspace = true }
 
 [features]
 default = []
