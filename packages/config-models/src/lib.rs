@@ -79,6 +79,8 @@ pub struct RouterConfig {
     pub provider_cooldown_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_estimated_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_session_estimated_cost: Option<f64>,
 }
 
 impl Default for RouterConfig {
@@ -92,6 +94,7 @@ impl Default for RouterConfig {
             provider_failure_threshold: default_provider_failure_threshold(),
             provider_cooldown_ms: default_provider_cooldown_ms(),
             max_estimated_cost: None,
+            max_session_estimated_cost: None,
         }
     }
 }
@@ -160,7 +163,7 @@ pub struct TelemetryConfig {
 }
 
 /// Provider configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderConfig {
     pub kind: ProviderKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -169,6 +172,8 @@ pub struct ProviderConfig {
     pub api_key_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_estimated_cost: Option<f64>,
 }
 
 /// Supported provider kinds.
@@ -193,4 +198,6 @@ pub struct ModelConfig {
     pub quality: Option<u8>,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_estimated_cost: Option<f64>,
 }

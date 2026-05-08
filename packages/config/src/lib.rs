@@ -139,7 +139,7 @@ impl std::fmt::Display for ConfigWarning {
             Self::ModelMissingChatCapability { model_id } => {
                 write!(
                     formatter,
-                    "model {model_id} does not declare chat capability"
+                    "model {model_id} does not declare chat or embeddings capability"
                 )
             }
             Self::OpenAiCompatibleProviderMissingBaseUrl { provider_id } => write!(
@@ -233,9 +233,11 @@ fn collect_provider_warnings(config: &BrouterConfig, warnings: &mut Vec<ConfigWa
 fn collect_model_warnings(config: &BrouterConfig, warnings: &mut Vec<ConfigWarning>) {
     for (model_id, model) in &config.models {
         let mut has_chat = false;
+        let mut has_embeddings = false;
         for capability in &model.capabilities {
             match capability.parse() {
                 Ok(brouter_provider_models::ModelCapability::Chat) => has_chat = true,
+                Ok(brouter_provider_models::ModelCapability::Embeddings) => has_embeddings = true,
                 Ok(_) => {}
                 Err(_) => warnings.push(ConfigWarning::UnknownModelCapability {
                     model_id: model_id.clone(),
@@ -243,7 +245,7 @@ fn collect_model_warnings(config: &BrouterConfig, warnings: &mut Vec<ConfigWarni
                 }),
             }
         }
-        if !has_chat {
+        if !has_chat && !has_embeddings {
             warnings.push(ConfigWarning::ModelMissingChatCapability {
                 model_id: model_id.clone(),
             });
@@ -456,6 +458,7 @@ mod tests {
                 base_url: Some("http://localhost:11434/v1".to_string()),
                 api_key_env: None,
                 timeout_ms: None,
+                max_estimated_cost: None,
             },
         );
         config.models.insert(
@@ -468,6 +471,7 @@ mod tests {
                 output_cost_per_million: 0.0,
                 quality: None,
                 capabilities: vec!["chat".to_string()],
+                max_estimated_cost: None,
             },
         );
 
@@ -484,6 +488,7 @@ mod tests {
                 base_url: None,
                 api_key_env: None,
                 timeout_ms: None,
+                max_estimated_cost: None,
             },
         );
         config.models.insert(
@@ -496,6 +501,7 @@ mod tests {
                 output_cost_per_million: 0.0,
                 quality: None,
                 capabilities: vec!["made_up".to_string()],
+                max_estimated_cost: None,
             },
         );
         config.router.rules.push(RouterRuleConfig {

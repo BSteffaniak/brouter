@@ -464,6 +464,8 @@ dependencies = [
  "brouter_api_models",
  "brouter_config_models",
  "brouter_provider_models",
+ "bytes",
+ "futures-util",
  "reqwest",
  "serde_json",
  "thiserror",

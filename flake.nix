@@ -75,6 +75,21 @@
         packages = {
           default = brouterPackage;
           brouter = brouterPackage;
+        } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          container = pkgs.dockerTools.buildLayeredImage {
+            name = "brouter";
+            tag = "latest";
+            contents = [ brouterPackage ];
+            config = {
+              Entrypoint = [ "${brouterPackage}/bin/brouter" ];
+              Cmd = [
+                "serve"
+                "--config"
+                "/config/brouter.toml"
+              ];
+              ExposedPorts."8080/tcp" = { };
+            };
+          };
         };
 
         apps =

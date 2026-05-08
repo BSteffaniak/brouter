@@ -21,13 +21,14 @@ patterns used by the sibling projects in this checkout.
 - `GET /health`
 - `GET /v1/models`
 - `POST /v1/chat/completions`
+- `POST /v1/embeddings`
 - `POST /v1/brouter/route/explain`
 - `GET /v1/brouter/usage`
 
 `/v1/chat/completions` supports non-streaming and streaming OpenAI-compatible
 upstreams, provider timeouts, fallback attempts for retryable failures,
-provider cooldowns after repeated failures, Anthropic non-streaming conversion,
-configurable scoring/routing rules, and optional SQLite telemetry via
+provider cooldowns after repeated failures, Anthropic non-streaming and streaming
+conversion, OpenAI-compatible embeddings forwarding, configurable scoring/routing rules, and optional SQLite telemetry via
 `switchy_database`. `/v1/brouter/usage` supports `session_id`, `model`,
 `success`, `since_ms`, and `until_ms` query filters.
 
@@ -103,6 +104,9 @@ OpenAI plus local fallback/private routing:
 default_objective = "balanced"
 provider_failure_threshold = 3
 provider_cooldown_ms = 30000
+# Optional global per-request/session budgets using router cost estimates.
+# max_estimated_cost = 0.05
+# max_session_estimated_cost = 1.00
 
 [[router.rules]]
 name = "private-local"
@@ -115,6 +119,19 @@ kind = "open-ai-compatible"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 timeout_ms = 60000
+# Optional provider-level per-request budget.
+# max_estimated_cost = 0.05
+```
+
+Embeddings model:
+
+```toml
+[models.embedding_cloud]
+provider = "openai"
+model = "text-embedding-3-small"
+context_window = 8192
+input_cost_per_million = 0.02
+capabilities = ["embeddings"]
 ```
 
 Optional local server auth:
@@ -151,6 +168,24 @@ WantedBy=multi-user.target
 
 The same TOML config format is used everywhere. Nix modules only generate that
 TOML and systemd wiring for users who prefer declarative Nix deployments.
+
+## Container image
+
+On Linux, the flake can build an OCI/Docker image:
+
+```sh
+nix build .#container
+```
+
+Run the resulting image with a mounted config directory and optional env file:
+
+```sh
+docker load < result
+docker run --rm -p 8080:8080 \
+  --env-file ./brouter.env \
+  -v "$PWD:/config:ro" \
+  brouter:latest
+```
 
 ## Nix usage
 

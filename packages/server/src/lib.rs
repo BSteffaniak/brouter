@@ -16,11 +16,13 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router as AxumRouter};
-use brouter_api_models::{ChatCompletionRequest, ErrorResponse, ModelListResponse, ModelObject};
+use brouter_api_models::{
+    ChatCompletionRequest, EmbeddingsRequest, ErrorResponse, ModelListResponse, ModelObject,
+};
 use brouter_config::{ConfigError, routeable_models, routing_rules, scoring_weights};
 use brouter_config_models::BrouterConfig;
 use brouter_provider::{ProviderClient, ProviderRegistry};
-use brouter_provider_models::{ModelId, ProviderId, RouteableModel};
+use brouter_provider_models::{ModelCapability, ModelId, ProviderId, RouteableModel};
 use brouter_router::{Router, RouterError};
 use brouter_router_models::{RoutingDecision, RoutingObjective};
 use brouter_telemetry::{TelemetryError, TelemetryStore, now_millis};
@@ -62,6 +64,9 @@ struct AppState {
     provider_failure_threshold: u32,
     provider_cooldown_ms: u64,
     max_estimated_cost: Option<f64>,
+    max_session_estimated_cost: Option<f64>,
+    model_budgets: BTreeMap<ModelId, f64>,
+    provider_budgets: BTreeMap<ProviderId, f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -131,12 +136,32 @@ fn build_app_with_api_key(
         provider_failure_threshold: config.router.provider_failure_threshold,
         provider_cooldown_ms: config.router.provider_cooldown_ms,
         max_estimated_cost: config.router.max_estimated_cost,
+        max_session_estimated_cost: config.router.max_session_estimated_cost,
+        model_budgets: config
+            .models
+            .iter()
+            .filter_map(|(id, model)| {
+                model
+                    .max_estimated_cost
+                    .map(|budget| (ModelId::new(id.clone()), budget))
+            })
+            .collect(),
+        provider_budgets: config
+            .providers
+            .iter()
+            .filter_map(|(id, provider)| {
+                provider
+                    .max_estimated_cost
+                    .map(|budget| (ProviderId::new(id.clone()), budget))
+            })
+            .collect(),
     };
 
     AxumRouter::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/embeddings", post(embeddings))
         .route("/v1/brouter/route/explain", post(route_explain))
         .route("/v1/brouter/usage", get(usage))
         .with_state(state)
@@ -236,6 +261,84 @@ async fn chat_completions(
 }
 
 #[allow(clippy::too_many_lines)]
+async fn embeddings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<EmbeddingsRequest>,
+) -> Response {
+    if let Err(error) = authorize(&state, &headers) {
+        return error.into_response();
+    }
+
+    let model = match embedding_model(&state, &request) {
+        Ok(model) => model,
+        Err(error) => return error.into_response(),
+    };
+    match state
+        .provider_client
+        .embeddings(&state.providers, &model, &request)
+        .await
+    {
+        Ok(provider_response) => {
+            let status = provider_status(provider_response.status);
+            let mut headers = HeaderMap::new();
+            insert_header(&mut headers, "x-brouter-selected-model", model.id.as_str());
+            insert_header(&mut headers, "x-brouter-provider", model.provider.as_str());
+            insert_header(
+                &mut headers,
+                "x-brouter-upstream-model",
+                &model.upstream_model,
+            );
+            (status, headers, Json(provider_response.body)).into_response()
+        }
+        Err(error) => error_response(StatusCode::BAD_GATEWAY, error.to_string(), "provider_error")
+            .into_response(),
+    }
+}
+
+fn embedding_model(
+    state: &AppState,
+    request: &EmbeddingsRequest,
+) -> Result<RouteableModel, (StatusCode, Json<ErrorResponse>)> {
+    if matches!(request.model.as_str(), "brouter/auto" | "auto") {
+        return state
+            .router
+            .models()
+            .iter()
+            .find(|model| model.has_capability(ModelCapability::Embeddings))
+            .cloned()
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::BAD_REQUEST,
+                    "no configured embedding model",
+                    "routing_error",
+                )
+            });
+    }
+    let model = state
+        .router
+        .models()
+        .iter()
+        .find(|model| model.id.as_str() == request.model)
+        .cloned()
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                format!("unknown embedding model {}", request.model),
+                "routing_error",
+            )
+        })?;
+    if !model.has_capability(ModelCapability::Embeddings) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!("model {} does not support embeddings", request.model),
+            "routing_error",
+        ));
+    }
+    Ok(model)
+}
+
+#[allow(clippy::too_many_lines)]
 async fn forward_streaming_with_fallbacks(
     state: &AppState,
     headers: &HeaderMap,
@@ -251,13 +354,17 @@ async fn forward_streaming_with_fallbacks(
             Err(error) => return error.into_response(),
         };
 
-        if !within_budget(state, candidate.estimated_cost) {
-            last_status = Some(StatusCode::PAYMENT_REQUIRED);
-            last_error = Some(format!(
-                "model {} exceeds configured max estimated cost",
-                candidate.model_id
-            ));
-            continue;
+        match within_budget(state, headers, request, &model, candidate.estimated_cost).await {
+            Ok(true) => {}
+            Ok(false) => {
+                last_status = Some(StatusCode::PAYMENT_REQUIRED);
+                last_error = Some(format!(
+                    "model {} exceeds configured max estimated cost",
+                    candidate.model_id
+                ));
+                continue;
+            }
+            Err(error) => return telemetry_error_response(&error).into_response(),
         }
         if provider_in_cooldown(state, &model.provider) {
             last_status = Some(StatusCode::SERVICE_UNAVAILABLE);
@@ -272,7 +379,7 @@ async fn forward_streaming_with_fallbacks(
             .await
         {
             Ok(response) => {
-                let status = provider_status(response.status().as_u16());
+                let status = provider_status(response.status);
                 if let Err(error) = record_model_attempt(
                     state,
                     headers,
@@ -305,11 +412,7 @@ async fn forward_streaming_with_fallbacks(
                         header::CONTENT_TYPE,
                         HeaderValue::from_static("text/event-stream"),
                     );
-                    return (
-                        status,
-                        response_headers,
-                        Body::from_stream(response.bytes_stream()),
-                    )
+                    return (status, response_headers, Body::from_stream(response.stream))
                         .into_response();
                 }
                 last_status = Some(status);
@@ -364,12 +467,16 @@ async fn forward_with_fallbacks(
             Err(error) => return error.into_response(),
         };
 
-        if !within_budget(state, candidate.estimated_cost) {
-            last_error = Some(format!(
-                "model {} exceeds configured max estimated cost",
-                candidate.model_id
-            ));
-            continue;
+        match within_budget(state, headers, request, &model, candidate.estimated_cost).await {
+            Ok(true) => {}
+            Ok(false) => {
+                last_error = Some(format!(
+                    "model {} exceeds configured max estimated cost",
+                    candidate.model_id
+                ));
+                continue;
+            }
+            Err(error) => return telemetry_error_response(&error).into_response(),
         }
         if provider_in_cooldown(state, &model.provider) {
             last_error = Some(format!("provider {} is cooling down", model.provider));
@@ -478,10 +585,42 @@ fn should_try_fallback(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
-fn within_budget(state: &AppState, estimated_cost: f64) -> bool {
-    state
+async fn within_budget(
+    state: &AppState,
+    headers: &HeaderMap,
+    request: &ChatCompletionRequest,
+    model: &RouteableModel,
+    estimated_cost: f64,
+) -> Result<bool, TelemetryError> {
+    let request_budget_allows = state
         .max_estimated_cost
         .is_none_or(|max_estimated_cost| estimated_cost <= max_estimated_cost)
+        && state
+            .provider_budgets
+            .get(&model.provider)
+            .is_none_or(|max_estimated_cost| estimated_cost <= *max_estimated_cost)
+        && state
+            .model_budgets
+            .get(&model.id)
+            .is_none_or(|max_estimated_cost| estimated_cost <= *max_estimated_cost);
+    if !request_budget_allows {
+        return Ok(false);
+    }
+    let Some(max_session_cost) = state.max_session_estimated_cost else {
+        return Ok(true);
+    };
+    let Some(session_id) = session_id(headers, request) else {
+        return Ok(true);
+    };
+    let session_cost = state
+        .telemetry
+        .events()
+        .await?
+        .iter()
+        .filter(|event| event.session_id.as_ref() == Some(&session_id))
+        .map(|event| event.estimated_cost)
+        .sum::<f64>();
+    Ok(session_cost + estimated_cost <= max_session_cost)
 }
 
 fn provider_in_cooldown(state: &AppState, provider_id: &ProviderId) -> bool {
@@ -806,6 +945,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn embeddings_forward_to_embedding_model() {
+        let upstream = spawn_embeddings_upstream().await;
+        let config = single_provider_config(upstream);
+        let app = build_app(&config, TelemetryStore::memory());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/embeddings")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"model": "brouter/auto", "input": "hello"}).to_string(),
+                    ))
+                    .expect("embeddings request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-brouter-selected-model"),
+            Some(&HeaderValue::from_static("cheap_cloud"))
+        );
+        let body = response_json(response).await;
+        assert_eq!(body["model"], "cheap-upstream");
+    }
+
+    #[tokio::test]
     async fn authenticated_routes_require_api_key() {
         let upstream = spawn_echo_upstream().await;
         let config = single_provider_config(upstream);
@@ -881,6 +1049,17 @@ mod tests {
         spawn_upstream(AxumRouter::new().route("/v1/chat/completions", post(echo))).await
     }
 
+    async fn spawn_embeddings_upstream() -> String {
+        async fn embeddings(Json(body): Json<Value>) -> Json<Value> {
+            Json(json!({
+                "object": "list",
+                "model": body["model"].clone(),
+                "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2]}]
+            }))
+        }
+        spawn_upstream(AxumRouter::new().route("/v1/embeddings", post(embeddings))).await
+    }
+
     async fn spawn_streaming_upstream() -> String {
         async fn stream() -> (HeaderMap, &'static str) {
             let mut headers = HeaderMap::new();
@@ -951,6 +1130,7 @@ mod tests {
                 base_url: Some(base_url),
                 api_key_env: None,
                 timeout_ms: None,
+                max_estimated_cost: None,
             },
         );
         config.models.insert(
@@ -962,7 +1142,8 @@ mod tests {
                 input_cost_per_million: 0.15,
                 output_cost_per_million: 0.60,
                 quality: Some(70),
-                capabilities: vec!["chat".to_string()],
+                capabilities: vec!["chat".to_string(), "embeddings".to_string()],
+                max_estimated_cost: None,
             },
         );
         config
@@ -977,6 +1158,7 @@ mod tests {
                 base_url: Some(failing_base_url),
                 api_key_env: None,
                 timeout_ms: None,
+                max_estimated_cost: None,
             },
         );
         providers.insert(
@@ -986,6 +1168,7 @@ mod tests {
                 base_url: Some(healthy_base_url),
                 api_key_env: None,
                 timeout_ms: None,
+                max_estimated_cost: None,
             },
         );
 
@@ -1000,6 +1183,7 @@ mod tests {
                 output_cost_per_million: 8.0,
                 quality: Some(90),
                 capabilities: vec!["chat".to_string(), "code".to_string()],
+                max_estimated_cost: None,
             },
         );
         models.insert(
@@ -1012,6 +1196,7 @@ mod tests {
                 output_cost_per_million: 0.60,
                 quality: Some(70),
                 capabilities: vec!["chat".to_string(), "code".to_string()],
+                max_estimated_cost: None,
             },
         );
 

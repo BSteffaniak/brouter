@@ -5,16 +5,19 @@
 //! Provider registry and forwarding primitives for brouter.
 
 use std::collections::BTreeMap;
+use std::pin::Pin;
 use std::time::Duration;
 
-use brouter_api_models::{ChatCompletionRequest, MessageContent};
+use brouter_api_models::{ChatCompletionRequest, EmbeddingsRequest, MessageContent};
 use brouter_config_models::{BrouterConfig, ProviderConfig, ProviderKind};
 use brouter_provider_models::{ProviderId, RouteableModel};
+use bytes::Bytes;
+use futures_util::{Stream, StreamExt, TryStreamExt};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 /// Registry of configured upstream providers.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProviderRegistry {
     providers: BTreeMap<ProviderId, ProviderConfig>,
 }
@@ -112,16 +115,48 @@ impl ProviderClient {
         registry: &ProviderRegistry,
         model: &RouteableModel,
         request: &ChatCompletionRequest,
-    ) -> Result<reqwest::Response, ProviderError> {
+    ) -> Result<ProviderStreamResponse, ProviderError> {
         let provider = provider_for(registry, model)?;
         match provider.kind {
             ProviderKind::OpenAiCompatible => {
-                self.openai_compatible_chat_completions(provider, model, request)
-                    .await
+                let response = self
+                    .openai_compatible_chat_completions(provider, model, request)
+                    .await?;
+                Ok(raw_stream_response(response))
+            }
+            ProviderKind::Anthropic => {
+                let response = self
+                    .anthropic_chat_completions_response(provider, model, request)
+                    .await?;
+                Ok(anthropic_stream_response(response, &model.upstream_model))
+            }
+        }
+    }
+
+    /// Forwards an embeddings request to an OpenAI-compatible upstream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected provider is missing, unsupported,
+    /// lacks required configuration, has a missing API key environment variable,
+    /// or the HTTP request fails.
+    pub async fn embeddings(
+        &self,
+        registry: &ProviderRegistry,
+        model: &RouteableModel,
+        request: &EmbeddingsRequest,
+    ) -> Result<ProviderResponse, ProviderError> {
+        let provider = provider_for(registry, model)?;
+        match provider.kind {
+            ProviderKind::OpenAiCompatible => {
+                let response = self
+                    .openai_compatible_embeddings(provider, model, request)
+                    .await?;
+                buffered_provider_response(response).await
             }
             ProviderKind::Anthropic => Err(ProviderError::UnsupportedProviderKind {
                 provider_id: model.provider.to_string(),
-                kind: "anthropic streaming".to_string(),
+                kind: "anthropic embeddings".to_string(),
             }),
         }
     }
@@ -167,6 +202,36 @@ impl ProviderClient {
         }
     }
 
+    async fn anthropic_chat_completions_response(
+        &self,
+        provider: &ProviderConfig,
+        model: &RouteableModel,
+        request: &ChatCompletionRequest,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let base_url = provider
+            .base_url
+            .as_deref()
+            .unwrap_or("https://api.anthropic.com/v1");
+        let url = format!("{}/messages", base_url.trim_end_matches('/'));
+        let anthropic_request = anthropic_request(model, request);
+        let mut request_builder = self
+            .http
+            .post(url)
+            .header("anthropic-version", "2023-06-01")
+            .json(&anthropic_request);
+        if let Some(timeout) = provider_timeout(provider) {
+            request_builder = request_builder.timeout(timeout);
+        }
+        if let Some(api_key_env) = &provider.api_key_env {
+            let api_key = std::env::var(api_key_env).map_err(|_| ProviderError::MissingApiKey {
+                env_var: api_key_env.clone(),
+                provider_id: model.provider.to_string(),
+            })?;
+            request_builder = request_builder.header("x-api-key", api_key);
+        }
+        Ok(request_builder.send().await?)
+    }
+
     async fn openai_compatible_chat_completions(
         &self,
         provider: &ProviderConfig,
@@ -198,6 +263,38 @@ impl ProviderClient {
 
         Ok(request_builder.send().await?)
     }
+
+    async fn openai_compatible_embeddings(
+        &self,
+        provider: &ProviderConfig,
+        model: &RouteableModel,
+        request: &EmbeddingsRequest,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let base_url =
+            provider
+                .base_url
+                .as_deref()
+                .ok_or_else(|| ProviderError::MissingBaseUrl {
+                    provider_id: model.provider.to_string(),
+                })?;
+        let url = format!("{}/embeddings", base_url.trim_end_matches('/'));
+        let mut upstream_request = request.clone();
+        upstream_request.model.clone_from(&model.upstream_model);
+
+        let mut request_builder = self.http.post(url).json(&upstream_request);
+        if let Some(timeout) = provider_timeout(provider) {
+            request_builder = request_builder.timeout(timeout);
+        }
+        if let Some(api_key_env) = &provider.api_key_env {
+            let api_key = std::env::var(api_key_env).map_err(|_| ProviderError::MissingApiKey {
+                env_var: api_key_env.clone(),
+                provider_id: model.provider.to_string(),
+            })?;
+            request_builder = request_builder.bearer_auth(api_key);
+        }
+
+        Ok(request_builder.send().await?)
+    }
 }
 
 fn provider_timeout(provider: &ProviderConfig) -> Option<Duration> {
@@ -209,6 +306,12 @@ fn provider_timeout(provider: &ProviderConfig) -> Option<Duration> {
 pub struct ProviderResponse {
     pub status: u16,
     pub body: Value,
+}
+
+/// Provider streaming response payload.
+pub struct ProviderStreamResponse {
+    pub status: u16,
+    pub stream: Pin<Box<dyn Stream<Item = Result<Bytes, ProviderError>> + Send>>,
 }
 
 /// Provider forwarding error.
@@ -251,6 +354,79 @@ async fn buffered_provider_response(
 
 fn parse_provider_body(text: &str) -> Value {
     serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string()))
+}
+
+fn raw_stream_response(response: reqwest::Response) -> ProviderStreamResponse {
+    let status = response.status().as_u16();
+    let stream = response.bytes_stream().map_err(ProviderError::Http);
+    ProviderStreamResponse {
+        status,
+        stream: Box::pin(stream),
+    }
+}
+
+fn anthropic_stream_response(response: reqwest::Response, model: &str) -> ProviderStreamResponse {
+    let status = response.status().as_u16();
+    if !response.status().is_success() {
+        return raw_stream_response(response);
+    }
+    let model = model.to_string();
+    let stream = response.bytes_stream().map(move |chunk| {
+        chunk
+            .map(|bytes| anthropic_sse_chunk_to_openai(&String::from_utf8_lossy(&bytes), &model))
+            .map(Bytes::from)
+            .map_err(ProviderError::Http)
+    });
+    ProviderStreamResponse {
+        status,
+        stream: Box::pin(stream),
+    }
+}
+
+fn anthropic_sse_chunk_to_openai(chunk: &str, model: &str) -> String {
+    let mut output = String::new();
+    for line in chunk.lines() {
+        if let Some(event) = line.strip_prefix("data: ")
+            && let Some(openai_event) = anthropic_event_to_openai(event, model)
+        {
+            output.push_str("data: ");
+            output.push_str(&openai_event);
+            output.push_str("\n\n");
+        }
+    }
+    output
+}
+
+fn anthropic_event_to_openai(event: &str, model: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(event).ok()?;
+    match value.get("type").and_then(Value::as_str) {
+        Some("message_start") => Some(
+            json!({
+                "id": value.get("message").and_then(|message| message.get("id")).cloned().unwrap_or_else(|| Value::String("anthropic".to_string())),
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": model,
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
+            })
+            .to_string(),
+        ),
+        Some("content_block_delta") => value
+            .get("delta")
+            .and_then(|delta| delta.get("text"))
+            .and_then(Value::as_str)
+            .map(|text| {
+                json!({
+                    "id": "anthropic",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
+                })
+                .to_string()
+            }),
+        Some("message_stop") => Some("[DONE]".to_string()),
+        _ => None,
+    }
 }
 
 fn anthropic_request(model: &RouteableModel, request: &ChatCompletionRequest) -> Value {
@@ -426,6 +602,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn anthropic_streaming_converts_to_openai_sse() {
+        let upstream = spawn_anthropic_streaming_upstream().await;
+        let config = anthropic_config(upstream);
+        let registry = ProviderRegistry::from_config(&config);
+        let model = RouteableModel {
+            id: ModelId::new("anthropic_selected"),
+            provider: ProviderId::new("anthropic"),
+            upstream_model: "claude-test".to_string(),
+            context_window: 200_000,
+            input_cost_per_million: 3.0,
+            output_cost_per_million: 15.0,
+            quality: 90,
+            capabilities: vec![ModelCapability::Chat],
+        };
+
+        let mut response = ProviderClient::new()
+            .chat_completions_response(&registry, &model, &chat_request(true))
+            .await
+            .expect("anthropic stream should succeed");
+        let body = response
+            .stream
+            .next()
+            .await
+            .expect("stream should yield")
+            .expect("body should be readable");
+        let body = String::from_utf8(body.to_vec()).expect("body should be utf8");
+
+        assert!(body.contains("chat.completion.chunk"));
+        assert!(body.contains("anthropic hello"));
+        assert!(body.contains("[DONE]"));
+    }
+
+    #[tokio::test]
     async fn openai_compatible_streaming_returns_raw_response() {
         let upstream = spawn_echo_upstream().await;
         let config = test_config(upstream);
@@ -441,13 +650,36 @@ mod tests {
             capabilities: vec![ModelCapability::Chat],
         };
 
-        let response = ProviderClient::new()
+        let mut response = ProviderClient::new()
             .chat_completions_response(&registry, &model, &chat_request(true))
             .await
             .expect("provider forwarding should succeed");
-        let body = response.text().await.expect("body should be readable");
+        let body = response
+            .stream
+            .next()
+            .await
+            .expect("stream should yield")
+            .expect("body should be readable");
+        let body = String::from_utf8(body.to_vec()).expect("body should be utf8");
 
         assert!(body.contains("real-streaming-model"));
+    }
+
+    async fn spawn_anthropic_streaming_upstream() -> String {
+        async fn messages() -> &'static str {
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-test\"}}\n\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"anthropic hello\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n"
+        }
+        let app = AxumRouter::new().route("/v1/messages", post(messages));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("address should be available");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("fake upstream should serve");
+        });
+        base_url(address)
     }
 
     async fn spawn_anthropic_upstream() -> String {
@@ -513,6 +745,7 @@ mod tests {
                 base_url: Some(base_url),
                 api_key_env: None,
                 timeout_ms: None,
+                max_estimated_cost: None,
             },
         );
         let mut models = BTreeMap::new();
@@ -526,6 +759,7 @@ mod tests {
                 output_cost_per_million: 15.0,
                 quality: Some(90),
                 capabilities: vec!["chat".to_string(), "reasoning".to_string()],
+                max_estimated_cost: None,
             },
         );
         BrouterConfig {
@@ -544,6 +778,7 @@ mod tests {
                 base_url: Some(base_url),
                 api_key_env: None,
                 timeout_ms: None,
+                max_estimated_cost: None,
             },
         );
         let mut models = BTreeMap::new();
@@ -557,6 +792,7 @@ mod tests {
                 output_cost_per_million: 0.0,
                 quality: Some(80),
                 capabilities: vec!["chat".to_string()],
+                max_estimated_cost: None,
             },
         );
         BrouterConfig {

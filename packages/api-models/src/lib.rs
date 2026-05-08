@@ -92,6 +92,19 @@ fn extract_text_part(value: &Value) -> Option<String> {
     }
 }
 
+/// OpenAI-compatible embeddings request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmbeddingsRequest {
+    pub model: String,
+    pub input: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<u32>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
 /// Response returned by `/v1/models`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelListResponse {

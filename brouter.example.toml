@@ -9,8 +9,9 @@ default_objective = "balanced"
 debug_headers = true
 provider_failure_threshold = 3
 provider_cooldown_ms = 30000
-# Optional per-request budget guard based on the router's prompt cost estimate.
+# Optional budget guards based on router cost estimates.
 # max_estimated_cost = 0.05
+# max_session_estimated_cost = 1.00
 
 [router.scoring]
 quality_weight = 1.0
@@ -46,6 +47,8 @@ kind = "open-ai-compatible"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 timeout_ms = 60000
+# Optional provider-level per-request estimated cost budget.
+# max_estimated_cost = 0.05
 
 [models.fast_local]
 provider = "ollama"
@@ -73,3 +76,14 @@ input_cost_per_million = 2.00
 output_cost_per_million = 8.00
 quality = 90
 capabilities = ["chat", "code", "json", "tools", "reasoning"]
+# Optional model-level per-request estimated cost budget.
+# max_estimated_cost = 0.10
+
+[models.embedding_cloud]
+provider = "openai"
+model = "text-embedding-3-small"
+context_window = 8192
+input_cost_per_million = 0.02
+output_cost_per_million = 0.0
+quality = 70
+capabilities = ["embeddings"]

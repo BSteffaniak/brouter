@@ -28,3 +28,4 @@ jobs:
       - uses: cachix/install-nix-action@v31
       - run: nix flake check --no-build
       - run: nix build .#checks.x86_64-linux.example-config --no-link
+      - run: nix build .#container --no-link

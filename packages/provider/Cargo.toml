@@ -14,6 +14,8 @@ version     = { workspace = true }
 brouter_api_models      = { workspace = true }
 brouter_config_models   = { workspace = true }
 brouter_provider_models = { workspace = true }
+bytes                   = { workspace = true }
+futures-util            = { workspace = true }
 reqwest                 = { workspace = true, features = ["json", "rustls-tls", "stream"] }
 serde_json              = { workspace = true, features = ["std"] }
 thiserror               = { workspace = true }
