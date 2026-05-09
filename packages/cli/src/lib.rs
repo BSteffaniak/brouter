@@ -17,13 +17,20 @@ use anyhow::{Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use brouter_api_models::{ChatCompletionRequest, ChatMessage, MessageContent};
+use brouter_catalog_models::ResolvedModelMetadata;
 use brouter_config::{
-    apply_default_config, load_config, resolve_config_path, routeable_models, routing_rules,
-    scoring_weights, validate_config_warnings,
+    apply_default_config, llm_judge_config, load_config, resolve_config_path, routeable_models,
+    routing_rules, scoring_weights, validate_config_warnings,
 };
 use brouter_config_models::{BrouterConfig, ProviderConfig, ProviderKind};
+use brouter_provider::{ProviderClient, ProviderRegistry};
+use brouter_provider_models::{ProviderId, RouteableModel};
 use brouter_router::Router;
-use brouter_router_models::RoutingObjective;
+use brouter_router::{
+    DEFAULT_JUDGE_SYSTEM_PROMPT, build_judge_prompt, judge_request, parse_judge_response,
+    should_fire_trigger, top_2_score_gap,
+};
+use brouter_router_models::{JudgeConfig, JudgeSessionContext, RoutingDecision, RoutingObjective};
 use clap::{Parser, Subcommand};
 use rand::TryRngCore as _;
 use serde::Deserialize;
@@ -57,11 +64,13 @@ pub async fn run_cli() -> Result<()> {
             prompt,
             first_message,
             objective,
+            judge,
         } => explain_route(
             &resolve_and_load(config.as_deref())?,
             &prompt,
             first_message,
             objective.as_deref(),
+            judge,
         ),
     }
 }
@@ -838,7 +847,9 @@ fn explain_route(
     prompt: &str,
     first_message: bool,
     objective: Option<&str>,
+    force_judge: bool,
 ) -> Result<()> {
+    let judge_config = llm_judge_config(config);
     let objective = objective.map_or_else(
         || RoutingObjective::from_name(&config.router.default_objective),
         RoutingObjective::from_name,
@@ -850,8 +861,90 @@ fn explain_route(
         routing_rules(config),
     );
     let decision = router.route_chat(&prompt_request(prompt), first_message)?;
+    let decision = maybe_invoke_judge(config, judge_config.as_ref(), &decision, force_judge)?;
     println!("{}", serde_json::to_string_pretty(&decision)?);
     Ok(())
+}
+
+/// Optionally invokes the LLM judge and returns the updated decision.
+#[allow(clippy::too_many_lines)]
+fn maybe_invoke_judge(
+    config: &BrouterConfig,
+    judge_config: Option<&JudgeConfig>,
+    decision: &RoutingDecision,
+    force_judge: bool,
+) -> Result<RoutingDecision> {
+    let Some(judge_config) = judge_config else {
+        return Ok(decision.clone());
+    };
+
+    // Determine if the judge should fire.
+    let rule_matched = decision.features.matched_rules.iter().any(|name| {
+        routing_rules(config)
+            .iter()
+            .any(|r| &r.name == name && r.llm_judge)
+    });
+    let gap = top_2_score_gap(&decision.candidates);
+    let should_fire = force_judge || should_fire_trigger(&judge_config.trigger, gap, rule_matched);
+    if !should_fire {
+        return Ok(decision.clone());
+    }
+
+    // Build judge request components.
+    let judge_model_id = &judge_config.model;
+    let system_prompt = judge_config
+        .system_prompt
+        .as_deref()
+        .unwrap_or(DEFAULT_JUDGE_SYSTEM_PROMPT);
+    let session_context = JudgeSessionContext::default();
+    let prompt_text = format!(
+        "intent={:?}, reasoning={:?}",
+        decision.features.intent, decision.features.reasoning
+    );
+    let user_prompt = build_judge_prompt(
+        &prompt_text,
+        &format!("{:?}", decision.features.intent),
+        decision.objective,
+        &decision.candidates[..decision.candidates.len().min(judge_config.shortlist.size)],
+        &session_context,
+    );
+    let judge_request = judge_request(judge_config, system_prompt, &user_prompt);
+
+    // Call the judge model synchronously.
+    let models = routeable_models(config);
+    let judge_model = models
+        .iter()
+        .find(|m| &m.id == judge_model_id)
+        .cloned()
+        .unwrap_or_else(|| RouteableModel {
+            id: judge_model_id.clone(),
+            provider: judge_config
+                .provider
+                .clone()
+                .unwrap_or_else(|| ProviderId::new("local")),
+            upstream_model: judge_model_id.to_string(),
+            context_window: 128_000,
+            input_cost_per_million: 0.0,
+            output_cost_per_million: 0.0,
+            quality: 50,
+            capabilities: vec![],
+            attributes: BTreeMap::new(),
+            display_badges: vec![],
+            metadata: ResolvedModelMetadata::default(),
+        });
+    let client = ProviderClient::new();
+    let registry = ProviderRegistry::from_config(config);
+    let response = tokio::runtime::Runtime::new()?
+        .block_on(client.chat_completions(&registry, &judge_model, &judge_request))
+        .map_err(|e| anyhow::anyhow!("LLM judge call failed: {e}"))?;
+    let raw_text = response.body.to_string();
+    let reasoning = parse_judge_response(&raw_text, &decision.candidates, judge_model_id);
+    let mut updated = decision.clone();
+    updated.reasoning = Some(reasoning);
+    if updated.reasoning.as_ref().is_some_and(|r| r.overridden) {
+        updated.selected_model = updated.reasoning.as_ref().unwrap().chosen_model.clone();
+    }
+    Ok(updated)
 }
 
 fn prompt_request(prompt: &str) -> ChatCompletionRequest {
@@ -959,5 +1052,8 @@ enum Command {
         /// Override the configured routing objective.
         #[arg(long)]
         objective: Option<String>,
+        /// Force LLM judge re-evaluation regardless of trigger settings.
+        #[arg(long)]
+        judge: bool,
     },
 }

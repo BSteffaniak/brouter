@@ -22,8 +22,11 @@ path = "src/main.rs"
 anyhow = { workspace = true, features = ["std"] }
 base64 = { workspace = true }
 brouter_api_models = { workspace = true }
+brouter_catalog_models = { workspace = true }
 brouter_config = { workspace = true }
 brouter_config_models = { workspace = true }
+brouter_provider = { workspace = true }
+brouter_provider_models = { workspace = true }
 brouter_router = { workspace = true }
 brouter_router_models = { workspace = true }
 brouter_server = { workspace = true }
