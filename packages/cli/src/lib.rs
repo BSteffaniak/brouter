@@ -24,7 +24,7 @@ use brouter_config::{
 };
 use brouter_config_models::{BrouterConfig, ProviderConfig, ProviderKind};
 use brouter_provider::{ProviderClient, ProviderRegistry};
-use brouter_provider_models::{ProviderId, RouteableModel};
+use brouter_provider_models::{ModelId, ProviderId, RouteableModel};
 use brouter_router::Router;
 use brouter_router::{
     DEFAULT_JUDGE_SYSTEM_PROMPT, build_judge_prompt, judge_request, parse_judge_response,
@@ -914,42 +914,112 @@ async fn maybe_invoke_judge(
     );
     let judge_request = judge_request(judge_config, system_prompt, &user_prompt);
 
-    // Call the judge model synchronously.
+    // Build the list of candidate judge models, in fallback order:
+    // 1. The configured primary judge model
+    // 2. Other models from the same provider (to avoid propagating provider failures)
+    // 3. Models from other providers
     let models = routeable_models(config);
-    let judge_model = models
-        .iter()
-        .find(|m| &m.id == judge_model_id)
-        .cloned()
-        .unwrap_or_else(|| RouteableModel {
-            id: judge_model_id.clone(),
-            provider: judge_config
-                .provider
-                .clone()
-                .unwrap_or_else(|| ProviderId::new("local")),
-            upstream_model: judge_model_id.to_string(),
-            context_window: 128_000,
-            input_cost_per_million: 0.0,
-            output_cost_per_million: 0.0,
-            quality: 50,
-            capabilities: vec![],
-            attributes: BTreeMap::new(),
-            display_badges: vec![],
-            metadata: ResolvedModelMetadata::default(),
-        });
-    let client = ProviderClient::new();
+    let primary_provider = judge_config.provider.clone();
+    let judge_model_ids: Vec<ModelId> = std::iter::once(judge_model_id.clone())
+        .chain(
+            models
+                .iter()
+                .filter(|m| {
+                    &m.id != judge_model_id
+                        && primary_provider.as_ref().is_some_and(|p| &m.provider == p)
+                })
+                .map(|m| m.id.clone()),
+        )
+        .chain(
+            models
+                .iter()
+                .filter(|m| {
+                    &m.id != judge_model_id
+                        && primary_provider.as_ref().is_some_and(|p| &m.provider != p)
+                })
+                .map(|m| m.id.clone()),
+        )
+        .collect();
+
+    // Try each judge model in fallback order until one succeeds.
     let registry = ProviderRegistry::from_config(config);
-    let response = client
-        .chat_completions(&registry, &judge_model, &judge_request)
-        .await
-        .map_err(|e| anyhow::anyhow!("LLM judge call failed: {e}"))?;
-    let raw_text = response.body.to_string();
-    let reasoning = parse_judge_response(&raw_text, &decision.candidates, judge_model_id);
+    let client = ProviderClient::new();
+    let mut raw_text = String::new();
+    let mut used_judge_id = judge_model_id;
+
+    for candidate_id in &judge_model_ids {
+        let judge_model = models
+            .iter()
+            .find(|m| &m.id == candidate_id)
+            .cloned()
+            .unwrap_or_else(|| RouteableModel {
+                id: candidate_id.clone(),
+                provider: judge_config
+                    .provider
+                    .clone()
+                    .unwrap_or_else(|| ProviderId::new("local")),
+                upstream_model: candidate_id.to_string(),
+                context_window: 128_000,
+                input_cost_per_million: 0.0,
+                output_cost_per_million: 0.0,
+                quality: 50,
+                capabilities: vec![],
+                attributes: BTreeMap::new(),
+                display_badges: vec![],
+                metadata: ResolvedModelMetadata::default(),
+            });
+
+        match client
+            .chat_completions(&registry, &judge_model, &judge_request)
+            .await
+        {
+            Ok(response) => {
+                raw_text = response.body.to_string();
+                used_judge_id = candidate_id;
+                break;
+            }
+            Err(e) => {
+                eprintln!("judge model unavailable ({candidate_id}), trying fallback: {e}");
+            }
+        }
+    }
+
+    let reasoning = if let Some(error_msg) = extract_api_error(&raw_text) {
+        // API returned an error response (e.g., usage limit). Return the original decision
+        // without LLM judge reasoning.
+        eprintln!("judge API error, preserving original decision: {error_msg}");
+        return Ok(decision.clone());
+    } else {
+        parse_judge_response(&raw_text, &decision.candidates, used_judge_id)
+    };
     let mut updated = decision.clone();
     updated.reasoning = Some(reasoning);
     if updated.reasoning.as_ref().is_some_and(|r| r.overridden) {
         updated.selected_model = updated.reasoning.as_ref().unwrap().chosen_model.clone();
     }
     Ok(updated)
+}
+
+/// Returns the API error message from a judge response if it looks like an API error.
+fn extract_api_error(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if let Ok(parsed) = serde_json::from_str::<ApiErrorResponse>(trimmed)
+        && !parsed.error.message.is_empty()
+    {
+        return Some(parsed.error.message);
+    }
+    None
+}
+
+/// API error response shape for detecting provider failures.
+#[derive(serde::Deserialize)]
+struct ApiErrorResponse {
+    error: ApiErrorDetail,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiErrorDetail {
+    message: String,
 }
 
 fn prompt_request(prompt: &str) -> ChatCompletionRequest {

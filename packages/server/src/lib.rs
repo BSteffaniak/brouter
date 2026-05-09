@@ -1114,6 +1114,7 @@ async fn route_request(
     Ok(decision)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn invoke_llm_judge(
     state: &AppState,
     decision: &RoutingDecision,
@@ -1148,17 +1149,55 @@ async fn invoke_llm_judge(
         &session_context,
     );
     let judge_request = judge_request(judge_config, system_prompt, &user_prompt);
-    let judge_response = state
-        .provider_client
-        .chat_completions(
-            &state.providers,
-            &RouteableModel {
-                id: judge_model_id.clone(),
+
+    // Build the list of candidate judge models, in fallback order:
+    // 1. The configured primary judge model
+    // 2. Other models from the same provider
+    // 3. Models from other providers
+    let primary_provider = judge_config.provider.clone();
+    let judge_model_ids: Vec<ModelId> = std::iter::once(judge_model_id.clone())
+        .chain(
+            state
+                .router
+                .models()
+                .iter()
+                .filter(|m| {
+                    m.id != judge_model_id
+                        && primary_provider.as_ref().is_some_and(|p| &m.provider == p)
+                })
+                .map(|m| m.id.clone()),
+        )
+        .chain(
+            state
+                .router
+                .models()
+                .iter()
+                .filter(|m| {
+                    m.id != judge_model_id
+                        && primary_provider.as_ref().is_some_and(|p| &m.provider != p)
+                })
+                .map(|m| m.id.clone()),
+        )
+        .collect();
+
+    // Try each judge model in fallback order until one succeeds.
+    let mut raw_text = String::new();
+    let mut used_judge_id = &judge_model_id;
+
+    for candidate_id in &judge_model_ids {
+        let judge_model = state
+            .router
+            .models()
+            .iter()
+            .find(|m| m.id == *candidate_id)
+            .cloned()
+            .unwrap_or_else(|| RouteableModel {
+                id: candidate_id.clone(),
                 provider: judge_config
                     .provider
                     .clone()
                     .unwrap_or_else(|| ProviderId::new("local")),
-                upstream_model: judge_model_id.to_string(),
+                upstream_model: candidate_id.to_string(),
                 context_window: 128_000,
                 input_cost_per_million: 0.0,
                 output_cost_per_million: 0.0,
@@ -1167,15 +1206,31 @@ async fn invoke_llm_judge(
                 attributes: BTreeMap::new(),
                 display_badges: vec![],
                 metadata: ResolvedModelMetadata::default(),
-            },
-            &judge_request,
-        )
-        .await
-        .map_err(|e| RouterError::Judge {
-            source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
-        })?;
-    let raw_text = judge_response.body.to_string();
-    let reasoning = parse_judge_response(&raw_text, &decision.candidates, &judge_model_id);
+            });
+
+        match state
+            .provider_client
+            .chat_completions(&state.providers, &judge_model, &judge_request)
+            .await
+        {
+            Ok(response) => {
+                raw_text = response.body.to_string();
+                used_judge_id = candidate_id;
+                break;
+            }
+            Err(e) => {
+                eprintln!("judge model unavailable ({candidate_id}), trying fallback: {e}");
+            }
+        }
+    }
+
+    let reasoning = if let Some(error_msg) = extract_api_error(&raw_text) {
+        // API returned an error response (e.g., usage limit). Preserve the original decision.
+        eprintln!("judge API error, preserving original decision: {error_msg}");
+        return Ok(None);
+    } else {
+        parse_judge_response(&raw_text, &decision.candidates, used_judge_id)
+    };
     let mut updated = decision.clone();
     updated.reasoning = Some(reasoning);
     if updated.reasoning.as_ref().is_some_and(|r| r.overridden) {
@@ -1193,6 +1248,28 @@ fn extract_prompt_text(features: &brouter_router_models::PromptFeatures) -> Stri
         "intent={:?}, reasoning={:?}",
         features.intent, features.reasoning
     )
+}
+
+/// Returns the API error message from a judge response if it looks like an API error.
+fn extract_api_error(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if let Ok(parsed) = serde_json::from_str::<ApiErrorResponse>(trimmed)
+        && !parsed.error.message.is_empty()
+    {
+        return Some(parsed.error.message);
+    }
+    None
+}
+
+/// API error response shape for detecting provider failures in judge calls.
+#[derive(Deserialize)]
+struct ApiErrorResponse {
+    error: ApiErrorDetail,
+}
+
+#[derive(Deserialize)]
+struct ApiErrorDetail {
+    message: String,
 }
 
 fn group_models(state: &AppState, model: &str) -> Option<Vec<ModelId>> {
