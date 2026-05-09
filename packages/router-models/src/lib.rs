@@ -271,3 +271,64 @@ pub struct ModelReasoning {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
+
+// Re-export judge types so config package can use them without a circular dep.
+pub use brouter_provider_models::ProviderId;
+
+#[derive(Debug, Clone)]
+pub struct JudgeConfig {
+    pub model: ModelId,
+    pub provider: Option<ProviderId>,
+    pub system_prompt: Option<String>,
+    pub trigger: JudgeTrigger,
+    pub shortlist: JudgeShortlistConfig,
+    pub output: JudgeOutput,
+    pub max_estimated_cost: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct JudgeTrigger {
+    pub score_gap_threshold: f64,
+    pub rule_triggered: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct JudgeShortlistConfig {
+    pub size: usize,
+    pub min_score: f64,
+    pub deny: Vec<JudgeShortlistDeny>,
+}
+
+#[derive(Debug, Clone)]
+pub struct JudgeShortlistDeny {
+    pub models: Vec<ModelId>,
+    pub upstream_models: Vec<String>,
+    pub providers: Vec<ProviderId>,
+    pub capabilities: Vec<ModelCapability>,
+    pub attributes: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct JudgeOutput {
+    pub structured: bool,
+    pub max_tokens: u32,
+    pub temperature: f64,
+}
+
+/// Session context summary passed to the judge.
+#[derive(Debug, Default)]
+pub struct JudgeSessionContext {
+    /// Number of previous requests in the session.
+    pub request_count: u32,
+    /// Accumulated estimated cost so far.
+    pub accumulated_cost: f64,
+    /// Recent routing decisions (model IDs and intents).
+    pub recent_decisions: Vec<RecentDecision>,
+}
+
+/// A lightweight recent routing decision for judge context.
+#[derive(Debug)]
+pub struct RecentDecision {
+    pub model_id: String,
+    pub intent: String,
+}

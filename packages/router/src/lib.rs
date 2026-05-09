@@ -17,12 +17,14 @@ use brouter_router_models::{
     PromptIntent, ReasoningLevel, RoutingDecision, RoutingObjective, RoutingOptions,
     RoutingProfile, RoutingRule, ScoredCandidate, ScoringWeights,
 };
-#[allow(unused_imports)]
-use llm_judge::{
-    JudgeConfig, JudgeSessionContext, JudgeTrigger, build_judge_prompt, judge_request,
-    parse_judge_response, top_2_score_gap,
-};
 use thiserror::Error;
+
+// Re-export judge types so config package can access them via the router crate.
+#[allow(unused_imports)]
+pub use brouter_router_models::{
+    JudgeConfig, JudgeOutput, JudgeSessionContext, JudgeShortlistConfig, JudgeTrigger,
+    RecentDecision,
+};
 #[derive(Debug, Error)]
 pub enum RouterError {
     #[error("no configured model can satisfy the request")]

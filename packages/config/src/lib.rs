@@ -16,7 +16,8 @@ use brouter_config_models::{
 use brouter_introspection_models::{CatalogModel, IntrospectionSnapshot};
 use brouter_provider_models::{ModelCapability, ModelId, ProviderId, RouteableModel};
 use brouter_router_models::{
-    CandidateDenyRule, CandidateSelector, ContextPolicy, RoutingObjective, RoutingProfile,
+    CandidateDenyRule, CandidateSelector, ContextPolicy, JudgeConfig, JudgeOutput,
+    JudgeShortlistConfig, JudgeShortlistDeny, JudgeTrigger, RoutingObjective, RoutingProfile,
     RoutingRule, ScoringWeights,
 };
 use thiserror::Error;
@@ -783,6 +784,48 @@ pub fn scoring_weights(config: &BrouterConfig) -> ScoringWeights {
             .policy_penalty
             .unwrap_or(defaults.policy_penalty),
     }
+}
+
+/// Converts configured router rules into runtime routing rules.
+#[allow(clippy::map_unwrap_or)]
+#[must_use]
+pub fn llm_judge_config(config: &BrouterConfig) -> Option<JudgeConfig> {
+    let cfg = config.router.llm_judge.as_ref()?;
+    Some(JudgeConfig {
+        model: ModelId::new(cfg.model.clone()),
+        provider: cfg.provider.as_ref().map(|p| ProviderId::new(p.clone())),
+        system_prompt: cfg.system_prompt.clone(),
+        trigger: JudgeTrigger {
+            score_gap_threshold: cfg.trigger.score_gap_threshold,
+            rule_triggered: cfg.trigger.rule_triggered,
+        },
+        shortlist: JudgeShortlistConfig {
+            size: cfg.shortlist.size,
+            min_score: cfg.shortlist.min_score,
+            deny: cfg
+                .shortlist
+                .deny
+                .iter()
+                .map(|sel| JudgeShortlistDeny {
+                    models: sel.models.iter().cloned().map(ModelId::new).collect(),
+                    upstream_models: sel.upstream_models.clone(),
+                    providers: sel.providers.iter().cloned().map(ProviderId::new).collect(),
+                    capabilities: sel
+                        .capabilities
+                        .iter()
+                        .filter_map(|c| c.parse().ok())
+                        .collect(),
+                    attributes: sel.attributes.clone(),
+                })
+                .collect(),
+        },
+        output: JudgeOutput {
+            structured: cfg.output.structured,
+            max_tokens: cfg.output.max_tokens,
+            temperature: cfg.output.temperature,
+        },
+        max_estimated_cost: cfg.budget.max_estimated_cost,
+    })
 }
 
 /// Converts context configuration into a runtime context policy.

@@ -1,6 +1,6 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
-#![allow(clippy::multiple_crate_versions, dead_code)]
+#![allow(clippy::multiple_crate_versions, dead_code, unused_imports)]
 
 //! LLM-based judge for model selection reasoning.
 //!
@@ -9,7 +9,10 @@
 
 use brouter_api_models::{ChatCompletionRequest, ChatMessage, MessageContent};
 use brouter_provider_models::{ModelCapability, ModelId};
-use brouter_router_models::{ModelReasoning, RoutingObjective, ScoredCandidate};
+use brouter_router_models::{
+    JudgeConfig, JudgeOutput, JudgeSessionContext, JudgeShortlistConfig, JudgeTrigger,
+    ModelReasoning, RecentDecision, RoutingObjective, ScoredCandidate,
+};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
@@ -31,66 +34,6 @@ Output format (JSON, no additional text):
 struct JudgeResponse {
     selected_model: String,
     reasoning: String,
-}
-
-/// Session context summary passed to the judge.
-#[derive(Debug, Default)]
-pub struct JudgeSessionContext {
-    /// Number of previous requests in the session.
-    pub request_count: u32,
-    /// Accumulated estimated cost so far.
-    pub accumulated_cost: f64,
-    /// Recent routing decisions (model IDs and intents).
-    pub recent_decisions: Vec<RecentDecision>,
-}
-
-/// A lightweight recent routing decision for judge context.
-#[derive(Debug)]
-pub struct RecentDecision {
-    pub model_id: String,
-    pub intent: String,
-}
-
-/// Configuration for invoking the LLM judge.
-#[derive(Debug, Clone)]
-pub struct JudgeConfig {
-    /// Model ID to use for LLM judge calls.
-    pub model: ModelId,
-    /// Custom system prompt. None uses the default.
-    pub system_prompt: Option<String>,
-    /// Maximum tokens for the reasoning response.
-    pub max_tokens: u32,
-    /// Temperature for reasoning calls.
-    pub temperature: f64,
-    /// Maximum estimated cost for the reasoning call.
-    pub max_estimated_cost: f64,
-}
-
-/// Trigger evaluation for the LLM judge.
-#[derive(Debug, Clone, Copy)]
-pub struct JudgeTrigger {
-    /// Fire when top-2 score gap is below this threshold.
-    pub score_gap_threshold: f64,
-    /// Fire when a matched rule has `llm_judge` = true.
-    pub rule_triggered: bool,
-}
-
-impl JudgeTrigger {
-    /// Returns true when the judge should fire.
-    #[must_use]
-    pub fn should_fire(&self, top_2_gap: f64, rule_triggered: bool) -> bool {
-        top_2_gap < self.score_gap_threshold || (self.rule_triggered && rule_triggered)
-    }
-}
-
-impl JudgeConfig {
-    /// Returns the effective system prompt.
-    #[must_use]
-    pub fn system_prompt(&self) -> &str {
-        self.system_prompt
-            .as_deref()
-            .unwrap_or(DEFAULT_JUDGE_SYSTEM_PROMPT)
-    }
 }
 
 /// Format capabilities as a comma-separated string.
@@ -228,9 +171,9 @@ pub fn judge_request(
                 tool_call_id: None,
             },
         ],
-        temperature: Some(config.temperature),
+        temperature: Some(config.output.temperature),
         top_p: None,
-        max_tokens: Some(config.max_tokens),
+        max_tokens: Some(config.output.max_tokens),
         reasoning_effort: None,
         stream: Some(false),
         tools: None,
