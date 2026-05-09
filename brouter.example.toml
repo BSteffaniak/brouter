@@ -69,6 +69,20 @@ code_bonus = 15.0
 reasoning_bonus = 20.0
 policy_penalty = 30.0
 
+# LLM judge re-evaluates routing decisions when configured.
+# The judge model is selected from the shortlist just like any other candidate,
+# and if it fails (e.g., provider usage limit), brouter falls back to other
+# available models across all enabled providers.
+# [[router.llm_judge]]
+# The model used to generate routing rationales. Must be in the models list.
+# model = "fast_model"
+# provider = "openai"
+# system_prompt = "You are a routing advisor..."
+# trigger = { score_gap_threshold = 5.0, rule_triggered = true }
+# shortlist = { size = 5, min_score = 0.0 }
+# output = { structured = true, max_tokens = 256, temperature = 0.0 }
+# budget = { max_estimated_cost = 0.0 }
+
 [[router.rules]]
 name = "private-local"
 when_contains = ["secret", "private key", "credentials"]
@@ -175,6 +189,57 @@ display_badges = ["priority"]
 # verified_at_ms = 1762560000000
 # context_window = 1047576
 # max_output_tokens = 32768
+
+# OpenRouter — aggregates many model providers. Create credentials with:
+#   brouter auth openrouter login --profile openrouter [--api-key sk-orv-...]
+# [providers.openrouter]
+# kind = "open-ai-compatible"
+# base_url = "https://openrouter.ai/api/v1"
+# auth_backend = "sshenv"
+# auth_profile = "openrouter"
+# auth_vault_path = "~/.local/state/brouter/auth/openrouter_vault"
+# timeout_ms = 60000
+#
+# [models.openrouter_fast]
+# provider = "openrouter"
+# model = "anthropic/claude-3.5-haiku"
+# context_window = 200000
+# input_cost_per_million = 0.0
+# output_cost_per_million = 0.0
+# quality = 85
+# capabilities = ["chat", "code", "json", "tools", "reasoning"]
+# attributes = { latency_class = "standard", billing_class = "subscription" }
+# display_badges = ["standard"]
+#
+# [models.openrouter_strong]
+# provider = "openrouter"
+# model = "anthropic/claude-3.7-sonnet"
+# context_window = 200000
+# input_cost_per_million = 0.0
+# output_cost_per_million = 0.0
+# quality = 92
+# capabilities = ["chat", "code", "json", "tools", "reasoning"]
+# attributes = { latency_class = "priority", billing_class = "subscription" }
+# display_badges = ["priority"]
+
+# OpenCode Zen — OpenCode's own LLM service. Create credentials with:
+#   brouter auth openaicom login --profile opencode-zen [--api-key ...]
+# [providers.opencode_zen]
+# kind = "open-ai-compatible"
+# base_url = "https://api.opencode.ai/v1"
+# api_key_env = "OPENCODE_API_KEY"
+# timeout_ms = 60000
+#
+# [models.opencode_zen_fast]
+# provider = "opencode_zen"
+# model = "opencode/big-pickle"
+# context_window = 128000
+# input_cost_per_million = 0.0
+# output_cost_per_million = 0.0
+# quality = 88
+# capabilities = ["chat", "code", "json", "tools", "reasoning"]
+# attributes = { latency_class = "standard", billing_class = "subscription" }
+# display_badges = ["standard"]
 
 [models.embedding_cloud]
 provider = "openai"
