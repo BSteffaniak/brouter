@@ -6,7 +6,7 @@
 
 use std::cmp::Ordering;
 
-use brouter_api_models::ChatCompletionRequest;
+use brouter_api_models::{ChatCompletionRequest, ReasoningEffort};
 use brouter_provider_models::{ModelCapability, RouteableModel};
 use brouter_router_models::{
     PromptFeatures, PromptIntent, ReasoningLevel, RoutingDecision, RoutingObjective, RoutingRule,
@@ -211,7 +211,10 @@ fn analyze_prompt(
 ) -> PromptFeatures {
     let lower_prompt = prompt.to_lowercase();
     let intent = detect_intent(&lower_prompt);
-    let reasoning = detect_reasoning(&lower_prompt, intent, is_first_message);
+    let reasoning = request.reasoning_effort.map_or_else(
+        || detect_reasoning(&lower_prompt, intent, is_first_message),
+        reasoning_level,
+    );
     let mut required_capabilities = required_capabilities(intent, reasoning);
     if request
         .tools
@@ -286,6 +289,16 @@ fn detect_reasoning(prompt: &str, intent: PromptIntent, is_first_message: bool) 
         ReasoningLevel::Medium
     } else {
         ReasoningLevel::Low
+    }
+}
+
+const fn reasoning_level(effort: ReasoningEffort) -> ReasoningLevel {
+    match effort {
+        ReasoningEffort::None | ReasoningEffort::Minimal | ReasoningEffort::Low => {
+            ReasoningLevel::Low
+        }
+        ReasoningEffort::Medium => ReasoningLevel::Medium,
+        ReasoningEffort::High | ReasoningEffort::Max => ReasoningLevel::High,
     }
 }
 
@@ -531,6 +544,7 @@ mod tests {
             temperature: None,
             top_p: None,
             max_tokens: None,
+            reasoning_effort: None,
             stream: None,
             tools: None,
             tool_choice: None,

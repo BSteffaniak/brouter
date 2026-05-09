@@ -847,6 +847,7 @@ fn prompt_request(prompt: &str) -> ChatCompletionRequest {
         temperature: None,
         top_p: None,
         max_tokens: None,
+        reasoning_effort: None,
         stream: None,
         tools: None,
         tool_choice: None,

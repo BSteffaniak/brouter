@@ -9,6 +9,34 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Canonical brouter reasoning effort scale.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    /// Disable provider-level extended thinking when possible.
+    #[serde(alias = "off")]
+    None,
+    /// Minimal provider-level thinking.
+    Minimal,
+    /// Low provider-level thinking.
+    Low,
+    /// Medium provider-level thinking.
+    Medium,
+    /// High provider-level thinking.
+    High,
+    /// Maximum provider-level thinking.
+    #[serde(alias = "xhigh")]
+    Max,
+}
+
+impl ReasoningEffort {
+    /// Returns true when provider-level extended thinking should be disabled.
+    #[must_use]
+    pub const fn is_none(self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
 /// Chat completion request compatible with the `OpenAI` chat completions API.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatCompletionRequest {
@@ -21,6 +49,8 @@ pub struct ChatCompletionRequest {
     pub top_p: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -188,6 +218,25 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn reasoning_effort_accepts_canonical_aliases() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "brouter/auto",
+            "messages": [],
+            "reasoning_effort": "off"
+        }))
+        .expect("request should deserialize");
+        assert_eq!(request.reasoning_effort, Some(ReasoningEffort::None));
+
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "brouter/auto",
+            "messages": [],
+            "reasoning_effort": "xhigh"
+        }))
+        .expect("request should deserialize");
+        assert_eq!(request.reasoning_effort, Some(ReasoningEffort::Max));
+    }
 
     #[test]
     fn preserves_unknown_chat_request_fields() {

@@ -10,7 +10,9 @@ use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::time::Duration;
 
-use brouter_api_models::{ChatCompletionRequest, EmbeddingsRequest, MessageContent};
+use brouter_api_models::{
+    ChatCompletionRequest, EmbeddingsRequest, MessageContent, ReasoningEffort,
+};
 use brouter_config_models::{BrouterConfig, ProviderConfig, ProviderKind};
 use brouter_provider_models::{ProviderId, RouteableModel};
 use bytes::Bytes;
@@ -258,8 +260,7 @@ impl ProviderClient {
                     provider_id: model.provider.to_string(),
                 })?;
         let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-        let mut upstream_request = request.clone();
-        upstream_request.model.clone_from(&model.upstream_model);
+        let upstream_request = openai_compatible_request_body(model, request);
 
         let mut request_builder = self.http.post(url).json(&upstream_request);
         if let Some(timeout) = provider_timeout(provider) {
@@ -307,6 +308,39 @@ impl ProviderClient {
 
         Ok(request_builder.send().await?)
     }
+}
+
+fn openai_compatible_request_body(
+    model: &RouteableModel,
+    request: &ChatCompletionRequest,
+) -> Value {
+    let mut body = serde_json::to_value(request).unwrap_or_else(|_| json!({}));
+    let Some(object) = body.as_object_mut() else {
+        return body;
+    };
+    object.insert(
+        "model".to_string(),
+        Value::String(model.upstream_model.clone()),
+    );
+    match request.reasoning_effort {
+        Some(ReasoningEffort::None) => {
+            object.remove("reasoning_effort");
+        }
+        Some(ReasoningEffort::Max) => {
+            object.insert(
+                "reasoning_effort".to_string(),
+                Value::String("high".to_string()),
+            );
+        }
+        Some(
+            ReasoningEffort::Minimal
+            | ReasoningEffort::Low
+            | ReasoningEffort::Medium
+            | ReasoningEffort::High,
+        )
+        | None => {}
+    }
+    body
 }
 
 fn provider_timeout(provider: &ProviderConfig) -> Option<Duration> {
@@ -452,10 +486,8 @@ fn anthropic_request(model: &RouteableModel, request: &ChatCompletionRequest) ->
         "model".to_string(),
         Value::String(model.upstream_model.clone()),
     );
-    body.insert(
-        "max_tokens".to_string(),
-        Value::from(request.max_tokens.unwrap_or(1_024)),
-    );
+    let max_tokens = anthropic_max_tokens(request);
+    body.insert("max_tokens".to_string(), Value::from(max_tokens));
     if let Some(temperature) = request.temperature {
         body.insert("temperature".to_string(), Value::from(temperature));
     }
@@ -464,6 +496,10 @@ fn anthropic_request(model: &RouteableModel, request: &ChatCompletionRequest) ->
     }
     if request.is_streaming() {
         body.insert("stream".to_string(), Value::Bool(true));
+    }
+    if let Some(thinking) = anthropic_thinking(request.reasoning_effort, max_tokens) {
+        body.insert("thinking".to_string(), thinking);
+        body.remove("temperature");
     }
 
     let system = anthropic_system_prompt(request);
@@ -475,6 +511,33 @@ fn anthropic_request(model: &RouteableModel, request: &ChatCompletionRequest) ->
         Value::Array(anthropic_messages(request)),
     );
     Value::Object(body)
+}
+
+fn anthropic_max_tokens(request: &ChatCompletionRequest) -> u32 {
+    let requested = request.max_tokens.unwrap_or(1_024);
+    request
+        .reasoning_effort
+        .and_then(anthropic_desired_thinking_budget)
+        .map_or(requested, |budget| {
+            requested.max(budget.saturating_add(1_024))
+        })
+}
+
+fn anthropic_thinking(effort: Option<ReasoningEffort>, max_tokens: u32) -> Option<Value> {
+    let desired_budget = effort.and_then(anthropic_desired_thinking_budget)?;
+    let budget_tokens = desired_budget.min(max_tokens.saturating_sub(1)).max(1_024);
+    Some(json!({"type": "enabled", "budget_tokens": budget_tokens}))
+}
+
+const fn anthropic_desired_thinking_budget(effort: ReasoningEffort) -> Option<u32> {
+    match effort {
+        ReasoningEffort::None => None,
+        ReasoningEffort::Minimal => Some(1_024),
+        ReasoningEffort::Low => Some(2_048),
+        ReasoningEffort::Medium => Some(4_096),
+        ReasoningEffort::High => Some(8_192),
+        ReasoningEffort::Max => Some(16_384),
+    }
 }
 
 fn anthropic_system_prompt(request: &ChatCompletionRequest) -> String {
@@ -556,7 +619,7 @@ mod tests {
 
     use axum::routing::post;
     use axum::{Json, Router as AxumRouter};
-    use brouter_api_models::{ChatMessage, MessageContent};
+    use brouter_api_models::{ChatMessage, MessageContent, ReasoningEffort};
     use brouter_config_models::{BrouterConfig, ModelConfig, ProviderConfig, ProviderKind};
     use brouter_provider_models::{ModelCapability, ModelId, ProviderId};
     use serde_json::{Value, json};
@@ -586,6 +649,29 @@ mod tests {
 
         assert_eq!(response.status, 200);
         assert_eq!(response.body["model"], "real-upstream-model");
+    }
+
+    #[test]
+    fn openai_compatible_request_maps_reasoning_effort() {
+        let model = RouteableModel {
+            id: ModelId::new("auto_selected"),
+            provider: ProviderId::new("fake"),
+            upstream_model: "real-upstream-model".to_string(),
+            context_window: 8_192,
+            input_cost_per_million: 0.0,
+            output_cost_per_million: 0.0,
+            quality: 80,
+            capabilities: vec![ModelCapability::Chat],
+        };
+        let mut request = chat_request(false);
+
+        request.reasoning_effort = Some(ReasoningEffort::None);
+        let body = openai_compatible_request_body(&model, &request);
+        assert!(body.get("reasoning_effort").is_none());
+
+        request.reasoning_effort = Some(ReasoningEffort::Max);
+        let body = openai_compatible_request_body(&model, &request);
+        assert_eq!(body["reasoning_effort"], "high");
     }
 
     #[tokio::test]
@@ -838,6 +924,7 @@ mod tests {
             temperature: None,
             top_p: None,
             max_tokens: None,
+            reasoning_effort: None,
             stream: Some(stream),
             tools: None,
             tool_choice: None,

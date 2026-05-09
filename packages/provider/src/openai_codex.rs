@@ -862,6 +862,7 @@ mod tests {
             temperature: None,
             top_p: None,
             max_tokens: None,
+            reasoning_effort: None,
             stream: Some(true),
             tools: None,
             tool_choice: None,
