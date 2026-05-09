@@ -97,6 +97,8 @@ pub struct RouterConfig {
     pub profiles: BTreeMap<String, RouterProfileConfig>,
     #[serde(default)]
     pub classifier: Option<ClassifierConfig>,
+    #[serde(default)]
+    pub llm_judge: Option<LlmJudgeConfig>,
     #[serde(default = "default_provider_failure_threshold")]
     pub provider_failure_threshold: u32,
     #[serde(default = "default_provider_cooldown_ms")]
@@ -122,6 +124,7 @@ impl Default for RouterConfig {
             groups: BTreeMap::new(),
             profiles: BTreeMap::new(),
             classifier: None,
+            llm_judge: None,
             provider_failure_threshold: default_provider_failure_threshold(),
             provider_cooldown_ms: default_provider_cooldown_ms(),
             max_estimated_cost: None,
@@ -366,6 +369,108 @@ pub struct RouterRuleConfig {
     pub prefer_attributes: BTreeMap<String, String>,
     #[serde(default)]
     pub require_attributes: BTreeMap<String, String>,
+    #[serde(default)]
+    pub llm_judge: bool,
+}
+
+/// LLM judge configuration for model selection reasoning.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct LlmJudgeConfig {
+    /// The model to use for LLM judge calls.
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub trigger: LlmJudgeTriggerConfig,
+    #[serde(default)]
+    pub shortlist: LlmJudgeShortlistConfig,
+    #[serde(default)]
+    pub output: LlmJudgeOutputConfig,
+    #[serde(default)]
+    pub budget: LlmJudgeBudgetConfig,
+}
+
+/// Trigger configuration for when the LLM judge fires.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct LlmJudgeTriggerConfig {
+    /// Fire LLM judge when top-2 candidate score gap is below this threshold.
+    #[serde(default = "default_llm_judge_score_gap_threshold")]
+    pub score_gap_threshold: f64,
+    /// Fire LLM judge when a rule has `llm_judge` = true (regardless of score gap).
+    #[serde(default = "default_llm_judge_rule_triggered")]
+    pub rule_triggered: bool,
+}
+
+const fn default_llm_judge_score_gap_threshold() -> f64 {
+    5.0
+}
+
+const fn default_llm_judge_rule_triggered() -> bool {
+    true
+}
+
+/// Shortlist configuration for LLM judge candidate presentation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LlmJudgeShortlistConfig {
+    /// Maximum number of candidates to include in the shortlist.
+    #[serde(default = "default_llm_judge_shortlist_size")]
+    pub size: usize,
+    /// Minimum deterministic score floor. Candidates below this are excluded.
+    #[serde(default)]
+    pub min_score: f64,
+    /// Hard deny list applied after scoring (additional exclusions).
+    #[serde(default)]
+    pub deny: Vec<CandidateSelectorConfig>,
+}
+
+const fn default_llm_judge_shortlist_size() -> usize {
+    5
+}
+
+impl Default for LlmJudgeShortlistConfig {
+    fn default() -> Self {
+        Self {
+            size: default_llm_judge_shortlist_size(),
+            min_score: 0.0,
+            deny: Vec::new(),
+        }
+    }
+}
+
+/// Output configuration for LLM judge responses.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct LlmJudgeOutputConfig {
+    /// Request structured JSON output via model tool-calling / `response_format`.
+    #[serde(default = "default_llm_judge_structured")]
+    pub structured: bool,
+    /// Maximum tokens for the reasoning response.
+    #[serde(default = "default_llm_judge_max_tokens")]
+    pub max_tokens: u32,
+    /// Temperature for reasoning calls.
+    #[serde(default = "default_llm_judge_temperature")]
+    pub temperature: f64,
+}
+
+const fn default_llm_judge_structured() -> bool {
+    true
+}
+
+const fn default_llm_judge_max_tokens() -> u32 {
+    256
+}
+
+const fn default_llm_judge_temperature() -> f64 {
+    0.3
+}
+
+/// Budget configuration for LLM judge calls.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct LlmJudgeBudgetConfig {
+    /// Maximum estimated cost for the reasoning call. Abort if exceeded.
+    #[serde(default)]
+    pub max_estimated_cost: f64,
 }
 
 /// Optional prompt classifier configuration.

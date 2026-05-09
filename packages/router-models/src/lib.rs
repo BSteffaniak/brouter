@@ -206,6 +206,8 @@ pub struct RoutingRule {
     pub require_capabilities: Vec<ModelCapability>,
     pub prefer_attributes: BTreeMap<String, String>,
     pub require_attributes: BTreeMap<String, String>,
+    #[serde(default)]
+    pub llm_judge: bool,
 }
 
 /// Prompt features extracted before candidate scoring.
@@ -231,6 +233,11 @@ pub struct ScoredCandidate {
     pub score: f64,
     pub estimated_cost: f64,
     pub reasons: Vec<String>,
+    /// Flat metadata fields used for LLM judge display.
+    pub capabilities: Vec<ModelCapability>,
+    pub provider: String,
+    pub quality: u8,
+    #[serde(default)]
     pub metadata: ResolvedModelMetadata,
 }
 
@@ -244,4 +251,23 @@ pub struct RoutingDecision {
     pub candidates: Vec<ScoredCandidate>,
     #[serde(default)]
     pub excluded_candidates: Vec<ExcludedCandidate>,
+    /// LLM-generated reasoning for why this model was selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ModelReasoning>,
+}
+
+/// LLM-generated reasoning attached to a routing decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelReasoning {
+    /// The model used to generate the reasoning.
+    pub model_id: ModelId,
+    /// Free-text explanation of the routing decision.
+    pub rationale: String,
+    /// The model chosen by the LLM judge.
+    pub chosen_model: ModelId,
+    /// True when the LLM judge overrode the deterministic top pick.
+    pub overridden: bool,
+    /// Error message if reasoning generation failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }

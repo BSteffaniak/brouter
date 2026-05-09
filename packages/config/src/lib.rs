@@ -963,6 +963,7 @@ pub fn routing_rules(config: &BrouterConfig) -> Vec<RoutingRule> {
                 .collect(),
             prefer_attributes: rule.prefer_attributes.clone(),
             require_attributes: rule.require_attributes.clone(),
+            llm_judge: rule.llm_judge,
         })
         .collect()
 }

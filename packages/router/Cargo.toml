@@ -16,6 +16,8 @@ brouter_catalog_models       = { workspace = true }
 brouter_introspection_models = { workspace = true }
 brouter_provider_models      = { workspace = true }
 brouter_router_models        = { workspace = true }
+serde                        = { workspace = true }
+serde_json                   = { workspace = true }
 thiserror                    = { workspace = true }
 
 [features]

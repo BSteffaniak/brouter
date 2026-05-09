@@ -4,6 +4,8 @@
 
 //! Prompt analysis and deterministic model routing engine for brouter.
 
+mod llm_judge;
+
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
@@ -15,9 +17,12 @@ use brouter_router_models::{
     PromptIntent, ReasoningLevel, RoutingDecision, RoutingObjective, RoutingOptions,
     RoutingProfile, RoutingRule, ScoredCandidate, ScoringWeights,
 };
+#[allow(unused_imports)]
+use llm_judge::{
+    JudgeConfig, JudgeSessionContext, JudgeTrigger, build_judge_prompt, judge_request,
+    parse_judge_response, top_2_score_gap,
+};
 use thiserror::Error;
-
-/// Router error.
 #[derive(Debug, Error)]
 pub enum RouterError {
     #[error("no configured model can satisfy the request")]
@@ -229,6 +234,7 @@ impl Router {
             reasons,
             candidates,
             excluded_candidates,
+            reasoning: None,
         })
     }
 
@@ -681,6 +687,9 @@ fn score_model(
         score,
         estimated_cost,
         reasons,
+        capabilities: model.capabilities.clone(),
+        provider: model.provider.to_string(),
+        quality: model.quality,
         metadata: model.metadata.clone(),
     }
 }
@@ -862,6 +871,7 @@ mod tests {
                 require_capabilities: vec![ModelCapability::Local],
                 prefer_attributes: BTreeMap::new(),
                 require_attributes: BTreeMap::new(),
+                llm_judge: false,
             }],
         );
 
@@ -892,6 +902,7 @@ mod tests {
                     "priority".to_string(),
                 )]),
                 require_attributes: BTreeMap::new(),
+                llm_judge: false,
             }],
         );
 
@@ -1027,6 +1038,7 @@ mod tests {
                     "priority".to_string(),
                 )]),
                 require_attributes: BTreeMap::new(),
+                llm_judge: false,
             }],
         )
     }
