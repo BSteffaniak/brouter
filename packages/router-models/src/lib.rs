@@ -4,6 +4,8 @@
 
 //! Routing decision and prompt classification models for brouter.
 
+use std::collections::BTreeMap;
+
 use brouter_provider_models::{ModelCapability, ModelId};
 use serde::{Deserialize, Serialize};
 
@@ -124,6 +126,8 @@ pub struct RoutingRule {
     pub objective: Option<RoutingObjective>,
     pub prefer_capabilities: Vec<ModelCapability>,
     pub require_capabilities: Vec<ModelCapability>,
+    pub prefer_attributes: BTreeMap<String, String>,
+    pub require_attributes: BTreeMap<String, String>,
 }
 
 /// Prompt features extracted before candidate scoring.
@@ -134,6 +138,8 @@ pub struct PromptFeatures {
     pub estimated_input_tokens: u32,
     pub required_capabilities: Vec<ModelCapability>,
     pub preferred_capabilities: Vec<ModelCapability>,
+    pub required_attributes: BTreeMap<String, String>,
+    pub preferred_attributes: BTreeMap<String, String>,
     pub matched_rules: Vec<String>,
     pub is_first_message: bool,
 }

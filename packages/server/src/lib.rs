@@ -360,6 +360,7 @@ async fn embeddings(
                 "x-brouter-upstream-model",
                 &model.upstream_model,
             );
+            insert_route_attribute_headers(&mut headers, &model);
             (status, headers, Json(provider_response.body)).into_response()
         }
         Err(error) => error_response(StatusCode::BAD_GATEWAY, error.to_string(), "provider_error")
@@ -748,7 +749,48 @@ fn route_headers(
         "x-brouter-fallback-used",
         fallback_used(attempted_model_id, decision),
     );
+    insert_route_attribute_headers(&mut headers, model);
     headers
+}
+
+fn insert_route_attribute_headers(headers: &mut HeaderMap, model: &RouteableModel) {
+    let attributes = route_attributes_header(model);
+    if !attributes.is_empty() {
+        insert_header(headers, "x-brouter-attributes", &attributes);
+    }
+    let badges = route_badges_header(model);
+    if !badges.is_empty() {
+        insert_header(headers, "x-brouter-display-badges", &badges);
+    }
+}
+
+fn route_attributes_header(model: &RouteableModel) -> String {
+    model
+        .attributes
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn route_badges_header(model: &RouteableModel) -> String {
+    if !model.display_badges.is_empty() {
+        return model.display_badges.join(",");
+    }
+    model
+        .attributes
+        .iter()
+        .filter_map(|(key, value)| display_badge_for_attribute(key, value))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn display_badge_for_attribute(key: &str, value: &str) -> Option<String> {
+    matches!(
+        key,
+        "latency_class" | "service_class" | "quality_lane" | "billing_class"
+    )
+    .then(|| value.to_string())
 }
 
 fn fallback_used(attempted_model_id: &ModelId, decision: &RoutingDecision) -> &'static str {
@@ -1239,6 +1281,7 @@ mod tests {
                 auth_backend: None,
                 auth_profile: None,
                 auth_vault_path: None,
+                attribute_mappings: BTreeMap::new(),
             },
         );
         config.models.insert(
@@ -1251,6 +1294,8 @@ mod tests {
                 output_cost_per_million: 0.60,
                 quality: Some(70),
                 capabilities: vec!["chat".to_string(), "embeddings".to_string()],
+                attributes: BTreeMap::new(),
+                display_badges: Vec::new(),
                 max_estimated_cost: None,
             },
         );
@@ -1270,6 +1315,7 @@ mod tests {
                 auth_backend: None,
                 auth_profile: None,
                 auth_vault_path: None,
+                attribute_mappings: BTreeMap::new(),
             },
         );
         providers.insert(
@@ -1283,6 +1329,7 @@ mod tests {
                 auth_backend: None,
                 auth_profile: None,
                 auth_vault_path: None,
+                attribute_mappings: BTreeMap::new(),
             },
         );
 
@@ -1297,6 +1344,8 @@ mod tests {
                 output_cost_per_million: 8.0,
                 quality: Some(90),
                 capabilities: vec!["chat".to_string(), "code".to_string()],
+                attributes: BTreeMap::new(),
+                display_badges: Vec::new(),
                 max_estimated_cost: None,
             },
         );
@@ -1310,6 +1359,8 @@ mod tests {
                 output_cost_per_million: 0.60,
                 quality: Some(70),
                 capabilities: vec!["chat".to_string(), "code".to_string()],
+                attributes: BTreeMap::new(),
+                display_badges: Vec::new(),
                 max_estimated_cost: None,
             },
         );

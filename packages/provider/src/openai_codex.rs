@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
-use crate::{ProviderError, ProviderResponse, ProviderStreamResponse};
+use crate::{ProviderError, ProviderResponse, ProviderStreamResponse, apply_attribute_mappings};
 
 const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -345,7 +345,8 @@ async fn send_codex_request(
     request: &ChatCompletionRequest,
     auth: &CodexAuth,
 ) -> Result<reqwest::Response, ProviderError> {
-    let body = codex_request_body(model, request);
+    let mut body = codex_request_body(model, request);
+    apply_attribute_mappings(provider, model, &mut body);
     let mut builder = http
         .post(OPENAI_CODEX_API_ENDPOINT)
         .bearer_auth(&auth.access_token)
@@ -899,6 +900,8 @@ mod tests {
             output_cost_per_million: 0.0,
             quality: 95,
             capabilities: vec![ModelCapability::Chat],
+            attributes: std::collections::BTreeMap::new(),
+            display_badges: Vec::new(),
         }
     }
 }

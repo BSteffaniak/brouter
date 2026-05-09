@@ -29,6 +29,8 @@
 - `objective` optional routing objective
 - `prefer_capabilities` array
 - `require_capabilities` array
+- `prefer_attributes` map of attribute names to preferred values
+- `require_attributes` map of attribute names to required values
 
 ## `[router.scoring]`
 
@@ -57,6 +59,7 @@ All fields are optional floats:
 - `auth_backend` optional string; `openai-codex` currently supports `sshenv`
 - `auth_profile` optional string; sshenv profile containing ChatGPT/Codex tokens
 - `auth_vault_path` optional string; sshenv vault path. If omitted, brouter uses `$BROUTER_AUTH_VAULT` or `~/.local/state/brouter/auth/vault`.
+- `attribute_mappings` optional nested map from attribute name/value to provider request edits. Each mapping can add top-level `request_fields` or remove top-level `omit_request_fields`.
 
 `openai-codex` expects brouter-owned sshenv keys such as
 `BROUTER_OPENAI_CODEX_ACCESS_TOKEN`, `BROUTER_OPENAI_CODEX_REFRESH_TOKEN`,
@@ -82,4 +85,18 @@ brouter auth openai-codex login --profile openai-max --headless
 - `output_cost_per_million` float
 - `quality` optional integer 0-255
 - `capabilities` array: `chat`, `code`, `json`, `tools`, `vision`, `local`, `reasoning`, `embeddings`
+- `attributes` optional map of arbitrary routing dimensions, for example `latency_class = "priority"`
+- `display_badges` optional array of compact badges exposed in `x-brouter-display-badges`; when omitted, brouter derives badges for known attributes such as `latency_class`
 - `max_estimated_cost` optional float; model-level per-request budget
+
+Example provider-specific request mapping:
+
+```toml
+[providers.openai.attribute_mappings.latency_class.priority.request_fields]
+service_tier = "priority"
+
+[providers.openai.attribute_mappings.latency_class.standard]
+omit_request_fields = ["service_tier"]
+```
+
+A model with `attributes.latency_class = "priority"` will add `service_tier = "priority"` to OpenAI-compatible requests. The same routing attribute can also be used by `prefer_attributes` or `require_attributes` without making `service_tier` a brouter-specific concept.

@@ -42,6 +42,7 @@ require_capabilities = ["local"]
 name = "debug-code-reasoning"
 intent = "debugging"
 prefer_capabilities = ["reasoning"]
+prefer_attributes = { latency_class = "priority" }
 
 [telemetry]
 database_path = "brouter.db"
@@ -67,6 +68,15 @@ timeout_ms = 60000
 # auth_profile = "openai-max"
 # auth_vault_path = "~/.local/state/brouter/auth/vault"
 # timeout_ms = 60000
+#
+# Attribute mappings translate brouter's generic model attributes into
+# provider-specific request fields only when the selected model has that
+# attribute value.
+# [providers.openai_max.attribute_mappings.latency_class.priority.request_fields]
+# service_tier = "priority"
+#
+# [providers.openai_max.attribute_mappings.latency_class.standard]
+# omit_request_fields = ["service_tier"]
 
 [models.fast_local]
 provider = "ollama"
@@ -85,6 +95,8 @@ input_cost_per_million = 0.15
 output_cost_per_million = 0.60
 quality = 70
 capabilities = ["chat", "json", "tools"]
+attributes = { latency_class = "standard", billing_class = "api" }
+display_badges = ["standard"]
 
 [models.strong_cloud]
 provider = "openai"
@@ -94,6 +106,8 @@ input_cost_per_million = 2.00
 output_cost_per_million = 8.00
 quality = 90
 capabilities = ["chat", "code", "json", "tools", "reasoning"]
+attributes = { latency_class = "priority", billing_class = "api" }
+display_badges = ["priority"]
 # Optional model-level per-request estimated cost budget.
 # max_estimated_cost = 0.10
 

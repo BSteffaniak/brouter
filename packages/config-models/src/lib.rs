@@ -162,6 +162,10 @@ pub struct RouterRuleConfig {
     pub prefer_capabilities: Vec<String>,
     #[serde(default)]
     pub require_capabilities: Vec<String>,
+    #[serde(default)]
+    pub prefer_attributes: BTreeMap<String, String>,
+    #[serde(default)]
+    pub require_attributes: BTreeMap<String, String>,
 }
 
 /// Optional prompt classifier configuration.
@@ -196,6 +200,17 @@ pub struct ProviderConfig {
     pub auth_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_vault_path: Option<String>,
+    #[serde(default)]
+    pub attribute_mappings: BTreeMap<String, BTreeMap<String, AttributeRequestMapping>>,
+}
+
+/// Provider request mapping applied when a selected model has a matching attribute.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttributeRequestMapping {
+    #[serde(default)]
+    pub request_fields: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub omit_request_fields: Vec<String>,
 }
 
 /// Supported provider kinds.
@@ -221,6 +236,10 @@ pub struct ModelConfig {
     pub quality: Option<u8>,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub attributes: BTreeMap<String, String>,
+    #[serde(default)]
+    pub display_badges: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_estimated_cost: Option<f64>,
 }

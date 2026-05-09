@@ -5,6 +5,7 @@
 //! Prompt analysis and deterministic model routing engine for brouter.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 use brouter_api_models::{ChatCompletionRequest, ReasoningEffort};
 use brouter_provider_models::{ModelCapability, RouteableModel};
@@ -174,6 +175,8 @@ impl Router {
                 &mut features.preferred_capabilities,
                 &rule.prefer_capabilities,
             );
+            append_attributes(&mut features.required_attributes, &rule.require_attributes);
+            append_attributes(&mut features.preferred_attributes, &rule.prefer_attributes);
             if let Some(rule_objective) = rule.objective {
                 objective = rule_objective;
             }
@@ -233,6 +236,8 @@ fn analyze_prompt(
         estimated_input_tokens: estimate_tokens(prompt),
         required_capabilities,
         preferred_capabilities: Vec::new(),
+        required_attributes: BTreeMap::new(),
+        preferred_attributes: BTreeMap::new(),
         matched_rules: Vec::new(),
         is_first_message,
     }
@@ -334,6 +339,17 @@ fn append_unique_capabilities(
     }
 }
 
+fn append_attributes(
+    attributes: &mut BTreeMap<String, String>,
+    additions: &BTreeMap<String, String>,
+) {
+    for (key, value) in additions {
+        attributes
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
+    }
+}
+
 fn contains_any(prompt: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| prompt.contains(needle))
 }
@@ -359,6 +375,7 @@ fn model_satisfies_features(
         .required_capabilities
         .iter()
         .all(|capability| model.has_capability(*capability))
+        && attributes_match(&model.attributes, &features.required_attributes)
 }
 
 fn score_model(
@@ -380,6 +397,7 @@ fn score_model(
         &mut reasons,
     );
     apply_preferred_capabilities(model, features, weights, &mut score, &mut reasons);
+    apply_preferred_attributes(model, features, weights, &mut score, &mut reasons);
     apply_session_bias(features, weights, &mut score, &mut reasons);
 
     ScoredCandidate {
@@ -461,6 +479,30 @@ fn apply_preferred_capabilities(
     }
 }
 
+fn apply_preferred_attributes(
+    model: &RouteableModel,
+    features: &PromptFeatures,
+    weights: ScoringWeights,
+    score: &mut f64,
+    reasons: &mut Vec<String>,
+) {
+    for (key, value) in &features.preferred_attributes {
+        if model.attributes.get(key) == Some(value) {
+            *score += weights.reasoning_bonus / 4.0;
+            reasons.push(format!("matched preferred attribute {key}={value}"));
+        }
+    }
+}
+
+fn attributes_match(
+    model_attributes: &BTreeMap<String, String>,
+    required_attributes: &BTreeMap<String, String>,
+) -> bool {
+    required_attributes
+        .iter()
+        .all(|(key, value)| model_attributes.get(key) == Some(value))
+}
+
 fn apply_session_bias(
     features: &PromptFeatures,
     weights: ScoringWeights,
@@ -519,6 +561,8 @@ mod tests {
                 objective: Some(RoutingObjective::LocalOnly),
                 prefer_capabilities: Vec::new(),
                 require_capabilities: vec![ModelCapability::Local],
+                prefer_attributes: BTreeMap::new(),
+                require_attributes: BTreeMap::new(),
             }],
         );
 
@@ -565,6 +609,8 @@ mod tests {
                 output_cost_per_million: 0.0,
                 quality: 60,
                 capabilities: vec![ModelCapability::Chat, ModelCapability::Local],
+                attributes: BTreeMap::new(),
+                display_badges: Vec::new(),
             },
             RouteableModel {
                 id: ModelId::new("coder"),
@@ -575,6 +621,8 @@ mod tests {
                 output_cost_per_million: 0.60,
                 quality: 80,
                 capabilities: vec![ModelCapability::Chat, ModelCapability::Code],
+                attributes: BTreeMap::new(),
+                display_badges: Vec::new(),
             },
         ]
     }

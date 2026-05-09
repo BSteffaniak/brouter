@@ -439,6 +439,8 @@ pub fn routing_rules(config: &BrouterConfig) -> Vec<RoutingRule> {
                 .iter()
                 .filter_map(|capability| capability.parse().ok())
                 .collect(),
+            prefer_attributes: rule.prefer_attributes.clone(),
+            require_attributes: rule.require_attributes.clone(),
         })
         .collect()
 }
@@ -478,6 +480,8 @@ fn model_config_to_routeable(
             .iter()
             .filter_map(|capability| capability.parse().ok())
             .collect(),
+        attributes: model.attributes.clone(),
+        display_badges: model.display_badges.clone(),
     }
 }
 
@@ -514,6 +518,7 @@ mod tests {
                 auth_backend: None,
                 auth_profile: None,
                 auth_vault_path: None,
+                attribute_mappings: std::collections::BTreeMap::new(),
             },
         );
         config.models.insert(
@@ -526,6 +531,8 @@ mod tests {
                 output_cost_per_million: 0.0,
                 quality: None,
                 capabilities: vec!["chat".to_string()],
+                attributes: std::collections::BTreeMap::new(),
+                display_badges: Vec::new(),
                 max_estimated_cost: None,
             },
         );
@@ -547,6 +554,7 @@ mod tests {
                 auth_backend: None,
                 auth_profile: None,
                 auth_vault_path: None,
+                attribute_mappings: std::collections::BTreeMap::new(),
             },
         );
         config.models.insert(
@@ -559,6 +567,8 @@ mod tests {
                 output_cost_per_million: 0.0,
                 quality: None,
                 capabilities: vec!["made_up".to_string()],
+                attributes: std::collections::BTreeMap::new(),
+                display_badges: Vec::new(),
                 max_estimated_cost: None,
             },
         );

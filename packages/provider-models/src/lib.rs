@@ -4,6 +4,8 @@
 
 //! Provider and model metadata types for brouter.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Stable identifier for a configured provider.
@@ -133,6 +135,8 @@ pub struct RouteableModel {
     pub output_cost_per_million: f64,
     pub quality: u8,
     pub capabilities: Vec<ModelCapability>,
+    pub attributes: BTreeMap<String, String>,
+    pub display_badges: Vec<String>,
 }
 
 impl RouteableModel {

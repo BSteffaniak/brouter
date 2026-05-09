@@ -260,7 +260,7 @@ impl ProviderClient {
                     provider_id: model.provider.to_string(),
                 })?;
         let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-        let upstream_request = openai_compatible_request_body(model, request);
+        let upstream_request = openai_compatible_request_body(provider, model, request);
 
         let mut request_builder = self.http.post(url).json(&upstream_request);
         if let Some(timeout) = provider_timeout(provider) {
@@ -311,6 +311,7 @@ impl ProviderClient {
 }
 
 fn openai_compatible_request_body(
+    provider: &ProviderConfig,
     model: &RouteableModel,
     request: &ChatCompletionRequest,
 ) -> Value {
@@ -340,7 +341,33 @@ fn openai_compatible_request_body(
         )
         | None => {}
     }
+    apply_attribute_mappings(provider, model, &mut body);
     body
+}
+
+pub(crate) fn apply_attribute_mappings(
+    provider: &ProviderConfig,
+    model: &RouteableModel,
+    body: &mut Value,
+) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    for (key, value) in &model.attributes {
+        let Some(mapping) = provider
+            .attribute_mappings
+            .get(key)
+            .and_then(|values| values.get(value))
+        else {
+            continue;
+        };
+        for field in &mapping.omit_request_fields {
+            object.remove(field);
+        }
+        for (field, field_value) in &mapping.request_fields {
+            object.insert(field.clone(), field_value.clone());
+        }
+    }
 }
 
 fn provider_timeout(provider: &ProviderConfig) -> Option<Duration> {
@@ -640,6 +667,8 @@ mod tests {
             output_cost_per_million: 0.0,
             quality: 80,
             capabilities: vec![ModelCapability::Chat],
+            attributes: BTreeMap::new(),
+            display_badges: Vec::new(),
         };
 
         let response = ProviderClient::new()
@@ -662,15 +691,28 @@ mod tests {
             output_cost_per_million: 0.0,
             quality: 80,
             capabilities: vec![ModelCapability::Chat],
+            attributes: BTreeMap::new(),
+            display_badges: Vec::new(),
+        };
+        let provider = ProviderConfig {
+            kind: ProviderKind::OpenAiCompatible,
+            base_url: Some("http://localhost/v1".to_string()),
+            api_key_env: None,
+            timeout_ms: None,
+            max_estimated_cost: None,
+            auth_backend: None,
+            auth_profile: None,
+            auth_vault_path: None,
+            attribute_mappings: BTreeMap::new(),
         };
         let mut request = chat_request(false);
 
         request.reasoning_effort = Some(ReasoningEffort::None);
-        let body = openai_compatible_request_body(&model, &request);
+        let body = openai_compatible_request_body(&provider, &model, &request);
         assert!(body.get("reasoning_effort").is_none());
 
         request.reasoning_effort = Some(ReasoningEffort::Max);
-        let body = openai_compatible_request_body(&model, &request);
+        let body = openai_compatible_request_body(&provider, &model, &request);
         assert_eq!(body["reasoning_effort"], "high");
     }
 
@@ -688,6 +730,8 @@ mod tests {
             output_cost_per_million: 15.0,
             quality: 90,
             capabilities: vec![ModelCapability::Chat, ModelCapability::Reasoning],
+            attributes: BTreeMap::new(),
+            display_badges: Vec::new(),
         };
 
         let response = ProviderClient::new()
@@ -718,6 +762,8 @@ mod tests {
             output_cost_per_million: 15.0,
             quality: 90,
             capabilities: vec![ModelCapability::Chat],
+            attributes: BTreeMap::new(),
+            display_badges: Vec::new(),
         };
 
         let mut response = ProviderClient::new()
@@ -751,6 +797,8 @@ mod tests {
             output_cost_per_million: 0.0,
             quality: 80,
             capabilities: vec![ModelCapability::Chat],
+            attributes: BTreeMap::new(),
+            display_badges: Vec::new(),
         };
 
         let mut response = ProviderClient::new()
@@ -852,6 +900,7 @@ mod tests {
                 auth_backend: None,
                 auth_profile: None,
                 auth_vault_path: None,
+                attribute_mappings: BTreeMap::new(),
             },
         );
         let mut models = BTreeMap::new();
@@ -865,6 +914,8 @@ mod tests {
                 output_cost_per_million: 15.0,
                 quality: Some(90),
                 capabilities: vec!["chat".to_string(), "reasoning".to_string()],
+                attributes: BTreeMap::new(),
+                display_badges: Vec::new(),
                 max_estimated_cost: None,
             },
         );
@@ -888,6 +939,7 @@ mod tests {
                 auth_backend: None,
                 auth_profile: None,
                 auth_vault_path: None,
+                attribute_mappings: BTreeMap::new(),
             },
         );
         let mut models = BTreeMap::new();
@@ -901,6 +953,8 @@ mod tests {
                 output_cost_per_million: 0.0,
                 quality: Some(80),
                 capabilities: vec!["chat".to_string()],
+                attributes: BTreeMap::new(),
+                display_badges: Vec::new(),
                 max_estimated_cost: None,
             },
         );

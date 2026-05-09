@@ -30,8 +30,10 @@ patterns used by the sibling projects in this checkout.
 `/v1/chat/completions` supports non-streaming and streaming OpenAI-compatible
 upstreams, provider timeouts, fallback attempts for retryable failures,
 provider cooldowns after repeated failures, Anthropic non-streaming and streaming
-conversion, OpenAI-compatible embeddings forwarding, configurable scoring/routing rules, and optional SQLite telemetry via
-`switchy_database`. `/v1/brouter/usage` supports `session_id`, `model`,
+conversion, OpenAI-compatible embeddings forwarding, configurable scoring/routing rules, generic model/provider route attributes, and optional SQLite telemetry via
+`switchy_database`. Successful chat responses include brouter headers such as
+`x-brouter-selected-model`, `x-brouter-provider`, `x-brouter-attributes`, and
+`x-brouter-display-badges`. `/v1/brouter/usage` supports `session_id`, `model`,
 `success`, `since_ms`, and `until_ms` query filters. `/metrics` exposes basic
 Prometheus text metrics from telemetry events.
 
