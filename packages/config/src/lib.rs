@@ -10,7 +10,9 @@ use brouter_catalog::FallbackCatalog;
 use brouter_catalog_models::{
     MetadataOverrideMode, MetadataProvenance, MetadataSource, ResolvedModelMetadata,
 };
-use brouter_config_models::{BrouterConfig, ProviderKind};
+use brouter_config_models::{
+    BrouterConfig, ProviderConfig, ProviderIntrospectionConfig, ProviderKind,
+};
 use brouter_introspection_models::{CatalogModel, IntrospectionSnapshot};
 use brouter_provider_models::{ModelCapability, ModelId, ProviderId, RouteableModel};
 use brouter_router_models::{
@@ -55,13 +57,134 @@ pub fn load_config(path: &Path) -> Result<BrouterConfig, ConfigError> {
         path: path.display().to_string(),
         source,
     })?;
-    let config =
+    let mut config =
         toml::from_str::<BrouterConfig>(&contents).map_err(|source| ConfigError::Parse {
             path: path.display().to_string(),
             source,
         })?;
+    apply_default_config(&mut config);
     validate_config(&config)?;
     Ok(config)
+}
+
+/// Applies provider presets, environment auto-detection, and default policies.
+pub fn apply_default_config(config: &mut BrouterConfig) {
+    apply_provider_presets(config);
+    apply_env_provider_autodetection(config);
+    apply_default_dynamic_policy(config);
+}
+
+fn apply_provider_presets(config: &mut BrouterConfig) {
+    for (provider_id, provider) in &mut config.providers {
+        let preset = provider
+            .preset
+            .as_deref()
+            .unwrap_or(provider_id)
+            .to_lowercase();
+        apply_provider_preset(provider, &preset);
+    }
+}
+
+fn apply_provider_preset(provider: &mut ProviderConfig, preset: &str) {
+    match preset {
+        "openrouter" => {
+            provider.kind = ProviderKind::OpenAiCompatible;
+            provider
+                .base_url
+                .get_or_insert_with(|| "https://openrouter.ai/api/v1".to_string());
+            provider
+                .api_key_env
+                .get_or_insert_with(|| "OPENROUTER_API_KEY".to_string());
+            provider.introspection.enabled = true;
+            provider.introspection.catalog = true;
+            provider.introspection.account = true;
+        }
+        "openai" => {
+            provider.kind = ProviderKind::OpenAiCompatible;
+            provider
+                .base_url
+                .get_or_insert_with(|| "https://api.openai.com/v1".to_string());
+            provider
+                .api_key_env
+                .get_or_insert_with(|| "OPENAI_API_KEY".to_string());
+            provider.introspection.enabled = true;
+            provider.introspection.catalog = true;
+        }
+        "anthropic" => {
+            provider.kind = ProviderKind::Anthropic;
+            provider
+                .base_url
+                .get_or_insert_with(|| "https://api.anthropic.com/v1".to_string());
+            provider
+                .api_key_env
+                .get_or_insert_with(|| "ANTHROPIC_API_KEY".to_string());
+            provider.introspection.enabled = true;
+            provider.introspection.catalog = true;
+        }
+        "ollama" => {
+            provider.kind = ProviderKind::OpenAiCompatible;
+            provider.base_url.get_or_insert_with(|| {
+                std::env::var("OLLAMA_HOST").map_or_else(
+                    |_| "http://localhost:11434/v1".to_string(),
+                    |host| format!("{}/v1", host.trim_end_matches('/')),
+                )
+            });
+            provider.introspection.enabled = true;
+            provider.introspection.catalog = true;
+        }
+        _ => {}
+    }
+}
+
+fn apply_env_provider_autodetection(config: &mut BrouterConfig) {
+    let mut added_provider = false;
+    if std::env::var_os("OPENROUTER_API_KEY").is_some() {
+        added_provider |= insert_auto_provider(config, "openrouter", "openrouter");
+    }
+    if std::env::var_os("OPENAI_API_KEY").is_some() {
+        added_provider |= insert_auto_provider(config, "openai", "openai");
+    }
+    if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
+        added_provider |= insert_auto_provider(config, "anthropic", "anthropic");
+    }
+    if std::env::var_os("OLLAMA_HOST").is_some() {
+        added_provider |= insert_auto_provider(config, "ollama", "ollama");
+    }
+    if added_provider {
+        config.router.metadata.refresh_on_startup = true;
+    }
+}
+
+fn insert_auto_provider(config: &mut BrouterConfig, provider_id: &str, preset: &str) -> bool {
+    if config.providers.contains_key(provider_id) {
+        return false;
+    }
+    let mut provider = ProviderConfig {
+        kind: ProviderKind::OpenAiCompatible,
+        preset: Some(preset.to_string()),
+        base_url: None,
+        api_key_env: None,
+        timeout_ms: Some(60_000),
+        max_estimated_cost: None,
+        auth_backend: None,
+        auth_profile: None,
+        auth_vault_path: None,
+        introspection: ProviderIntrospectionConfig::default(),
+        resource_pools: Vec::new(),
+        attribute_mappings: std::collections::BTreeMap::new(),
+    };
+    apply_provider_preset(&mut provider, preset);
+    config.providers.insert(provider_id.to_string(), provider);
+    true
+}
+
+fn apply_default_dynamic_policy(config: &mut BrouterConfig) {
+    config
+        .router
+        .dynamic_policy
+        .disable_attributes_when_low
+        .entry("latency_class".to_string())
+        .or_insert_with(|| "priority".to_string());
 }
 
 /// Validates a parsed brouter configuration.
@@ -608,38 +731,98 @@ pub const fn context_policy(config: &BrouterConfig) -> ContextPolicy {
 pub fn routing_profiles(
     config: &BrouterConfig,
 ) -> std::collections::BTreeMap<String, RoutingProfile> {
-    config
-        .router
-        .profiles
-        .iter()
-        .map(|(name, profile)| {
-            (
-                name.clone(),
-                RoutingProfile {
-                    objective: profile
-                        .objective
-                        .as_deref()
-                        .map(RoutingObjective::from_name),
-                    allow: profile.allow.iter().map(selector_config).collect(),
-                    deny: profile
-                        .deny
-                        .iter()
-                        .map(|deny| CandidateDenyRule {
-                            selector: deny_selector_config(deny),
-                            reason: deny.reason.clone(),
-                            hard: deny.hard,
-                            penalty: deny.penalty,
-                        })
-                        .collect(),
-                    context_policy: profile.context.as_ref().map(|context| ContextPolicy {
-                        safety_margin_ratio: context.safety_margin_ratio,
-                        preserve_session_context_floor: context.preserve_session_context_floor,
-                        allow_context_downgrade: context.allow_context_downgrade,
-                    }),
-                },
-            )
-        })
-        .collect()
+    let mut profiles = default_routing_profiles();
+    profiles.extend(config.router.profiles.iter().map(|(name, profile)| {
+        (
+            name.clone(),
+            RoutingProfile {
+                objective: profile
+                    .objective
+                    .as_deref()
+                    .map(RoutingObjective::from_name),
+                allow: profile.allow.iter().map(selector_config).collect(),
+                deny: profile
+                    .deny
+                    .iter()
+                    .map(|deny| CandidateDenyRule {
+                        selector: deny_selector_config(deny),
+                        reason: deny.reason.clone(),
+                        hard: deny.hard,
+                        penalty: deny.penalty,
+                    })
+                    .collect(),
+                context_policy: profile.context.as_ref().map(|context| ContextPolicy {
+                    safety_margin_ratio: context.safety_margin_ratio,
+                    preserve_session_context_floor: context.preserve_session_context_floor,
+                    allow_context_downgrade: context.allow_context_downgrade,
+                }),
+            },
+        )
+    }));
+    profiles
+}
+
+fn default_routing_profiles() -> std::collections::BTreeMap<String, RoutingProfile> {
+    std::collections::BTreeMap::from([
+        (
+            "balanced".to_string(),
+            RoutingProfile {
+                objective: Some(RoutingObjective::Balanced),
+                ..RoutingProfile::default()
+            },
+        ),
+        (
+            "cheap".to_string(),
+            RoutingProfile {
+                objective: Some(RoutingObjective::Cheapest),
+                ..RoutingProfile::default()
+            },
+        ),
+        (
+            "fast".to_string(),
+            RoutingProfile {
+                objective: Some(RoutingObjective::Fastest),
+                ..RoutingProfile::default()
+            },
+        ),
+        (
+            "strong".to_string(),
+            RoutingProfile {
+                objective: Some(RoutingObjective::Strongest),
+                ..RoutingProfile::default()
+            },
+        ),
+        (
+            "local".to_string(),
+            RoutingProfile {
+                objective: Some(RoutingObjective::LocalOnly),
+                allow: vec![CandidateSelector {
+                    capabilities: vec![ModelCapability::Local],
+                    ..CandidateSelector::default()
+                }],
+                ..RoutingProfile::default()
+            },
+        ),
+        (
+            "conserve_quota".to_string(),
+            RoutingProfile {
+                objective: Some(RoutingObjective::Cheapest),
+                deny: vec![CandidateDenyRule {
+                    selector: CandidateSelector {
+                        attributes: std::collections::BTreeMap::from([(
+                            "latency_class".to_string(),
+                            "priority".to_string(),
+                        )]),
+                        ..CandidateSelector::default()
+                    },
+                    reason: "priority lane disabled by default conserve_quota profile".to_string(),
+                    hard: true,
+                    penalty: None,
+                }],
+                ..RoutingProfile::default()
+            },
+        ),
+    ])
 }
 
 fn selector_config(selector: &brouter_config_models::CandidateSelectorConfig) -> CandidateSelector {
@@ -740,7 +923,143 @@ pub fn routeable_models_with_introspection(
             ));
         }
     }
+    append_discovered_models(config, snapshots, &mut models);
+    append_fallback_catalog_models(config, &catalog, &mut models);
     models
+}
+
+fn append_fallback_catalog_models(
+    config: &BrouterConfig,
+    catalog: &FallbackCatalog,
+    models: &mut Vec<RouteableModel>,
+) {
+    for (provider_id, provider) in &config.providers {
+        let provider_id = ProviderId::new(provider_id.clone());
+        let family = provider_family(
+            provider_id.as_str(),
+            provider.kind,
+            provider.base_url.as_deref(),
+        );
+        for catalog_model in catalog.models().iter().filter(|model| {
+            model.provider_kind == brouter_catalog::provider_kind_name(provider.kind)
+                && model.provider_family == family
+        }) {
+            if models.iter().any(|model| {
+                model.provider == provider_id
+                    && model.upstream_model == catalog_model.upstream_model
+            }) {
+                continue;
+            }
+            if let Some(model) = fallback_catalog_model_to_routeable(&provider_id, catalog_model) {
+                models.push(model);
+            }
+        }
+    }
+}
+
+fn fallback_catalog_model_to_routeable(
+    provider_id: &ProviderId,
+    catalog_model: &brouter_catalog_models::CatalogModelMetadata,
+) -> Option<RouteableModel> {
+    let context_window = catalog_model.context_window?;
+    let capabilities = parse_capabilities(&catalog_model.capabilities);
+    Some(RouteableModel {
+        id: ModelId::new(discovered_model_id(
+            provider_id,
+            &catalog_model.upstream_model,
+        )),
+        provider: provider_id.clone(),
+        upstream_model: catalog_model.upstream_model.clone(),
+        context_window,
+        input_cost_per_million: catalog_model.input_cost_per_million.unwrap_or_default(),
+        output_cost_per_million: catalog_model.output_cost_per_million.unwrap_or_default(),
+        quality: discovered_quality(&capabilities, &catalog_model.upstream_model),
+        capabilities,
+        attributes: std::collections::BTreeMap::from([(
+            "discovered".to_string(),
+            "true".to_string(),
+        )]),
+        display_badges: Vec::new(),
+        metadata: ResolvedModelMetadata {
+            context_window: catalog_provenance(catalog_model),
+            max_output_tokens: catalog_model.max_output_tokens,
+            max_output_tokens_source: catalog_provenance(catalog_model),
+            cost: catalog_provenance(catalog_model),
+            capabilities: catalog_provenance(catalog_model),
+        },
+    })
+}
+
+fn append_discovered_models(
+    config: &BrouterConfig,
+    snapshots: &[IntrospectionSnapshot],
+    models: &mut Vec<RouteableModel>,
+) {
+    for snapshot in snapshots {
+        let Some(catalog) = &snapshot.catalog else {
+            continue;
+        };
+        for catalog_model in catalog.models.values() {
+            if models.iter().any(|model| {
+                model.provider == snapshot.provider
+                    && model.upstream_model == catalog_model.upstream_model
+            }) {
+                continue;
+            }
+            if let Some(model) = catalog_model_to_routeable(config, snapshot, catalog_model) {
+                models.push(model);
+            }
+        }
+    }
+}
+
+fn catalog_model_to_routeable(
+    config: &BrouterConfig,
+    snapshot: &IntrospectionSnapshot,
+    catalog_model: &CatalogModel,
+) -> Option<RouteableModel> {
+    let context_window = catalog_model.fields.context_window.value?;
+    let mut capabilities = catalog_model
+        .fields
+        .capabilities
+        .value
+        .clone()
+        .unwrap_or_else(|| vec![ModelCapability::Chat]);
+    if snapshot.provider.as_str() == "ollama" && !capabilities.contains(&ModelCapability::Local) {
+        capabilities.push(ModelCapability::Local);
+    }
+    let model_id = discovered_model_id(&snapshot.provider, &catalog_model.upstream_model);
+    Some(RouteableModel {
+        id: ModelId::new(model_id),
+        provider: snapshot.provider.clone(),
+        upstream_model: catalog_model.upstream_model.clone(),
+        context_window,
+        input_cost_per_million: catalog_model
+            .fields
+            .input_cost_per_million
+            .value
+            .unwrap_or_default(),
+        output_cost_per_million: catalog_model
+            .fields
+            .output_cost_per_million
+            .value
+            .unwrap_or_default(),
+        quality: discovered_quality(&capabilities, &catalog_model.upstream_model),
+        capabilities,
+        attributes: discovered_attributes(config, snapshot, catalog_model),
+        display_badges: Vec::new(),
+        metadata: ResolvedModelMetadata {
+            context_window: catalog_model.fields.context_window.provenance.clone(),
+            max_output_tokens: catalog_model.fields.max_output_tokens.value,
+            max_output_tokens_source: catalog_model.fields.max_output_tokens.provenance.clone(),
+            cost: catalog_model
+                .fields
+                .input_cost_per_million
+                .provenance
+                .clone(),
+            capabilities: catalog_model.fields.capabilities.provenance.clone(),
+        },
+    })
 }
 
 fn model_config_to_routeable(
@@ -1019,6 +1338,57 @@ fn resolve_max_output_tokens(
     (None, MetadataProvenance::new(MetadataSource::Unknown))
 }
 
+fn discovered_model_id(provider: &ProviderId, upstream_model: &str) -> String {
+    format!("{provider}/{upstream_model}")
+}
+
+fn discovered_quality(capabilities: &[ModelCapability], upstream_model: &str) -> u8 {
+    let lower_model = upstream_model.to_lowercase();
+    if lower_model.contains("opus")
+        || lower_model.contains("gpt-4.1")
+        || lower_model.contains("gpt-5")
+    {
+        92
+    } else if capabilities.contains(&ModelCapability::Reasoning)
+        || lower_model.contains("sonnet")
+        || lower_model.contains("reason")
+    {
+        88
+    } else if capabilities.contains(&ModelCapability::Code) || lower_model.contains("coder") {
+        78
+    } else {
+        70
+    }
+}
+
+fn discovered_attributes(
+    _config: &BrouterConfig,
+    snapshot: &IntrospectionSnapshot,
+    catalog_model: &CatalogModel,
+) -> std::collections::BTreeMap<String, String> {
+    let mut attributes = std::collections::BTreeMap::new();
+    attributes.insert("discovered".to_string(), "true".to_string());
+    if catalog_model
+        .fields
+        .input_cost_per_million
+        .value
+        .unwrap_or_default()
+        == 0.0
+        && catalog_model
+            .fields
+            .output_cost_per_million
+            .value
+            .unwrap_or_default()
+            == 0.0
+    {
+        attributes.insert("billing_class".to_string(), "free".to_string());
+    }
+    if snapshot.provider.as_str() == "ollama" {
+        attributes.insert("location".to_string(), "local".to_string());
+    }
+    attributes
+}
+
 fn live_catalog_model<'a>(
     snapshots: &'a [IntrospectionSnapshot],
     provider_id: &str,
@@ -1106,6 +1476,7 @@ mod tests {
             "local".to_string(),
             ProviderConfig {
                 kind: ProviderKind::OpenAiCompatible,
+                preset: None,
                 base_url: Some("http://localhost:11434/v1".to_string()),
                 api_key_env: None,
                 timeout_ms: None,
@@ -1145,6 +1516,7 @@ mod tests {
             "openai".to_string(),
             ProviderConfig {
                 kind: ProviderKind::OpenAiCompatible,
+                preset: None,
                 base_url: Some("https://api.openai.com/v1".to_string()),
                 api_key_env: None,
                 timeout_ms: None,
@@ -1191,6 +1563,7 @@ mod tests {
             "openai".to_string(),
             ProviderConfig {
                 kind: ProviderKind::OpenAiCompatible,
+                preset: None,
                 base_url: Some("https://api.openai.com/v1".to_string()),
                 api_key_env: None,
                 timeout_ms: None,
@@ -1246,6 +1619,7 @@ mod tests {
             "local".to_string(),
             ProviderConfig {
                 kind: ProviderKind::OpenAiCompatible,
+                preset: None,
                 base_url: None,
                 api_key_env: None,
                 timeout_ms: None,

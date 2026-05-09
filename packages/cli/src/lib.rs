@@ -18,7 +18,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use brouter_api_models::{ChatCompletionRequest, ChatMessage, MessageContent};
 use brouter_config::{
-    load_config, routeable_models, routing_rules, scoring_weights, validate_config_warnings,
+    apply_default_config, load_config, routeable_models, routing_rules, scoring_weights,
+    validate_config_warnings,
 };
 use brouter_config_models::{BrouterConfig, ProviderConfig, ProviderKind};
 use brouter_router::Router;
@@ -74,7 +75,13 @@ fn init_tracing() {
 }
 
 async fn serve(config: &Path) -> Result<()> {
-    let config = load_config(config)?;
+    let config = if config.exists() {
+        load_config(config)?
+    } else {
+        let mut config = BrouterConfig::default();
+        apply_default_config(&mut config);
+        config
+    };
     brouter_server::serve(config).await?;
     Ok(())
 }

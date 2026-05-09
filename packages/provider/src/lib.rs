@@ -1143,6 +1143,7 @@ mod tests {
         };
         let provider = ProviderConfig {
             kind: ProviderKind::OpenAiCompatible,
+            preset: None,
             base_url: Some("http://localhost/v1".to_string()),
             api_key_env: None,
             timeout_ms: None,
@@ -1457,6 +1458,7 @@ mod tests {
             "anthropic".to_string(),
             ProviderConfig {
                 kind: ProviderKind::Anthropic,
+                preset: None,
                 base_url: Some(base_url),
                 api_key_env: None,
                 timeout_ms: None,
@@ -1499,6 +1501,7 @@ mod tests {
             "fake".to_string(),
             ProviderConfig {
                 kind: ProviderKind::OpenAiCompatible,
+                preset: None,
                 base_url: Some(base_url),
                 api_key_env: None,
                 timeout_ms: None,

@@ -385,7 +385,10 @@ pub struct TelemetryConfig {
 /// Provider configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderConfig {
+    #[serde(default)]
     pub kind: ProviderKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -488,12 +491,25 @@ pub struct AttributeRequestMapping {
 }
 
 /// Supported provider kinds.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderKind {
+    #[default]
     OpenAiCompatible,
     Anthropic,
     OpenaiCodex,
+}
+
+impl ProviderKind {
+    /// Parses a provider kind name.
+    #[must_use]
+    pub fn from_name(value: &str) -> Self {
+        match value {
+            "anthropic" => Self::Anthropic,
+            "openai-codex" | "openai_codex" => Self::OpenaiCodex,
+            _ => Self::OpenAiCompatible,
+        }
+    }
 }
 
 /// Model configuration used by the router.

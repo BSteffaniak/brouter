@@ -118,9 +118,28 @@ All fields are optional floats:
 
 - `database_path` optional path; omitted uses in-memory telemetry
 
+## Provider presets and zero-config startup
+
+`brouter serve` can start without `brouter.toml`. It auto-detects providers from environment variables:
+
+- `OPENROUTER_API_KEY` -> OpenRouter preset
+- `OPENAI_API_KEY` -> OpenAI preset
+- `ANTHROPIC_API_KEY` -> Anthropic preset
+- `OLLAMA_HOST` -> Ollama OpenAI-compatible preset
+
+Auto-detected providers enable startup catalog introspection and discovered models. Provider presets can also be used explicitly:
+
+```toml
+[providers.openrouter]
+preset = "openrouter"
+```
+
+Built-in profiles available without config: `balanced`, `cheap`, `fast`, `strong`, `local`, and `conserve_quota`.
+
 ## `[providers.<id>]`
 
-- `kind`: `open-ai-compatible`, `anthropic`, or `openai-codex`
+- `kind`: `open-ai-compatible`, `anthropic`, or `openai-codex`; defaults to `open-ai-compatible`
+- `preset`: optional provider preset: `openrouter`, `openai`, `anthropic`, or `ollama`
 - `base_url` optional string; required for OpenAI-compatible providers
 - `api_key_env` optional string
 - `timeout_ms` optional integer
@@ -131,7 +150,7 @@ All fields are optional floats:
 - `introspection` optional live introspection settings
 - `attribute_mappings` optional nested map from attribute name/value to provider request edits. Each mapping can add top-level `request_fields` or remove top-level `omit_request_fields`.
 
-Provider introspection is generic: adapters translate provider API responses into provider-neutral catalog/account snapshots. Current adapters fetch OpenAI-compatible `/models` metadata, including OpenRouter-style `context_length`, `pricing`, and `supported_parameters` when present, OpenRouter-compatible `/auth/key` credit/account data, and Anthropic `/models` as a partial catalog. Missing fields continue through the generic resolver to user overrides and the fallback catalog.
+Provider introspection is generic: adapters translate provider API responses into provider-neutral catalog/account snapshots. Current adapters fetch OpenAI-compatible `/models` metadata, including OpenRouter-style `context_length`, `pricing`, and `supported_parameters` when present, OpenRouter-compatible `/auth/key` credit/account data, and Anthropic `/models` as a partial catalog. Discovered catalog models become routeable automatically. Missing fields continue through the generic resolver to user overrides and the fallback catalog.
 
 ```toml
 [providers.openrouter.introspection]

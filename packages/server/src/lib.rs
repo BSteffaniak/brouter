@@ -1567,6 +1567,7 @@ mod tests {
             "healthy".to_string(),
             ProviderConfig {
                 kind: ProviderKind::OpenAiCompatible,
+                preset: None,
                 base_url: Some(base_url),
                 api_key_env: None,
                 timeout_ms: None,
@@ -1604,6 +1605,7 @@ mod tests {
             "failing".to_string(),
             ProviderConfig {
                 kind: ProviderKind::OpenAiCompatible,
+                preset: None,
                 base_url: Some(failing_base_url),
                 api_key_env: None,
                 timeout_ms: None,
@@ -1620,6 +1622,7 @@ mod tests {
             "healthy".to_string(),
             ProviderConfig {
                 kind: ProviderKind::OpenAiCompatible,
+                preset: None,
                 base_url: Some(healthy_base_url),
                 api_key_env: None,
                 timeout_ms: None,

@@ -50,7 +50,13 @@ cargo test
 
 ## Build and run
 
-Copy the example config, edit providers/models for your environment, then start
+Start with no config if you have a supported provider environment variable such as `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `OLLAMA_HOST`:
+
+```sh
+cargo run -p brouter_cli -- serve
+```
+
+Or copy the example config, edit providers/models for your environment, then start
 brouter:
 
 ```sh
