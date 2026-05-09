@@ -65,13 +65,16 @@ pub async fn run_cli() -> Result<()> {
             first_message,
             objective,
             judge,
-        } => explain_route(
-            &resolve_and_load(config.as_deref())?,
-            &prompt,
-            first_message,
-            objective.as_deref(),
-            judge,
-        ),
+        } => {
+            explain_route(
+                &resolve_and_load(config.as_deref())?,
+                &prompt,
+                first_message,
+                objective.as_deref(),
+                judge,
+            )
+            .await
+        }
     }
 }
 
@@ -842,7 +845,7 @@ struct OpenAiDeviceTokenResponse {
     code_verifier: String,
 }
 
-fn explain_route(
+async fn explain_route(
     config: &BrouterConfig,
     prompt: &str,
     first_message: bool,
@@ -861,14 +864,15 @@ fn explain_route(
         routing_rules(config),
     );
     let decision = router.route_chat(&prompt_request(prompt), first_message)?;
-    let decision = maybe_invoke_judge(config, judge_config.as_ref(), &decision, force_judge)?;
+    let decision =
+        maybe_invoke_judge(config, judge_config.as_ref(), &decision, force_judge).await?;
     println!("{}", serde_json::to_string_pretty(&decision)?);
     Ok(())
 }
 
 /// Optionally invokes the LLM judge and returns the updated decision.
 #[allow(clippy::too_many_lines)]
-fn maybe_invoke_judge(
+async fn maybe_invoke_judge(
     config: &BrouterConfig,
     judge_config: Option<&JudgeConfig>,
     decision: &RoutingDecision,
@@ -934,8 +938,9 @@ fn maybe_invoke_judge(
         });
     let client = ProviderClient::new();
     let registry = ProviderRegistry::from_config(config);
-    let response = tokio::runtime::Runtime::new()?
-        .block_on(client.chat_completions(&registry, &judge_model, &judge_request))
+    let response = client
+        .chat_completions(&registry, &judge_model, &judge_request)
+        .await
         .map_err(|e| anyhow::anyhow!("LLM judge call failed: {e}"))?;
     let raw_text = response.body.to_string();
     let reasoning = parse_judge_response(&raw_text, &decision.candidates, judge_model_id);

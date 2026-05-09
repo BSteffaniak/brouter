@@ -32,8 +32,20 @@ Output format (JSON, no additional text):
 /// Output format expected from the LLM judge.
 #[derive(Debug, Deserialize)]
 struct JudgeResponse {
+    #[serde(alias = "model", alias = "selected_model")]
     selected_model: String,
     reasoning: String,
+}
+
+/// Error response format from API providers.
+#[derive(Debug, Deserialize)]
+struct ApiErrorResponse {
+    error: ApiErrorDetail,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiErrorDetail {
+    message: String,
 }
 
 /// Format capabilities as a comma-separated string.
@@ -133,15 +145,20 @@ pub fn parse_judge_response(
             }
         }
         Err(e) => {
+            // Check if the raw response is an error from the API.
+            let error_msg = serde_json::from_str::<ApiErrorResponse>(&json_str)
+                .ok()
+                .and_then(|r| (!r.error.message.is_empty()).then_some(r.error.message));
             let fallback = shortlist
                 .first()
                 .map_or_else(|| judge_model.clone(), |c| c.model_id.clone());
+            let msg = error_msg.unwrap_or_else(|| format!("parse failure: {e}"));
             ModelReasoning {
                 model_id: judge_model.clone(),
-                rationale: format!("Failed to parse judge response: {e}"),
+                rationale: format!("Failed to parse judge response: {msg}"),
                 chosen_model: fallback,
                 overridden: false,
-                error: Some(format!("parse failure: {e}")),
+                error: Some(msg),
             }
         }
     }
@@ -172,14 +189,17 @@ pub fn judge_request(
                 tool_call_id: None,
             },
         ],
-        temperature: Some(config.output.temperature),
+        // Omit temperature if it would be 0.0 to avoid issues with providers that don't support it.
+        // Omit temperature if 0.0 to avoid issues with providers that don't support it.
+        temperature: (config.output.temperature > 0.0).then_some(config.output.temperature),
         top_p: None,
         max_tokens: Some(config.output.max_tokens),
         reasoning_effort: None,
         stream: Some(false),
         tools: None,
         tool_choice: None,
-        response_format: Some(serde_json::json!({"type": "json_object"})),
+        response_format: (config.output.structured)
+            .then(|| serde_json::json!({"type": "json_object"})),
         metadata: None,
         extra: BTreeMap::new(),
     }
