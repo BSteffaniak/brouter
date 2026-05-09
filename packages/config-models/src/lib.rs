@@ -84,6 +84,10 @@ pub struct RouterConfig {
     #[serde(default)]
     pub context: ContextConfig,
     #[serde(default)]
+    pub metadata: MetadataConfig,
+    #[serde(default)]
+    pub dynamic_policy: DynamicPolicyConfig,
+    #[serde(default)]
     pub rules: Vec<RouterRuleConfig>,
     #[serde(default)]
     pub aliases: BTreeMap<String, String>,
@@ -111,6 +115,8 @@ impl Default for RouterConfig {
             debug_headers: false,
             scoring: ScoringConfig::default(),
             context: ContextConfig::default(),
+            metadata: MetadataConfig::default(),
+            dynamic_policy: DynamicPolicyConfig::default(),
             rules: Vec::new(),
             aliases: BTreeMap::new(),
             groups: BTreeMap::new(),
@@ -157,6 +163,88 @@ pub struct ScoringConfig {
     pub reasoning_bonus: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_penalty: Option<f64>,
+}
+
+/// Metadata introspection/cache configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct MetadataConfig {
+    #[serde(default)]
+    pub strict: bool,
+    #[serde(default = "default_metadata_max_age_ms")]
+    pub max_age_ms: u64,
+    #[serde(default)]
+    pub refresh_on_startup: bool,
+    #[serde(default)]
+    pub allow_stale_on_provider_error: bool,
+    #[serde(default = "default_allow_fallback_catalog")]
+    pub allow_fallback_catalog: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_path: Option<String>,
+}
+
+impl Default for MetadataConfig {
+    fn default() -> Self {
+        Self {
+            strict: false,
+            max_age_ms: default_metadata_max_age_ms(),
+            refresh_on_startup: false,
+            allow_stale_on_provider_error: false,
+            allow_fallback_catalog: default_allow_fallback_catalog(),
+            cache_path: None,
+        }
+    }
+}
+
+const fn default_metadata_max_age_ms() -> u64 {
+    86_400_000
+}
+
+const fn default_allow_fallback_catalog() -> bool {
+    true
+}
+
+/// Dynamic account policy configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DynamicPolicyConfig {
+    #[serde(default = "default_low_remaining_ratio")]
+    pub low_remaining_ratio: f64,
+    #[serde(default = "default_critical_remaining_ratio")]
+    pub critical_remaining_ratio: f64,
+    #[serde(default = "default_low_remaining_penalty")]
+    pub low_remaining_penalty: f64,
+    #[serde(default = "default_exclude_when_exhausted")]
+    pub exclude_when_exhausted: bool,
+    #[serde(default)]
+    pub disable_attributes_when_low: BTreeMap<String, String>,
+}
+
+impl Default for DynamicPolicyConfig {
+    fn default() -> Self {
+        Self {
+            low_remaining_ratio: default_low_remaining_ratio(),
+            critical_remaining_ratio: default_critical_remaining_ratio(),
+            low_remaining_penalty: default_low_remaining_penalty(),
+            exclude_when_exhausted: default_exclude_when_exhausted(),
+            disable_attributes_when_low: BTreeMap::new(),
+        }
+    }
+}
+
+const fn default_low_remaining_ratio() -> f64 {
+    0.25
+}
+
+const fn default_critical_remaining_ratio() -> f64 {
+    0.05
+}
+
+const fn default_low_remaining_penalty() -> f64 {
+    30.0
+}
+
+const fn default_exclude_when_exhausted() -> bool {
+    true
 }
 
 /// Context safety configuration.
@@ -207,6 +295,8 @@ pub struct CandidateSelectorConfig {
     #[serde(default)]
     pub models: Vec<String>,
     #[serde(default)]
+    pub upstream_models: Vec<String>,
+    #[serde(default)]
     pub providers: Vec<String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
@@ -219,6 +309,8 @@ pub struct CandidateSelectorConfig {
 pub struct DenyRuleConfig {
     #[serde(default)]
     pub models: Vec<String>,
+    #[serde(default)]
+    pub upstream_models: Vec<String>,
     #[serde(default)]
     pub providers: Vec<String>,
     #[serde(default)]
@@ -237,6 +329,7 @@ impl Default for DenyRuleConfig {
     fn default() -> Self {
         Self {
             models: Vec::new(),
+            upstream_models: Vec::new(),
             providers: Vec::new(),
             capabilities: Vec::new(),
             attributes: BTreeMap::new(),
@@ -308,7 +401,38 @@ pub struct ProviderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_vault_path: Option<String>,
     #[serde(default)]
+    pub introspection: ProviderIntrospectionConfig,
+    #[serde(default)]
     pub attribute_mappings: BTreeMap<String, BTreeMap<String, AttributeRequestMapping>>,
+}
+
+/// Provider live introspection configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct ProviderIntrospectionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_introspection_catalog")]
+    pub catalog: bool,
+    #[serde(default)]
+    pub account: bool,
+    #[serde(default)]
+    pub limits: bool,
+}
+
+impl Default for ProviderIntrospectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            catalog: default_introspection_catalog(),
+            account: false,
+            limits: false,
+        }
+    }
+}
+
+const fn default_introspection_catalog() -> bool {
+    true
 }
 
 /// Provider request mapping applied when a selected model has a matching attribute.

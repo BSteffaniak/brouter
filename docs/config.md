@@ -19,10 +19,31 @@
 - `provider_cooldown_ms` integer
 - `max_estimated_cost` optional float; global per-request budget
 - `max_session_estimated_cost` optional float; per-session budget using `x-brouter-session` or `metadata.session_id`
+- `metadata` live metadata/cache policy
+- `dynamic_policy` generic account/quota policy thresholds
 - `aliases` map of alias model IDs to configured model IDs
 - `groups` map of group names to model ID arrays; clients can request `group:<name>`
 
 Profiles can be selected with `model = "profile:<name>"`, `x-brouter-profile`, or request metadata `brouter_profile`. Profile allow rules are hard allowlists. Hard deny rules exclude candidates; soft deny rules apply a scoring penalty.
+
+## `[router.metadata]`
+
+- `strict` boolean, default `false`; when enabled, models with missing required metadata can be excluded by future strict checks
+- `max_age_ms` integer, default `86400000`
+- `refresh_on_startup` boolean, default `false`; fetch enabled provider introspection before building routeable models
+- `allow_stale_on_provider_error` boolean, default `false`
+- `allow_fallback_catalog` boolean, default `true`
+- `cache_path` optional path reserved for persisted snapshots
+
+## `[router.dynamic_policy]`
+
+Generic account/resource policy applied to introspected resource pools:
+
+- `low_remaining_ratio` float, default `0.25`
+- `critical_remaining_ratio` float, default `0.05`
+- `low_remaining_penalty` float, default `30.0`
+- `exclude_when_exhausted` boolean, default `true`
+- `disable_attributes_when_low` map, for example `{ latency_class = "priority" }`
 
 ## `[router.context]`
 
@@ -107,7 +128,19 @@ All fields are optional floats:
 - `auth_backend` optional string; `openai-codex` currently supports `sshenv`
 - `auth_profile` optional string; sshenv profile containing ChatGPT/Codex tokens
 - `auth_vault_path` optional string; sshenv vault path. If omitted, brouter uses `$BROUTER_AUTH_VAULT` or `~/.local/state/brouter/auth/vault`.
+- `introspection` optional live introspection settings
 - `attribute_mappings` optional nested map from attribute name/value to provider request edits. Each mapping can add top-level `request_fields` or remove top-level `omit_request_fields`.
+
+Provider introspection is generic: adapters translate provider API responses into provider-neutral catalog/account snapshots. Current adapters fetch OpenAI-compatible `/models` metadata, including OpenRouter-style `context_length`, `pricing`, and `supported_parameters` when present, and Anthropic `/models` as a partial catalog. Missing fields continue through the generic resolver to user overrides and the fallback catalog.
+
+```toml
+[providers.openrouter.introspection]
+enabled = true
+catalog = true
+account = false
+```
+
+Snapshots can be inspected with `GET /v1/brouter/introspection`.
 
 `openai-codex` expects brouter-owned sshenv keys such as
 `BROUTER_OPENAI_CODEX_ACCESS_TOKEN`, `BROUTER_OPENAI_CODEX_REFRESH_TOKEN`,

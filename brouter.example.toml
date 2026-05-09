@@ -25,6 +25,20 @@ strong = "strong_cloud"
 [router.groups]
 cloud = ["cheap_cloud", "strong_cloud"]
 
+[router.metadata]
+# Live provider metadata is preferred over fallback catalog data when enabled.
+refresh_on_startup = false
+max_age_ms = 86400000
+allow_fallback_catalog = true
+
+[router.dynamic_policy]
+# Generic account/resource policy for introspected quota pools.
+low_remaining_ratio = 0.25
+critical_remaining_ratio = 0.05
+low_remaining_penalty = 30.0
+exclude_when_exhausted = true
+# disable_attributes_when_low = { latency_class = "priority" }
+
 [router.context]
 # Protect conversations from silently falling back to a smaller context window.
 safety_margin_ratio = 0.15
@@ -84,6 +98,10 @@ kind = "open-ai-compatible"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 timeout_ms = 60000
+# [providers.openai.introspection]
+# enabled = true
+# catalog = true
+# account = false
 # Optional provider-level per-request estimated cost budget.
 # max_estimated_cost = 0.05
 

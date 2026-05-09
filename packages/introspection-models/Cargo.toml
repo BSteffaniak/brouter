@@ -1,0 +1,24 @@
+[package]
+authors     = { workspace = true }
+categories  = ["config"]
+description = "Generic live introspection data models for brouter"
+edition     = { workspace = true }
+keywords    = ["introspection", "llm", "models"]
+license     = { workspace = true }
+name        = "brouter_introspection_models"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+brouter_catalog_models  = { workspace = true }
+brouter_provider_models = { workspace = true }
+serde                   = { workspace = true, features = ["derive", "std"] }
+serde_json              = { workspace = true, features = ["std"] }
+
+[features]
+default = []
+fail-on-warnings = [
+    "brouter_catalog_models/fail-on-warnings",
+    "brouter_provider_models/fail-on-warnings",
+]

@@ -20,9 +20,14 @@ use brouter_api_models::{
     ChatCompletionRequest, EmbeddingsRequest, ErrorResponse, ModelListResponse, ModelObject,
 };
 use brouter_config::{
-    ConfigError, context_policy, routeable_models, routing_profiles, routing_rules, scoring_weights,
+    ConfigError, context_policy, routeable_models_with_introspection, routing_profiles,
+    routing_rules, scoring_weights,
 };
 use brouter_config_models::BrouterConfig;
+use brouter_introspection::{DynamicPolicyConfig, dynamic_policy_effects};
+use brouter_introspection_models::{
+    DynamicPolicyEffect, IntrospectionRequest, IntrospectionSnapshot,
+};
 use brouter_provider::{ProviderClient, ProviderRegistry};
 use brouter_provider_models::{ModelCapability, ModelId, ProviderId, RouteableModel};
 use brouter_router::{Router, RouterError};
@@ -73,6 +78,8 @@ struct AppState {
     groups: BTreeMap<String, Vec<ModelId>>,
     default_profile: Option<String>,
     session_context_tokens: Arc<Mutex<BTreeMap<String, u32>>>,
+    introspection_snapshots: Vec<IntrospectionSnapshot>,
+    dynamic_policy_effects: Vec<DynamicPolicyEffect>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -106,7 +113,8 @@ pub async fn serve(config: BrouterConfig) -> Result<(), ServerError> {
     let address = parse_bind_address(&bind_address)?;
     let telemetry = telemetry_store(&config).await?;
     let api_key = server_api_key(&config)?;
-    let app = build_app_with_api_key(&config, telemetry, api_key);
+    let snapshots = refresh_introspection_snapshots(&config).await;
+    let app = build_app_with_api_key_and_introspection(&config, telemetry, api_key, snapshots);
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .map_err(|source| ServerError::Bind { address, source })?;
@@ -120,14 +128,34 @@ fn build_app(config: &BrouterConfig, telemetry: TelemetryStore) -> AxumRouter {
     build_app_with_api_key(config, telemetry, None)
 }
 
+#[cfg(test)]
 fn build_app_with_api_key(
     config: &BrouterConfig,
     telemetry: TelemetryStore,
     api_key: Option<String>,
 ) -> AxumRouter {
+    build_app_with_api_key_and_introspection(config, telemetry, api_key, Vec::new())
+}
+
+fn build_app_with_api_key_and_introspection(
+    config: &BrouterConfig,
+    telemetry: TelemetryStore,
+    api_key: Option<String>,
+    introspection_snapshots: Vec<IntrospectionSnapshot>,
+) -> AxumRouter {
     let objective = RoutingObjective::from_name(&config.router.default_objective);
+    let dynamic_policy_effects = dynamic_policy_effects(
+        introspection_snapshots.clone(),
+        DynamicPolicyConfig {
+            low_remaining_ratio: config.router.dynamic_policy.low_remaining_ratio,
+            critical_remaining_ratio: config.router.dynamic_policy.critical_remaining_ratio,
+            low_remaining_penalty: config.router.dynamic_policy.low_remaining_penalty,
+            exclude_when_exhausted: config.router.dynamic_policy.exclude_when_exhausted,
+        },
+        &config.router.dynamic_policy.disable_attributes_when_low,
+    );
     let router = Router::new_with_policy(
-        routeable_models(config),
+        routeable_models_with_introspection(config, &introspection_snapshots),
         objective,
         scoring_weights(config),
         routing_rules(config),
@@ -176,6 +204,8 @@ fn build_app_with_api_key(
             .collect(),
         default_profile: config.router.default_profile.clone(),
         session_context_tokens: Arc::new(Mutex::new(BTreeMap::new())),
+        introspection_snapshots,
+        dynamic_policy_effects,
     };
 
     let app = AxumRouter::new()
@@ -187,6 +217,7 @@ fn build_app_with_api_key(
         .route("/v1/brouter/route/explain", post(route_explain))
         .route("/v1/brouter/usage", get(usage))
         .route("/v1/brouter/usage/summary", get(usage_summary))
+        .route("/v1/brouter/introspection", get(introspection))
         .layer(DefaultBodyLimit::max(config.server.max_request_body_bytes))
         .with_state(state);
     apply_cors(app, &config.server.cors_allowed_origins)
@@ -213,6 +244,33 @@ fn apply_cors(app: AxumRouter, allowed_origins: &[String]) -> AxumRouter {
         layer
     };
     app.layer(layer)
+}
+
+async fn refresh_introspection_snapshots(config: &BrouterConfig) -> Vec<IntrospectionSnapshot> {
+    if !config.router.metadata.refresh_on_startup {
+        return Vec::new();
+    }
+    let registry = ProviderRegistry::from_config(config);
+    let client = ProviderClient::new();
+    let mut snapshots = Vec::new();
+    for provider_id in registry.provider_ids() {
+        let Some(provider) = config.providers.get(provider_id.as_str()) else {
+            continue;
+        };
+        if !provider.introspection.enabled {
+            continue;
+        }
+        let request = IntrospectionRequest {
+            include_catalog: provider.introspection.catalog,
+            include_account: provider.introspection.account,
+            include_limits: provider.introspection.limits,
+        };
+        match client.introspect(&registry, &provider_id, request).await {
+            Ok(snapshot) => snapshots.push(snapshot),
+            Err(error) => tracing::warn!(%provider_id, %error, "provider introspection failed"),
+        }
+    }
+    snapshots
 }
 
 async fn telemetry_store(config: &BrouterConfig) -> Result<TelemetryStore, TelemetryError> {
@@ -285,6 +343,14 @@ async fn usage(
         .await
         .map(|events| Json(filter_usage_events(events, &query)))
         .map_err(|error| telemetry_error_response(&error))
+}
+
+async fn introspection(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<IntrospectionSnapshot>>, (StatusCode, Json<ErrorResponse>)> {
+    authorize(&state, &headers)?;
+    Ok(Json(state.introspection_snapshots))
 }
 
 async fn usage_summary(
@@ -844,6 +910,7 @@ async fn route_request(
                 allowed_models,
                 profile,
                 session_context_tokens,
+                dynamic_policy_effects: state.dynamic_policy_effects.clone(),
             },
         )
         .map_err(|error| router_error_response(&error))?;
@@ -1350,6 +1417,7 @@ mod tests {
                 auth_backend: None,
                 auth_profile: None,
                 auth_vault_path: None,
+                introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 attribute_mappings: BTreeMap::new(),
             },
         );
@@ -1385,6 +1453,7 @@ mod tests {
                 auth_backend: None,
                 auth_profile: None,
                 auth_vault_path: None,
+                introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 attribute_mappings: BTreeMap::new(),
             },
         );
@@ -1399,6 +1468,7 @@ mod tests {
                 auth_backend: None,
                 auth_profile: None,
                 auth_vault_path: None,
+                introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 attribute_mappings: BTreeMap::new(),
             },
         );

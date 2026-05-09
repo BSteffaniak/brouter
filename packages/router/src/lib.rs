@@ -8,6 +8,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use brouter_api_models::{ChatCompletionRequest, ReasoningEffort};
+use brouter_introspection_models::{DynamicPolicyEffect, ResourceSelector};
 use brouter_provider_models::{ModelCapability, ModelId, RouteableModel};
 use brouter_router_models::{
     CandidateDenyRule, CandidateSelector, ContextPolicy, ExcludedCandidate, PromptFeatures,
@@ -134,6 +135,7 @@ impl Router {
                 allowed_models: allowed_models.map(<[ModelId]>::to_vec),
                 profile: None,
                 session_context_tokens: None,
+                dynamic_policy_effects: Vec::new(),
             },
         )
     }
@@ -179,7 +181,13 @@ impl Router {
             None
         };
         let allowed_models = options.allowed_models.or(explicit_model);
-        self.route_features_with_objective(features, objective, allowed_models.as_deref(), profile)
+        self.route_features_with_objective(
+            features,
+            objective,
+            allowed_models.as_deref(),
+            profile,
+            &options.dynamic_policy_effects,
+        )
     }
 
     /// Selects a model for precomputed prompt features.
@@ -192,7 +200,7 @@ impl Router {
         let mut features = features;
         let objective = self.apply_rules("", &mut features);
         apply_context_policy(&mut features, self.context_policy, None);
-        self.route_features_with_objective(features, objective, None, None)
+        self.route_features_with_objective(features, objective, None, None, &[])
     }
 
     fn route_features_with_objective(
@@ -201,9 +209,15 @@ impl Router {
         objective: RoutingObjective,
         allowed_models: Option<&[ModelId]>,
         profile: Option<&RoutingProfile>,
+        dynamic_policy_effects: &[DynamicPolicyEffect],
     ) -> Result<RoutingDecision, RouterError> {
-        let (mut candidates, excluded_candidates) =
-            self.scored_candidates(&features, objective, allowed_models, profile);
+        let (mut candidates, excluded_candidates) = self.scored_candidates(
+            &features,
+            objective,
+            allowed_models,
+            profile,
+            dynamic_policy_effects,
+        );
         candidates.sort_by(compare_candidate_scores);
         let selected = candidates.first().ok_or(RouterError::NoCandidate)?;
         let selected_model = selected.model_id.clone();
@@ -224,13 +238,19 @@ impl Router {
         objective: RoutingObjective,
         allowed_models: Option<&[ModelId]>,
         profile: Option<&RoutingProfile>,
+        dynamic_policy_effects: &[DynamicPolicyEffect],
     ) -> (Vec<ScoredCandidate>, Vec<ExcludedCandidate>) {
         let mut candidates = Vec::new();
         let mut excluded = Vec::new();
         for model in &self.models {
-            if let Some(reason) =
-                candidate_exclusion_reason(model, features, objective, allowed_models, profile)
-            {
+            if let Some(reason) = candidate_exclusion_reason(
+                model,
+                features,
+                objective,
+                allowed_models,
+                profile,
+                dynamic_policy_effects,
+            ) {
                 excluded.push(ExcludedCandidate {
                     model_id: model.id.clone(),
                     reason,
@@ -239,6 +259,7 @@ impl Router {
             }
             let mut candidate = score_model(model, features, objective, self.weights);
             apply_soft_denies(model, profile, self.weights, &mut candidate);
+            apply_dynamic_penalties(model, dynamic_policy_effects, &mut candidate);
             candidates.push(candidate);
         }
         (candidates, excluded)
@@ -510,6 +531,7 @@ fn candidate_exclusion_reason(
     objective: RoutingObjective,
     allowed_models: Option<&[ModelId]>,
     profile: Option<&RoutingProfile>,
+    dynamic_policy_effects: &[DynamicPolicyEffect],
 ) -> Option<String> {
     if allowed_models.is_some_and(|allowed| !allowed.contains(&model.id)) {
         return Some("not in requested model group or allowlist".to_string());
@@ -525,6 +547,9 @@ fn candidate_exclusion_reason(
     }
     if let Some(deny) = hard_matching_deny(profile, model) {
         return Some(format!("denied by routing profile: {}", deny.reason));
+    }
+    if let Some(reason) = dynamic_exclusion_reason(model, dynamic_policy_effects) {
+        return Some(reason);
     }
     if objective == RoutingObjective::LocalOnly && !model.has_capability(ModelCapability::Local) {
         return Some("local-only objective requires local capability".to_string());
@@ -562,7 +587,45 @@ fn hard_matching_deny<'a>(
 
 fn selector_matches_model(selector: &CandidateSelector, model: &RouteableModel) -> bool {
     (selector.models.is_empty() || selector.models.contains(&model.id))
+        && (selector.upstream_models.is_empty()
+            || selector.upstream_models.contains(&model.upstream_model))
         && (selector.providers.is_empty() || selector.providers.contains(&model.provider))
+        && selector
+            .capabilities
+            .iter()
+            .all(|capability| model.has_capability(*capability))
+        && attributes_match(&model.attributes, &selector.attributes)
+}
+
+fn dynamic_exclusion_reason(
+    model: &RouteableModel,
+    effects: &[DynamicPolicyEffect],
+) -> Option<String> {
+    effects.iter().find_map(|effect| match effect {
+        DynamicPolicyEffect::Exclude { selector, reason }
+            if resource_selector_matches_model(selector, model) =>
+        {
+            Some(reason.clone())
+        }
+        DynamicPolicyEffect::DisableAttribute {
+            selector,
+            key,
+            value,
+            reason,
+        } if resource_selector_matches_model(selector, model)
+            && model.attributes.get(key) == Some(value) =>
+        {
+            Some(reason.clone())
+        }
+        _ => None,
+    })
+}
+
+fn resource_selector_matches_model(selector: &ResourceSelector, model: &RouteableModel) -> bool {
+    (selector.providers.is_empty() || selector.providers.contains(&model.provider))
+        && (selector.upstream_models.is_empty()
+            || selector.upstream_models.contains(&model.upstream_model))
+        && (selector.configured_models.is_empty() || selector.configured_models.contains(&model.id))
         && selector
             .capabilities
             .iter()
@@ -704,6 +767,27 @@ fn apply_preferred_attributes(
         if model.attributes.get(key) == Some(value) {
             *score += weights.reasoning_bonus / 4.0;
             reasons.push(format!("matched preferred attribute {key}={value}"));
+        }
+    }
+}
+
+fn apply_dynamic_penalties(
+    model: &RouteableModel,
+    effects: &[DynamicPolicyEffect],
+    candidate: &mut ScoredCandidate,
+) {
+    for effect in effects {
+        if let DynamicPolicyEffect::Penalize {
+            selector,
+            penalty,
+            reason,
+        } = effect
+            && resource_selector_matches_model(selector, model)
+        {
+            candidate.score -= *penalty;
+            candidate
+                .reasons
+                .push(format!("dynamic policy penalty {penalty}: {reason}"));
         }
     }
 }

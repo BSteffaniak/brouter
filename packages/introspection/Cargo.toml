@@ -1,25 +1,25 @@
 [package]
 authors     = { workspace = true }
-categories  = ["algorithms"]
-description = "Routing decision models for brouter"
+categories  = ["config"]
+description = "Generic introspection cache and policy helpers for brouter"
 edition     = { workspace = true }
-keywords    = ["llm", "router", "routing"]
+keywords    = ["introspection", "llm", "models"]
 license     = { workspace = true }
-name        = "brouter_router_models"
+name        = "brouter_introspection"
 readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-brouter_catalog_models       = { workspace = true }
 brouter_introspection_models = { workspace = true }
 brouter_provider_models      = { workspace = true }
 serde                        = { workspace = true, features = ["derive", "std"] }
+serde_json                   = { workspace = true, features = ["std"] }
+thiserror                    = { workspace = true }
 
 [features]
 default = []
 fail-on-warnings = [
-    "brouter_catalog_models/fail-on-warnings",
     "brouter_introspection_models/fail-on-warnings",
     "brouter_provider_models/fail-on-warnings",
 ]

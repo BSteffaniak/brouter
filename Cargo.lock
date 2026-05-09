@@ -637,6 +637,7 @@ dependencies = [
  "brouter_catalog",
  "brouter_catalog_models",
  "brouter_config_models",
+ "brouter_introspection_models",
  "brouter_provider_models",
  "brouter_router_models",
  "thiserror 2.0.18",
@@ -652,6 +653,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "brouter_introspection"
+version = "0.1.0"
+dependencies = [
+ "brouter_introspection_models",
+ "brouter_provider_models",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "brouter_introspection_models"
+version = "0.1.0"
+dependencies = [
+ "brouter_catalog_models",
+ "brouter_provider_models",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "brouter_provider"
 version = "0.1.0"
 dependencies = [
@@ -660,6 +682,7 @@ dependencies = [
  "brouter_api_models",
  "brouter_catalog_models",
  "brouter_config_models",
+ "brouter_introspection_models",
  "brouter_provider_models",
  "bytes",
  "futures-util",
@@ -686,6 +709,7 @@ version = "0.1.0"
 dependencies = [
  "brouter_api_models",
  "brouter_catalog_models",
+ "brouter_introspection_models",
  "brouter_provider_models",
  "brouter_router_models",
  "thiserror 2.0.18",
@@ -696,6 +720,7 @@ name = "brouter_router_models"
 version = "0.1.0"
 dependencies = [
  "brouter_catalog_models",
+ "brouter_introspection_models",
  "brouter_provider_models",
  "serde",
 ]
@@ -708,6 +733,8 @@ dependencies = [
  "brouter_api_models",
  "brouter_config",
  "brouter_config_models",
+ "brouter_introspection",
+ "brouter_introspection_models",
  "brouter_provider",
  "brouter_provider_models",
  "brouter_router",

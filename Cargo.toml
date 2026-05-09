@@ -7,6 +7,8 @@ members = [
     "packages/cli",
     "packages/config",
     "packages/config-models",
+    "packages/introspection",
+    "packages/introspection-models",
     "packages/provider",
     "packages/provider-models",
     "packages/router",
@@ -32,20 +34,22 @@ version    = "0.1.0"
 
 [workspace.dependencies]
 # Internal brouter packages
-brouter                  = { version = "0.1.0", default-features = false, path = "packages/brouter" }
-brouter_api_models       = { version = "0.1.0", default-features = false, path = "packages/api-models" }
-brouter_catalog          = { version = "0.1.0", default-features = false, path = "packages/catalog" }
-brouter_catalog_models   = { version = "0.1.0", default-features = false, path = "packages/catalog-models" }
-brouter_cli              = { version = "0.1.0", default-features = false, path = "packages/cli" }
-brouter_config           = { version = "0.1.0", default-features = false, path = "packages/config" }
-brouter_config_models    = { version = "0.1.0", default-features = false, path = "packages/config-models" }
-brouter_provider         = { version = "0.1.0", default-features = false, path = "packages/provider" }
-brouter_provider_models  = { version = "0.1.0", default-features = false, path = "packages/provider-models" }
-brouter_router           = { version = "0.1.0", default-features = false, path = "packages/router" }
-brouter_router_models    = { version = "0.1.0", default-features = false, path = "packages/router-models" }
-brouter_server           = { version = "0.1.0", default-features = false, path = "packages/server" }
-brouter_telemetry        = { version = "0.1.0", default-features = false, path = "packages/telemetry" }
-brouter_telemetry_models = { version = "0.1.0", default-features = false, path = "packages/telemetry-models" }
+brouter                      = { version = "0.1.0", default-features = false, path = "packages/brouter" }
+brouter_api_models           = { version = "0.1.0", default-features = false, path = "packages/api-models" }
+brouter_catalog              = { version = "0.1.0", default-features = false, path = "packages/catalog" }
+brouter_catalog_models       = { version = "0.1.0", default-features = false, path = "packages/catalog-models" }
+brouter_cli                  = { version = "0.1.0", default-features = false, path = "packages/cli" }
+brouter_config               = { version = "0.1.0", default-features = false, path = "packages/config" }
+brouter_config_models        = { version = "0.1.0", default-features = false, path = "packages/config-models" }
+brouter_introspection        = { version = "0.1.0", default-features = false, path = "packages/introspection" }
+brouter_introspection_models = { version = "0.1.0", default-features = false, path = "packages/introspection-models" }
+brouter_provider             = { version = "0.1.0", default-features = false, path = "packages/provider" }
+brouter_provider_models      = { version = "0.1.0", default-features = false, path = "packages/provider-models" }
+brouter_router               = { version = "0.1.0", default-features = false, path = "packages/router" }
+brouter_router_models        = { version = "0.1.0", default-features = false, path = "packages/router-models" }
+brouter_server               = { version = "0.1.0", default-features = false, path = "packages/server" }
+brouter_telemetry            = { version = "0.1.0", default-features = false, path = "packages/telemetry" }
+brouter_telemetry_models     = { version = "0.1.0", default-features = false, path = "packages/telemetry-models" }
 
 # External dependencies
 anyhow = { version = "1.0.98", default-features = false }

@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 
 use brouter_catalog_models::ResolvedModelMetadata;
+use brouter_introspection_models::DynamicPolicyEffect;
 use brouter_provider_models::{ModelCapability, ModelId};
 use serde::{Deserialize, Serialize};
 
@@ -139,17 +140,19 @@ impl Default for ContextPolicy {
 }
 
 /// Runtime options for a single routing request.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RoutingOptions {
     pub allowed_models: Option<Vec<ModelId>>,
     pub profile: Option<String>,
     pub session_context_tokens: Option<u32>,
+    pub dynamic_policy_effects: Vec<DynamicPolicyEffect>,
 }
 
 /// Candidate selector used by profile allow and deny policies.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CandidateSelector {
     pub models: Vec<ModelId>,
+    pub upstream_models: Vec<String>,
     pub providers: Vec<brouter_provider_models::ProviderId>,
     pub capabilities: Vec<ModelCapability>,
     pub attributes: BTreeMap<String, String>,
@@ -160,6 +163,7 @@ impl CandidateSelector {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.models.is_empty()
+            && self.upstream_models.is_empty()
             && self.providers.is_empty()
             && self.capabilities.is_empty()
             && self.attributes.is_empty()

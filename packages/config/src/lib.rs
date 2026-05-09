@@ -11,6 +11,7 @@ use brouter_catalog_models::{
     MetadataOverrideMode, MetadataProvenance, MetadataSource, ResolvedModelMetadata,
 };
 use brouter_config_models::{BrouterConfig, ProviderKind};
+use brouter_introspection_models::{CatalogModel, IntrospectionSnapshot};
 use brouter_provider_models::{ModelCapability, ModelId, ProviderId, RouteableModel};
 use brouter_router_models::{
     CandidateDenyRule, CandidateSelector, ContextPolicy, RoutingObjective, RoutingProfile,
@@ -424,6 +425,7 @@ fn collect_profile_warnings(config: &BrouterConfig, warnings: &mut Vec<ConfigWar
         for deny in &profile.deny {
             let selector = brouter_config_models::CandidateSelectorConfig {
                 models: deny.models.clone(),
+                upstream_models: deny.upstream_models.clone(),
                 providers: deny.providers.clone(),
                 capabilities: deny.capabilities.clone(),
                 attributes: deny.attributes.clone(),
@@ -643,6 +645,7 @@ pub fn routing_profiles(
 fn selector_config(selector: &brouter_config_models::CandidateSelectorConfig) -> CandidateSelector {
     CandidateSelector {
         models: selector.models.iter().cloned().map(ModelId::new).collect(),
+        upstream_models: selector.upstream_models.clone(),
         providers: selector
             .providers
             .iter()
@@ -661,6 +664,7 @@ fn selector_config(selector: &brouter_config_models::CandidateSelectorConfig) ->
 fn deny_selector_config(deny: &brouter_config_models::DenyRuleConfig) -> CandidateSelector {
     CandidateSelector {
         models: deny.models.iter().cloned().map(ModelId::new).collect(),
+        upstream_models: deny.upstream_models.clone(),
         providers: deny
             .providers
             .iter()
@@ -714,15 +718,26 @@ pub fn routing_rules(config: &BrouterConfig) -> Vec<RoutingRule> {
 /// Converts configured models into router candidates.
 #[must_use]
 pub fn routeable_models(config: &BrouterConfig) -> Vec<RouteableModel> {
+    routeable_models_with_introspection(config, &[])
+}
+
+/// Converts configured models into router candidates using live provider snapshots.
+#[must_use]
+pub fn routeable_models_with_introspection(
+    config: &BrouterConfig,
+    snapshots: &[IntrospectionSnapshot],
+) -> Vec<RouteableModel> {
     let catalog = FallbackCatalog::default();
     let mut models = config
         .models
         .iter()
-        .map(|(id, model)| model_config_to_routeable(config, &catalog, id, model))
+        .map(|(id, model)| model_config_to_routeable(config, &catalog, snapshots, id, model))
         .collect::<Vec<_>>();
     for (alias, target) in &config.router.aliases {
         if let Some(model) = config.models.get(target) {
-            models.push(model_config_to_routeable(config, &catalog, alias, model));
+            models.push(model_config_to_routeable(
+                config, &catalog, snapshots, alias, model,
+            ));
         }
     }
     models
@@ -731,6 +746,7 @@ pub fn routeable_models(config: &BrouterConfig) -> Vec<RouteableModel> {
 fn model_config_to_routeable(
     config: &BrouterConfig,
     catalog: &FallbackCatalog,
+    snapshots: &[IntrospectionSnapshot],
     id: &str,
     model: &brouter_config_models::ModelConfig,
 ) -> RouteableModel {
@@ -742,7 +758,8 @@ fn model_config_to_routeable(
             &model.model,
         )
     });
-    let resolved = resolve_model_metadata(model, catalog_model);
+    let live_model = live_catalog_model(snapshots, &model.provider, &model.model);
+    let resolved = resolve_model_metadata(model, live_model, catalog_model);
     RouteableModel {
         id: ModelId::new(id.to_string()),
         provider: ProviderId::new(model.provider.clone()),
@@ -771,19 +788,36 @@ struct ResolvedMetadataValues {
 
 fn resolve_model_metadata(
     model: &brouter_config_models::ModelConfig,
+    live_model: Option<&CatalogModel>,
     catalog_model: Option<&brouter_catalog_models::CatalogModelMetadata>,
 ) -> ResolvedMetadataValues {
     let override_config = model.metadata_overrides.as_ref();
     let override_mode = override_config
         .map(|overrides| MetadataOverrideMode::from_name(&overrides.mode))
         .unwrap_or_default();
-    let context_resolution =
-        resolve_context_window(model, catalog_model, override_config, override_mode);
-    let cost_resolution = resolve_cost(model, catalog_model, override_config, override_mode);
-    let capabilities_resolution =
-        resolve_capabilities(model, catalog_model, override_config, override_mode);
+    let context_resolution = resolve_context_window(
+        model,
+        live_model,
+        catalog_model,
+        override_config,
+        override_mode,
+    );
+    let cost_resolution = resolve_cost(
+        model,
+        live_model,
+        catalog_model,
+        override_config,
+        override_mode,
+    );
+    let capabilities_resolution = resolve_capabilities(
+        model,
+        live_model,
+        catalog_model,
+        override_config,
+        override_mode,
+    );
     let max_output_resolution =
-        resolve_max_output_tokens(catalog_model, override_config, override_mode);
+        resolve_max_output_tokens(live_model, catalog_model, override_config, override_mode);
 
     ResolvedMetadataValues {
         context_window: context_resolution.0,
@@ -802,6 +836,7 @@ fn resolve_model_metadata(
 
 fn resolve_context_window(
     model: &brouter_config_models::ModelConfig,
+    live_model: Option<&CatalogModel>,
     catalog_model: Option<&brouter_catalog_models::CatalogModelMetadata>,
     override_config: Option<&brouter_config_models::ModelMetadataOverridesConfig>,
     override_mode: MetadataOverrideMode,
@@ -813,6 +848,11 @@ fn resolve_context_window(
             value,
             override_provenance(override_config, MetadataSource::UserForcedOverride),
         );
+    }
+    if let Some(field) = live_model.map(|model| &model.fields.context_window)
+        && let Some(value) = field.value
+    {
+        return (value, field.provenance.clone());
     }
     if let Some(value) = model.context_window {
         return (value, MetadataProvenance::new(MetadataSource::UserConfig));
@@ -835,6 +875,7 @@ fn resolve_context_window(
 
 fn resolve_cost(
     model: &brouter_config_models::ModelConfig,
+    live_model: Option<&CatalogModel>,
     catalog_model: Option<&brouter_catalog_models::CatalogModelMetadata>,
     override_config: Option<&brouter_config_models::ModelMetadataOverridesConfig>,
     override_mode: MetadataOverrideMode,
@@ -849,6 +890,19 @@ fn resolve_cost(
                 .and_then(|overrides| overrides.output_cost_per_million)
                 .unwrap_or(model.output_cost_per_million),
             override_provenance(override_config, MetadataSource::UserForcedOverride),
+        );
+    }
+    if let Some(live_model) = live_model
+        && let Some(input_cost) = live_model.fields.input_cost_per_million.value
+    {
+        return (
+            input_cost,
+            live_model
+                .fields
+                .output_cost_per_million
+                .value
+                .unwrap_or_default(),
+            live_model.fields.input_cost_per_million.provenance.clone(),
         );
     }
     if model.input_cost_per_million > 0.0 || model.output_cost_per_million > 0.0 {
@@ -884,6 +938,7 @@ fn resolve_cost(
 
 fn resolve_capabilities(
     model: &brouter_config_models::ModelConfig,
+    live_model: Option<&CatalogModel>,
     catalog_model: Option<&brouter_catalog_models::CatalogModelMetadata>,
     override_config: Option<&brouter_config_models::ModelMetadataOverridesConfig>,
     override_mode: MetadataOverrideMode,
@@ -896,6 +951,12 @@ fn resolve_capabilities(
             parse_capabilities(&overrides.capabilities),
             override_provenance(override_config, MetadataSource::UserForcedOverride),
         );
+    }
+    if let Some(field) = live_model.map(|model| &model.fields.capabilities)
+        && let Some(value) = field.value.clone()
+        && !value.is_empty()
+    {
+        return (value, field.provenance.clone());
     }
     if !model.capabilities.is_empty() {
         return (
@@ -924,6 +985,7 @@ fn resolve_capabilities(
 }
 
 fn resolve_max_output_tokens(
+    live_model: Option<&CatalogModel>,
     catalog_model: Option<&brouter_catalog_models::CatalogModelMetadata>,
     override_config: Option<&brouter_config_models::ModelMetadataOverridesConfig>,
     override_mode: MetadataOverrideMode,
@@ -935,6 +997,11 @@ fn resolve_max_output_tokens(
             Some(value),
             override_provenance(override_config, MetadataSource::UserForcedOverride),
         );
+    }
+    if let Some(field) = live_model.map(|model| &model.fields.max_output_tokens)
+        && let Some(value) = field.value
+    {
+        return (Some(value), field.provenance.clone());
     }
     if override_mode == MetadataOverrideMode::Fallback
         && let Some(value) = override_config.and_then(|overrides| overrides.max_output_tokens)
@@ -950,6 +1017,18 @@ fn resolve_max_output_tokens(
         return (Some(value), catalog_provenance(catalog_model));
     }
     (None, MetadataProvenance::new(MetadataSource::Unknown))
+}
+
+fn live_catalog_model<'a>(
+    snapshots: &'a [IntrospectionSnapshot],
+    provider_id: &str,
+    upstream_model: &str,
+) -> Option<&'a CatalogModel> {
+    snapshots
+        .iter()
+        .find(|snapshot| snapshot.provider.as_str() == provider_id)
+        .and_then(|snapshot| snapshot.catalog.as_ref())
+        .and_then(|catalog| catalog.models.get(upstream_model))
 }
 
 fn parse_capabilities(capabilities: &[String]) -> Vec<ModelCapability> {
@@ -1034,6 +1113,7 @@ mod tests {
                 auth_backend: None,
                 auth_profile: None,
                 auth_vault_path: None,
+                introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 attribute_mappings: std::collections::BTreeMap::new(),
             },
         );
@@ -1071,6 +1151,7 @@ mod tests {
                 auth_backend: None,
                 auth_profile: None,
                 auth_vault_path: None,
+                introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 attribute_mappings: std::collections::BTreeMap::new(),
             },
         );
@@ -1115,6 +1196,7 @@ mod tests {
                 auth_backend: None,
                 auth_profile: None,
                 auth_vault_path: None,
+                introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 attribute_mappings: std::collections::BTreeMap::new(),
             },
         );
@@ -1168,6 +1250,7 @@ mod tests {
                 auth_backend: None,
                 auth_profile: None,
                 auth_vault_path: None,
+                introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 attribute_mappings: std::collections::BTreeMap::new(),
             },
         );
