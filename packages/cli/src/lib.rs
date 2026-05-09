@@ -238,6 +238,22 @@ async fn auth(command: AuthCommand) -> Result<()> {
                 headless,
             } => login_openai_codex(profile, vault, recipient_key, headless).await,
         },
+        AuthCommand::Openrouter { command } => match command {
+            OpenrouterAuthCommand::Login {
+                profile,
+                vault,
+                recipient_key,
+                api_key,
+            } => login_openrouter(profile, vault, recipient_key, api_key),
+        },
+        AuthCommand::Openaicom { command } => match command {
+            OpenaicomAuthCommand::Login {
+                profile,
+                vault,
+                recipient_key,
+                api_key,
+            } => login_openaicom(profile, vault, recipient_key, api_key),
+        },
     }
 }
 
@@ -295,6 +311,61 @@ async fn login_openai_codex(
         vault.display()
     );
     Ok(())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn login_openrouter(
+    profile: String,
+    vault: PathBuf,
+    recipient_key: Option<String>,
+    api_key: Option<String>,
+) -> Result<()> {
+    let api_key = resolve_api_key(api_key, "OPENROUTER_API_KEY", "OpenRouter")?;
+    let store = open_auth_store(&vault, recipient_key)?;
+    set_auth_secret(&store, &profile, "OPENROUTER_API_KEY", api_key)?;
+    println!(
+        "OpenRouter API key saved to profile {profile} in {}",
+        vault.display()
+    );
+    Ok(())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn login_openaicom(
+    profile: String,
+    vault: PathBuf,
+    recipient_key: Option<String>,
+    api_key: Option<String>,
+) -> Result<()> {
+    let api_key = resolve_api_key(api_key, "OPENAI_API_KEY", "OpenAI")?;
+    let store = open_auth_store(&vault, recipient_key)?;
+    set_auth_secret(&store, &profile, "OPENAI_API_KEY", api_key)?;
+    println!(
+        "OpenAI API key saved to profile {profile} in {}",
+        vault.display()
+    );
+    Ok(())
+}
+
+fn resolve_api_key(provided: Option<String>, env_var: &str, name: &str) -> Result<String> {
+    if let Some(key) = provided {
+        return Ok(key);
+    }
+    if let Ok(key) = std::env::var(env_var) {
+        println!("Read {name} API key from {env_var} environment variable.");
+        return Ok(key);
+    }
+    print!(
+        "Enter your {name} API key (or paste the full https://api.openai.com/dashboard/API/... URL): "
+    );
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let key = input.trim().to_string();
+    if key.is_empty() {
+        bail!("No API key provided");
+    }
+    Ok(key)
 }
 
 fn open_auth_store(
@@ -1060,6 +1131,16 @@ enum AuthCommand {
         #[command(subcommand)]
         command: OpenaiCodexAuthCommand,
     },
+    /// Manages `OpenRouter` credentials.
+    Openrouter {
+        #[command(subcommand)]
+        command: OpenrouterAuthCommand,
+    },
+    /// Manages `OpenAI` direct API credentials.
+    Openaicom {
+        #[command(subcommand)]
+        command: OpenaicomAuthCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1078,6 +1159,44 @@ enum OpenaiCodexAuthCommand {
         /// Use Codex device-code auth instead of browser OAuth.
         #[arg(long)]
         headless: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OpenrouterAuthCommand {
+    /// Stores an `OpenRouter` API key in the sshenv vault.
+    Login {
+        /// sshenv profile to write.
+        #[arg(long, default_value = "openrouter")]
+        profile: String,
+        /// sshenv vault path to use.
+        #[arg(long, default_value_os_t = default_auth_vault_path())]
+        vault: PathBuf,
+        /// SSH public key or public-key file used when initializing a new vault.
+        #[arg(long)]
+        recipient_key: Option<String>,
+        /// `OpenRouter` API key (leave blank to interactively paste or read from env).
+        #[arg(long)]
+        api_key: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OpenaicomAuthCommand {
+    /// Stores an `OpenAI` API key in the sshenv vault.
+    Login {
+        /// sshenv profile to write.
+        #[arg(long, default_value = "openai")]
+        profile: String,
+        /// sshenv vault path to use.
+        #[arg(long, default_value_os_t = default_auth_vault_path())]
+        vault: PathBuf,
+        /// SSH public key or public-key file used when initializing a new vault.
+        #[arg(long)]
+        recipient_key: Option<String>,
+        /// `OpenAI` API key (leave blank to interactively paste or read from env).
+        #[arg(long)]
+        api_key: Option<String>,
     },
 }
 
