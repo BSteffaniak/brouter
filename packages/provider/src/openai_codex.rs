@@ -902,6 +902,7 @@ mod tests {
             capabilities: vec![ModelCapability::Chat],
             attributes: std::collections::BTreeMap::new(),
             display_badges: Vec::new(),
+            metadata: brouter_catalog_models::ResolvedModelMetadata::default(),
         }
     }
 }

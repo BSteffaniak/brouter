@@ -334,7 +334,8 @@ pub enum ProviderKind {
 pub struct ModelConfig {
     pub provider: String,
     pub model: String,
-    pub context_window: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
     #[serde(default)]
     pub input_cost_per_million: f64,
     #[serde(default)]
@@ -349,4 +350,33 @@ pub struct ModelConfig {
     pub display_badges: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_estimated_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_overrides: Option<ModelMetadataOverridesConfig>,
+}
+
+/// User-provided model metadata overrides.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ModelMetadataOverridesConfig {
+    #[serde(default = "default_metadata_override_mode")]
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_cost_per_million: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_cost_per_million: Option<f64>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+fn default_metadata_override_mode() -> String {
+    "fallback".to_string()
 }

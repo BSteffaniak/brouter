@@ -6,8 +6,12 @@
 
 use std::path::Path;
 
+use brouter_catalog::FallbackCatalog;
+use brouter_catalog_models::{
+    MetadataOverrideMode, MetadataProvenance, MetadataSource, ResolvedModelMetadata,
+};
 use brouter_config_models::{BrouterConfig, ProviderKind};
-use brouter_provider_models::{ModelId, ProviderId, RouteableModel};
+use brouter_provider_models::{ModelCapability, ModelId, ProviderId, RouteableModel};
 use brouter_router_models::{
     CandidateDenyRule, CandidateSelector, ContextPolicy, RoutingObjective, RoutingProfile,
     RoutingRule, ScoringWeights,
@@ -73,7 +77,7 @@ pub fn validate_config(config: &BrouterConfig) -> Result<(), ConfigError> {
                 provider_id: model.provider.clone(),
             });
         }
-        if model.context_window == 0 {
+        if model.context_window == Some(0) {
             return Err(ConfigError::EmptyContextWindow {
                 model_id: model_id.clone(),
             });
@@ -147,6 +151,12 @@ pub enum ConfigWarning {
     UnknownProfileObjective {
         profile: String,
         objective: String,
+    },
+    MissingModelContextMetadata {
+        model_id: String,
+    },
+    ForcedMetadataOverrideMissingProvenance {
+        model_id: String,
     },
 }
 
@@ -255,6 +265,14 @@ impl std::fmt::Display for ConfigWarning {
                 formatter,
                 "profile {profile} declares unknown objective {objective}"
             ),
+            Self::MissingModelContextMetadata { model_id } => write!(
+                formatter,
+                "model {model_id} has no context metadata from config, override, or fallback catalog"
+            ),
+            Self::ForcedMetadataOverrideMissingProvenance { model_id } => write!(
+                formatter,
+                "model {model_id} uses forced metadata overrides without reason or source_url"
+            ),
         }
     }
 }
@@ -301,6 +319,7 @@ fn collect_provider_warnings(config: &BrouterConfig, warnings: &mut Vec<ConfigWa
 }
 
 fn collect_model_warnings(config: &BrouterConfig, warnings: &mut Vec<ConfigWarning>) {
+    let catalog = FallbackCatalog::default();
     for (model_id, model) in &config.models {
         let mut has_chat = false;
         let mut has_embeddings = false;
@@ -315,8 +334,46 @@ fn collect_model_warnings(config: &BrouterConfig, warnings: &mut Vec<ConfigWarni
                 }),
             }
         }
+        let catalog_model = config.providers.get(&model.provider).and_then(|provider| {
+            catalog.find(
+                provider.kind,
+                &provider_family(&model.provider, provider.kind, provider.base_url.as_deref()),
+                &model.model,
+            )
+        });
+        if let Some(catalog_model) = catalog_model.as_ref() {
+            for capability in &catalog_model.capabilities {
+                match capability.parse() {
+                    Ok(ModelCapability::Chat) => has_chat = true,
+                    Ok(ModelCapability::Embeddings) => has_embeddings = true,
+                    Ok(_) | Err(_) => {}
+                }
+            }
+        }
         if !has_chat && !has_embeddings {
             warnings.push(ConfigWarning::ModelMissingChatCapability {
+                model_id: model_id.clone(),
+            });
+        }
+        let override_config = model.metadata_overrides.as_ref();
+        if model.context_window.is_none()
+            && override_config
+                .and_then(|overrides| overrides.context_window)
+                .is_none()
+            && catalog_model
+                .and_then(|metadata| metadata.context_window)
+                .is_none()
+        {
+            warnings.push(ConfigWarning::MissingModelContextMetadata {
+                model_id: model_id.clone(),
+            });
+        }
+        if override_config.is_some_and(|overrides| {
+            MetadataOverrideMode::from_name(&overrides.mode) == MetadataOverrideMode::Force
+                && overrides.reason.is_none()
+                && overrides.source_url.is_none()
+        }) {
+            warnings.push(ConfigWarning::ForcedMetadataOverrideMissingProvenance {
                 model_id: model_id.clone(),
             });
         }
@@ -657,40 +714,290 @@ pub fn routing_rules(config: &BrouterConfig) -> Vec<RoutingRule> {
 /// Converts configured models into router candidates.
 #[must_use]
 pub fn routeable_models(config: &BrouterConfig) -> Vec<RouteableModel> {
+    let catalog = FallbackCatalog::default();
     let mut models = config
         .models
         .iter()
-        .map(|(id, model)| model_config_to_routeable(id, model))
+        .map(|(id, model)| model_config_to_routeable(config, &catalog, id, model))
         .collect::<Vec<_>>();
     for (alias, target) in &config.router.aliases {
         if let Some(model) = config.models.get(target) {
-            models.push(model_config_to_routeable(alias, model));
+            models.push(model_config_to_routeable(config, &catalog, alias, model));
         }
     }
     models
 }
 
 fn model_config_to_routeable(
+    config: &BrouterConfig,
+    catalog: &FallbackCatalog,
     id: &str,
     model: &brouter_config_models::ModelConfig,
 ) -> RouteableModel {
+    let provider = config.providers.get(&model.provider);
+    let catalog_model = provider.and_then(|provider| {
+        catalog.find(
+            provider.kind,
+            &provider_family(&model.provider, provider.kind, provider.base_url.as_deref()),
+            &model.model,
+        )
+    });
+    let resolved = resolve_model_metadata(model, catalog_model);
     RouteableModel {
         id: ModelId::new(id.to_string()),
         provider: ProviderId::new(model.provider.clone()),
         upstream_model: model.model.clone(),
-        context_window: model.context_window,
-        input_cost_per_million: model.input_cost_per_million,
-        output_cost_per_million: model.output_cost_per_million,
+        context_window: resolved.context_window,
+        input_cost_per_million: resolved.input_cost_per_million,
+        output_cost_per_million: resolved.output_cost_per_million,
         quality: model
             .quality
             .unwrap_or_else(|| inferred_quality(&model.capabilities)),
-        capabilities: model
-            .capabilities
-            .iter()
-            .filter_map(|capability| capability.parse().ok())
-            .collect(),
+        capabilities: resolved.capabilities,
         attributes: model.attributes.clone(),
         display_badges: model.display_badges.clone(),
+        metadata: resolved.metadata,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedMetadataValues {
+    context_window: u32,
+    input_cost_per_million: f64,
+    output_cost_per_million: f64,
+    capabilities: Vec<ModelCapability>,
+    metadata: ResolvedModelMetadata,
+}
+
+fn resolve_model_metadata(
+    model: &brouter_config_models::ModelConfig,
+    catalog_model: Option<&brouter_catalog_models::CatalogModelMetadata>,
+) -> ResolvedMetadataValues {
+    let override_config = model.metadata_overrides.as_ref();
+    let override_mode = override_config
+        .map(|overrides| MetadataOverrideMode::from_name(&overrides.mode))
+        .unwrap_or_default();
+    let context_resolution =
+        resolve_context_window(model, catalog_model, override_config, override_mode);
+    let cost_resolution = resolve_cost(model, catalog_model, override_config, override_mode);
+    let capabilities_resolution =
+        resolve_capabilities(model, catalog_model, override_config, override_mode);
+    let max_output_resolution =
+        resolve_max_output_tokens(catalog_model, override_config, override_mode);
+
+    ResolvedMetadataValues {
+        context_window: context_resolution.0,
+        input_cost_per_million: cost_resolution.0,
+        output_cost_per_million: cost_resolution.1,
+        capabilities: capabilities_resolution.0,
+        metadata: ResolvedModelMetadata {
+            context_window: context_resolution.1,
+            max_output_tokens: max_output_resolution.0,
+            max_output_tokens_source: max_output_resolution.1,
+            cost: cost_resolution.2,
+            capabilities: capabilities_resolution.1,
+        },
+    }
+}
+
+fn resolve_context_window(
+    model: &brouter_config_models::ModelConfig,
+    catalog_model: Option<&brouter_catalog_models::CatalogModelMetadata>,
+    override_config: Option<&brouter_config_models::ModelMetadataOverridesConfig>,
+    override_mode: MetadataOverrideMode,
+) -> (u32, MetadataProvenance) {
+    if override_mode == MetadataOverrideMode::Force
+        && let Some(value) = override_config.and_then(|overrides| overrides.context_window)
+    {
+        return (
+            value,
+            override_provenance(override_config, MetadataSource::UserForcedOverride),
+        );
+    }
+    if let Some(value) = model.context_window {
+        return (value, MetadataProvenance::new(MetadataSource::UserConfig));
+    }
+    if override_mode == MetadataOverrideMode::Fallback
+        && let Some(value) = override_config.and_then(|overrides| overrides.context_window)
+    {
+        return (
+            value,
+            override_provenance(override_config, MetadataSource::UserVerifiedFallback),
+        );
+    }
+    if let Some(catalog_model) = catalog_model
+        && let Some(value) = catalog_model.context_window
+    {
+        return (value, catalog_provenance(catalog_model));
+    }
+    (0, MetadataProvenance::new(MetadataSource::Unknown))
+}
+
+fn resolve_cost(
+    model: &brouter_config_models::ModelConfig,
+    catalog_model: Option<&brouter_catalog_models::CatalogModelMetadata>,
+    override_config: Option<&brouter_config_models::ModelMetadataOverridesConfig>,
+    override_mode: MetadataOverrideMode,
+) -> (f64, f64, MetadataProvenance) {
+    if override_mode == MetadataOverrideMode::Force
+        && let Some(input_cost) =
+            override_config.and_then(|overrides| overrides.input_cost_per_million)
+    {
+        return (
+            input_cost,
+            override_config
+                .and_then(|overrides| overrides.output_cost_per_million)
+                .unwrap_or(model.output_cost_per_million),
+            override_provenance(override_config, MetadataSource::UserForcedOverride),
+        );
+    }
+    if model.input_cost_per_million > 0.0 || model.output_cost_per_million > 0.0 {
+        return (
+            model.input_cost_per_million,
+            model.output_cost_per_million,
+            MetadataProvenance::new(MetadataSource::UserConfig),
+        );
+    }
+    if override_mode == MetadataOverrideMode::Fallback
+        && let Some(input_cost) =
+            override_config.and_then(|overrides| overrides.input_cost_per_million)
+    {
+        return (
+            input_cost,
+            override_config
+                .and_then(|overrides| overrides.output_cost_per_million)
+                .unwrap_or_default(),
+            override_provenance(override_config, MetadataSource::UserVerifiedFallback),
+        );
+    }
+    if let Some(catalog_model) = catalog_model
+        && let Some(input_cost) = catalog_model.input_cost_per_million
+    {
+        return (
+            input_cost,
+            catalog_model.output_cost_per_million.unwrap_or_default(),
+            catalog_provenance(catalog_model),
+        );
+    }
+    (0.0, 0.0, MetadataProvenance::new(MetadataSource::Unknown))
+}
+
+fn resolve_capabilities(
+    model: &brouter_config_models::ModelConfig,
+    catalog_model: Option<&brouter_catalog_models::CatalogModelMetadata>,
+    override_config: Option<&brouter_config_models::ModelMetadataOverridesConfig>,
+    override_mode: MetadataOverrideMode,
+) -> (Vec<ModelCapability>, MetadataProvenance) {
+    if override_mode == MetadataOverrideMode::Force
+        && let Some(overrides) = override_config
+        && !overrides.capabilities.is_empty()
+    {
+        return (
+            parse_capabilities(&overrides.capabilities),
+            override_provenance(override_config, MetadataSource::UserForcedOverride),
+        );
+    }
+    if !model.capabilities.is_empty() {
+        return (
+            parse_capabilities(&model.capabilities),
+            MetadataProvenance::new(MetadataSource::UserConfig),
+        );
+    }
+    if override_mode == MetadataOverrideMode::Fallback
+        && let Some(overrides) = override_config
+        && !overrides.capabilities.is_empty()
+    {
+        return (
+            parse_capabilities(&overrides.capabilities),
+            override_provenance(override_config, MetadataSource::UserVerifiedFallback),
+        );
+    }
+    if let Some(catalog_model) = catalog_model
+        && !catalog_model.capabilities.is_empty()
+    {
+        return (
+            parse_capabilities(&catalog_model.capabilities),
+            catalog_provenance(catalog_model),
+        );
+    }
+    (Vec::new(), MetadataProvenance::new(MetadataSource::Unknown))
+}
+
+fn resolve_max_output_tokens(
+    catalog_model: Option<&brouter_catalog_models::CatalogModelMetadata>,
+    override_config: Option<&brouter_config_models::ModelMetadataOverridesConfig>,
+    override_mode: MetadataOverrideMode,
+) -> (Option<u32>, MetadataProvenance) {
+    if override_mode == MetadataOverrideMode::Force
+        && let Some(value) = override_config.and_then(|overrides| overrides.max_output_tokens)
+    {
+        return (
+            Some(value),
+            override_provenance(override_config, MetadataSource::UserForcedOverride),
+        );
+    }
+    if override_mode == MetadataOverrideMode::Fallback
+        && let Some(value) = override_config.and_then(|overrides| overrides.max_output_tokens)
+    {
+        return (
+            Some(value),
+            override_provenance(override_config, MetadataSource::UserVerifiedFallback),
+        );
+    }
+    if let Some(catalog_model) = catalog_model
+        && let Some(value) = catalog_model.max_output_tokens
+    {
+        return (Some(value), catalog_provenance(catalog_model));
+    }
+    (None, MetadataProvenance::new(MetadataSource::Unknown))
+}
+
+fn parse_capabilities(capabilities: &[String]) -> Vec<ModelCapability> {
+    capabilities
+        .iter()
+        .filter_map(|capability| capability.parse().ok())
+        .collect()
+}
+
+fn override_provenance(
+    override_config: Option<&brouter_config_models::ModelMetadataOverridesConfig>,
+    source: MetadataSource,
+) -> MetadataProvenance {
+    let mut provenance = MetadataProvenance::new(source);
+    if let Some(overrides) = override_config {
+        provenance.reason.clone_from(&overrides.reason);
+        provenance.source_url.clone_from(&overrides.source_url);
+        provenance.verified_at_ms = overrides.verified_at_ms;
+    }
+    provenance
+}
+
+fn catalog_provenance(
+    catalog_model: &brouter_catalog_models::CatalogModelMetadata,
+) -> MetadataProvenance {
+    MetadataProvenance {
+        source: MetadataSource::BrouterFallbackCatalog,
+        source_label: Some(catalog_model.source_label.clone()),
+        source_url: catalog_model.source_url.clone(),
+        reason: None,
+        verified_at_ms: catalog_model.verified_at_ms,
+    }
+}
+
+fn provider_family(
+    provider_id: &str,
+    provider_kind: ProviderKind,
+    base_url: Option<&str>,
+) -> String {
+    match provider_kind {
+        ProviderKind::Anthropic => "anthropic".to_string(),
+        ProviderKind::OpenaiCodex => "openai".to_string(),
+        ProviderKind::OpenAiCompatible
+            if base_url.is_some_and(|url| url.contains("openai.com")) =>
+        {
+            "openai".to_string()
+        }
+        ProviderKind::OpenAiCompatible => provider_id.to_string(),
     }
 }
 
@@ -735,7 +1042,7 @@ mod tests {
             ModelConfig {
                 provider: "local".to_string(),
                 model: "llama".to_string(),
-                context_window: 8_192,
+                context_window: Some(8_192),
                 input_cost_per_million: 0.0,
                 output_cost_per_million: 0.0,
                 quality: None,
@@ -743,10 +1050,108 @@ mod tests {
                 attributes: std::collections::BTreeMap::new(),
                 display_badges: Vec::new(),
                 max_estimated_cost: None,
+                metadata_overrides: None,
             },
         );
 
         validate_config(&config).expect("config should be valid");
+    }
+
+    #[test]
+    fn fallback_catalog_fills_missing_model_metadata() {
+        let mut config = BrouterConfig::default();
+        config.providers.insert(
+            "openai".to_string(),
+            ProviderConfig {
+                kind: ProviderKind::OpenAiCompatible,
+                base_url: Some("https://api.openai.com/v1".to_string()),
+                api_key_env: None,
+                timeout_ms: None,
+                max_estimated_cost: None,
+                auth_backend: None,
+                auth_profile: None,
+                auth_vault_path: None,
+                attribute_mappings: std::collections::BTreeMap::new(),
+            },
+        );
+        config.models.insert(
+            "strong".to_string(),
+            ModelConfig {
+                provider: "openai".to_string(),
+                model: "gpt-4.1".to_string(),
+                context_window: None,
+                input_cost_per_million: 0.0,
+                output_cost_per_million: 0.0,
+                quality: None,
+                capabilities: Vec::new(),
+                attributes: std::collections::BTreeMap::new(),
+                display_badges: Vec::new(),
+                max_estimated_cost: None,
+                metadata_overrides: None,
+            },
+        );
+
+        let models = routeable_models(&config);
+
+        assert_eq!(models[0].context_window, 1_047_576);
+        assert_eq!(
+            models[0].metadata.context_window.source,
+            MetadataSource::BrouterFallbackCatalog
+        );
+        assert!(models[0].has_capability(ModelCapability::Reasoning));
+    }
+
+    #[test]
+    fn forced_metadata_override_wins_over_fallback_catalog() {
+        let mut config = BrouterConfig::default();
+        config.providers.insert(
+            "openai".to_string(),
+            ProviderConfig {
+                kind: ProviderKind::OpenAiCompatible,
+                base_url: Some("https://api.openai.com/v1".to_string()),
+                api_key_env: None,
+                timeout_ms: None,
+                max_estimated_cost: None,
+                auth_backend: None,
+                auth_profile: None,
+                auth_vault_path: None,
+                attribute_mappings: std::collections::BTreeMap::new(),
+            },
+        );
+        config.models.insert(
+            "strong".to_string(),
+            ModelConfig {
+                provider: "openai".to_string(),
+                model: "gpt-4.1".to_string(),
+                context_window: None,
+                input_cost_per_million: 0.0,
+                output_cost_per_million: 0.0,
+                quality: None,
+                capabilities: Vec::new(),
+                attributes: std::collections::BTreeMap::new(),
+                display_badges: Vec::new(),
+                max_estimated_cost: None,
+                metadata_overrides: Some(brouter_config_models::ModelMetadataOverridesConfig {
+                    mode: "force".to_string(),
+                    reason: Some("manual test override".to_string()),
+                    source_url: None,
+                    verified_at_ms: None,
+                    context_window: Some(42_000),
+                    max_output_tokens: None,
+                    input_cost_per_million: None,
+                    output_cost_per_million: None,
+                    capabilities: Vec::new(),
+                }),
+            },
+        );
+
+        let models = routeable_models(&config);
+
+        assert_eq!(models[0].context_window, 42_000);
+        assert_eq!(
+            models[0].metadata.context_window.source,
+            MetadataSource::UserForcedOverride
+        );
     }
 
     #[test]
@@ -771,7 +1176,7 @@ mod tests {
             ModelConfig {
                 provider: "local".to_string(),
                 model: "llama".to_string(),
-                context_window: 8_192,
+                context_window: Some(8_192),
                 input_cost_per_million: 0.0,
                 output_cost_per_million: 0.0,
                 quality: None,
@@ -779,6 +1184,7 @@ mod tests {
                 attributes: std::collections::BTreeMap::new(),
                 display_badges: Vec::new(),
                 max_estimated_cost: None,
+                metadata_overrides: None,
             },
         );
         config.router.rules.push(RouterRuleConfig {

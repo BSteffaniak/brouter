@@ -618,6 +618,7 @@ fn score_model(
         score,
         estimated_cost,
         reasons,
+        metadata: model.metadata.clone(),
     }
 }
 
@@ -997,6 +998,7 @@ mod tests {
                 capabilities: vec![ModelCapability::Chat, ModelCapability::Reasoning],
                 attributes: BTreeMap::from([("latency_class".to_string(), "standard".to_string())]),
                 display_badges: vec!["standard".to_string()],
+                metadata: brouter_catalog_models::ResolvedModelMetadata::default(),
             },
             RouteableModel {
                 id: ModelId::new("openai_max_strong_priority"),
@@ -1009,6 +1011,7 @@ mod tests {
                 capabilities: vec![ModelCapability::Chat, ModelCapability::Reasoning],
                 attributes: BTreeMap::from([("latency_class".to_string(), "priority".to_string())]),
                 display_badges: vec!["priority".to_string()],
+                metadata: brouter_catalog_models::ResolvedModelMetadata::default(),
             },
         ]
     }
@@ -1026,6 +1029,7 @@ mod tests {
                 capabilities: vec![ModelCapability::Chat],
                 attributes: BTreeMap::new(),
                 display_badges: Vec::new(),
+                metadata: brouter_catalog_models::ResolvedModelMetadata::default(),
             },
             RouteableModel {
                 id: ModelId::new("long_context"),
@@ -1038,6 +1042,7 @@ mod tests {
                 capabilities: vec![ModelCapability::Chat],
                 attributes: BTreeMap::new(),
                 display_badges: Vec::new(),
+                metadata: brouter_catalog_models::ResolvedModelMetadata::default(),
             },
         ]
     }
@@ -1055,6 +1060,7 @@ mod tests {
                 capabilities: vec![ModelCapability::Chat, ModelCapability::Local],
                 attributes: BTreeMap::new(),
                 display_badges: Vec::new(),
+                metadata: brouter_catalog_models::ResolvedModelMetadata::default(),
             },
             RouteableModel {
                 id: ModelId::new("coder"),
@@ -1067,6 +1073,7 @@ mod tests {
                 capabilities: vec![ModelCapability::Chat, ModelCapability::Code],
                 attributes: BTreeMap::new(),
                 display_badges: Vec::new(),
+                metadata: brouter_catalog_models::ResolvedModelMetadata::default(),
             },
         ]
     }

@@ -128,7 +128,7 @@ brouter auth openai-codex login --profile openai-max --headless
 
 - `provider` provider ID
 - `model` upstream model name
-- `context_window` integer
+- `context_window` optional integer; user-provided context metadata. If omitted, brouter tries user metadata overrides and then the built-in fallback catalog.
 - `input_cost_per_million` float
 - `output_cost_per_million` float
 - `quality` optional integer 0-255
@@ -148,3 +148,39 @@ omit_request_fields = ["service_tier"]
 ```
 
 A model with `attributes.latency_class = "priority"` will add `service_tier = "priority"` to OpenAI-compatible requests. The same routing attribute can also be used by `prefer_attributes` or `require_attributes` without making `service_tier` a brouter-specific concept.
+
+## `[models.<id>.metadata_overrides]`
+
+Use metadata overrides when the user intentionally knows more than provider APIs or brouter's fallback catalog. `mode` controls precedence:
+
+- `force`: override all other metadata sources.
+- `fallback`: use only when provider/cache/user model fields do not provide a value.
+- `validate`: reserved for conflict reporting; currently does not override.
+
+Fields:
+
+- `reason` optional explanation, strongly recommended for `force`
+- `source_url` optional source URL, strongly recommended for `force`
+- `verified_at_ms` optional Unix timestamp in milliseconds
+- `context_window` optional integer
+- `max_output_tokens` optional integer
+- `input_cost_per_million` optional float
+- `output_cost_per_million` optional float
+- `capabilities` optional array
+
+Example:
+
+```toml
+[models.gpt41.metadata_overrides]
+mode = "force"
+reason = "Provider API has not reflected the latest documented context window yet"
+source_url = "https://platform.openai.com/docs/models"
+verified_at_ms = 1762560000000
+context_window = 1047576
+max_output_tokens = 32768
+capabilities = ["chat", "code", "json", "tools", "reasoning"]
+```
+
+## Built-in fallback catalog
+
+When provider APIs do not expose context/pricing/capabilities and the user has not provided metadata, brouter can use an isolated curated fallback catalog in `packages/catalog/data`. This catalog is a last-resort source; route explanations include field provenance so users can see when fallback data was used.

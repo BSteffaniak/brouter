@@ -1,0 +1,51 @@
+[[models]]
+capabilities            = ["chat", "code", "json", "tools", "reasoning"]
+context_window          = 1047576
+input_cost_per_million  = 2.00
+max_output_tokens       = 32768
+output_cost_per_million = 8.00
+provider_family         = "openai"
+provider_kind           = "open-ai-compatible"
+source_label            = "OpenAI model documentation"
+source_url              = "https://platform.openai.com/docs/models"
+upstream_model          = "gpt-4.1"
+verified_at_ms          = 1762560000000
+
+[[models]]
+capabilities            = ["chat", "json", "tools"]
+context_window          = 128000
+input_cost_per_million  = 0.15
+max_output_tokens       = 16384
+output_cost_per_million = 0.60
+provider_family         = "openai"
+provider_kind           = "open-ai-compatible"
+source_label            = "OpenAI model documentation"
+source_url              = "https://platform.openai.com/docs/models"
+upstream_model          = "gpt-4o-mini"
+verified_at_ms          = 1762560000000
+
+[[models]]
+capabilities            = ["embeddings"]
+context_window          = 8192
+input_cost_per_million  = 0.02
+max_output_tokens       = 0
+output_cost_per_million = 0.0
+provider_family         = "openai"
+provider_kind           = "open-ai-compatible"
+source_label            = "OpenAI model documentation"
+source_url              = "https://platform.openai.com/docs/models"
+upstream_model          = "text-embedding-3-small"
+verified_at_ms          = 1762560000000
+
+[[models]]
+capabilities            = ["chat", "code", "json", "tools", "reasoning"]
+context_window          = 272000
+input_cost_per_million  = 0.0
+max_output_tokens       = 128000
+output_cost_per_million = 0.0
+provider_family         = "openai"
+provider_kind           = "openai-codex"
+source_label            = "OpenAI ChatGPT/Codex observed model catalog"
+source_url              = "https://platform.openai.com/docs/models"
+upstream_model          = "gpt-5.1-codex-max"
+verified_at_ms          = 1762560000000

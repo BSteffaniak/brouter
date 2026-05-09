@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 
+use brouter_catalog_models::ResolvedModelMetadata;
 use serde::{Deserialize, Serialize};
 
 /// Stable identifier for a configured provider.
@@ -137,6 +138,7 @@ pub struct RouteableModel {
     pub capabilities: Vec<ModelCapability>,
     pub attributes: BTreeMap<String, String>,
     pub display_badges: Vec<String>,
+    pub metadata: ResolvedModelMetadata,
 }
 
 impl RouteableModel {

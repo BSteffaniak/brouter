@@ -590,6 +590,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "brouter_catalog"
+version = "0.1.0"
+dependencies = [
+ "brouter_catalog_models",
+ "brouter_config_models",
+ "thiserror 2.0.18",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "brouter_catalog_models"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "brouter_cli"
 version = "0.1.0"
 dependencies = [
@@ -617,6 +634,8 @@ dependencies = [
 name = "brouter_config"
 version = "0.1.0"
 dependencies = [
+ "brouter_catalog",
+ "brouter_catalog_models",
  "brouter_config_models",
  "brouter_provider_models",
  "brouter_router_models",
@@ -639,6 +658,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "brouter_api_models",
+ "brouter_catalog_models",
  "brouter_config_models",
  "brouter_provider_models",
  "bytes",
@@ -656,6 +676,7 @@ dependencies = [
 name = "brouter_provider_models"
 version = "0.1.0"
 dependencies = [
+ "brouter_catalog_models",
  "serde",
 ]
 
@@ -664,6 +685,7 @@ name = "brouter_router"
 version = "0.1.0"
 dependencies = [
  "brouter_api_models",
+ "brouter_catalog_models",
  "brouter_provider_models",
  "brouter_router_models",
  "thiserror 2.0.18",
@@ -673,6 +695,7 @@ dependencies = [
 name = "brouter_router_models"
 version = "0.1.0"
 dependencies = [
+ "brouter_catalog_models",
  "brouter_provider_models",
  "serde",
 ]

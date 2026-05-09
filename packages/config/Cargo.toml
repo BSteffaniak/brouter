@@ -11,6 +11,8 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+brouter_catalog         = { workspace = true }
+brouter_catalog_models  = { workspace = true }
 brouter_config_models   = { workspace = true }
 brouter_provider_models = { workspace = true }
 brouter_router_models   = { workspace = true }
@@ -20,6 +22,8 @@ toml                    = { workspace = true, features = ["parse"] }
 [features]
 default = []
 fail-on-warnings = [
+    "brouter_catalog/fail-on-warnings",
+    "brouter_catalog_models/fail-on-warnings",
     "brouter_config_models/fail-on-warnings",
     "brouter_provider_models/fail-on-warnings",
     "brouter_router_models/fail-on-warnings",

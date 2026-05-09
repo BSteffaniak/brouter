@@ -137,6 +137,15 @@ attributes = { latency_class = "priority", billing_class = "api" }
 display_badges = ["priority"]
 # Optional model-level per-request estimated cost budget.
 # max_estimated_cost = 0.10
+# Optional explicit user metadata override. Use mode = "force" only when you
+# intentionally know better than provider APIs and brouter's fallback catalog.
+# [models.strong_cloud.metadata_overrides]
+# mode = "force"
+# reason = "Provider API has not reflected latest docs yet"
+# source_url = "https://platform.openai.com/docs/models"
+# verified_at_ms = 1762560000000
+# context_window = 1047576
+# max_output_tokens = 32768
 
 [models.embedding_cloud]
 provider = "openai"

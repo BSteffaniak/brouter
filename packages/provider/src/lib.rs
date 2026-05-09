@@ -669,6 +669,7 @@ mod tests {
             capabilities: vec![ModelCapability::Chat],
             attributes: BTreeMap::new(),
             display_badges: Vec::new(),
+            metadata: brouter_catalog_models::ResolvedModelMetadata::default(),
         };
 
         let response = ProviderClient::new()
@@ -693,6 +694,7 @@ mod tests {
             capabilities: vec![ModelCapability::Chat],
             attributes: BTreeMap::new(),
             display_badges: Vec::new(),
+            metadata: brouter_catalog_models::ResolvedModelMetadata::default(),
         };
         let provider = ProviderConfig {
             kind: ProviderKind::OpenAiCompatible,
@@ -732,6 +734,7 @@ mod tests {
             capabilities: vec![ModelCapability::Chat, ModelCapability::Reasoning],
             attributes: BTreeMap::new(),
             display_badges: Vec::new(),
+            metadata: brouter_catalog_models::ResolvedModelMetadata::default(),
         };
 
         let response = ProviderClient::new()
@@ -764,6 +767,7 @@ mod tests {
             capabilities: vec![ModelCapability::Chat],
             attributes: BTreeMap::new(),
             display_badges: Vec::new(),
+            metadata: brouter_catalog_models::ResolvedModelMetadata::default(),
         };
 
         let mut response = ProviderClient::new()
@@ -799,6 +803,7 @@ mod tests {
             capabilities: vec![ModelCapability::Chat],
             attributes: BTreeMap::new(),
             display_badges: Vec::new(),
+            metadata: brouter_catalog_models::ResolvedModelMetadata::default(),
         };
 
         let mut response = ProviderClient::new()
@@ -909,7 +914,7 @@ mod tests {
             ModelConfig {
                 provider: "anthropic".to_string(),
                 model: "claude-test".to_string(),
-                context_window: 200_000,
+                context_window: Some(200_000),
                 input_cost_per_million: 3.0,
                 output_cost_per_million: 15.0,
                 quality: Some(90),
@@ -917,6 +922,7 @@ mod tests {
                 attributes: BTreeMap::new(),
                 display_badges: Vec::new(),
                 max_estimated_cost: None,
+                metadata_overrides: None,
             },
         );
         BrouterConfig {
@@ -948,7 +954,7 @@ mod tests {
             ModelConfig {
                 provider: "fake".to_string(),
                 model: "real-upstream-model".to_string(),
-                context_window: 8_192,
+                context_window: Some(8_192),
                 input_cost_per_million: 0.0,
                 output_cost_per_million: 0.0,
                 quality: Some(80),
@@ -956,6 +962,7 @@ mod tests {
                 attributes: BTreeMap::new(),
                 display_badges: Vec::new(),
                 max_estimated_cost: None,
+                metadata_overrides: None,
             },
         );
         BrouterConfig {

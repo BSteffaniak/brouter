@@ -1,0 +1,12 @@
+[[models]]
+capabilities            = ["chat", "code", "json", "tools", "reasoning"]
+context_window          = 200000
+input_cost_per_million  = 3.00
+max_output_tokens       = 64000
+output_cost_per_million = 15.00
+provider_family         = "anthropic"
+provider_kind           = "anthropic"
+source_label            = "Anthropic model documentation"
+source_url              = "https://docs.anthropic.com/en/docs/about-claude/models"
+upstream_model          = "claude-sonnet-4-5"
+verified_at_ms          = 1762560000000

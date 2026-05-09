@@ -11,8 +11,9 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-serde = { workspace = true, features = ["derive", "std"] }
+brouter_catalog_models = { workspace = true }
+serde                  = { workspace = true, features = ["derive", "std"] }
 
 [features]
 default          = []
-fail-on-warnings = []
+fail-on-warnings = ["brouter_catalog_models/fail-on-warnings"]

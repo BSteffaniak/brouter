@@ -2,6 +2,8 @@
 members = [
     "packages/api-models",
     "packages/brouter",
+    "packages/catalog",
+    "packages/catalog-models",
     "packages/cli",
     "packages/config",
     "packages/config-models",
@@ -32,6 +34,8 @@ version    = "0.1.0"
 # Internal brouter packages
 brouter                  = { version = "0.1.0", default-features = false, path = "packages/brouter" }
 brouter_api_models       = { version = "0.1.0", default-features = false, path = "packages/api-models" }
+brouter_catalog          = { version = "0.1.0", default-features = false, path = "packages/catalog" }
+brouter_catalog_models   = { version = "0.1.0", default-features = false, path = "packages/catalog-models" }
 brouter_cli              = { version = "0.1.0", default-features = false, path = "packages/cli" }
 brouter_config           = { version = "0.1.0", default-features = false, path = "packages/config" }
 brouter_config_models    = { version = "0.1.0", default-features = false, path = "packages/config-models" }

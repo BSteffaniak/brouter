@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 
+use brouter_catalog_models::ResolvedModelMetadata;
 use brouter_provider_models::{ModelCapability, ModelId};
 use serde::{Deserialize, Serialize};
 
@@ -226,6 +227,7 @@ pub struct ScoredCandidate {
     pub score: f64,
     pub estimated_cost: f64,
     pub reasons: Vec<String>,
+    pub metadata: ResolvedModelMetadata,
 }
 
 /// Explainable model selection result.

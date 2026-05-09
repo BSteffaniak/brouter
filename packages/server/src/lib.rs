@@ -1358,7 +1358,7 @@ mod tests {
             ModelConfig {
                 provider: "healthy".to_string(),
                 model: "cheap-upstream".to_string(),
-                context_window: 128_000,
+                context_window: Some(128_000),
                 input_cost_per_million: 0.15,
                 output_cost_per_million: 0.60,
                 quality: Some(70),
@@ -1366,6 +1366,7 @@ mod tests {
                 attributes: BTreeMap::new(),
                 display_badges: Vec::new(),
                 max_estimated_cost: None,
+                metadata_overrides: None,
             },
         );
         config
@@ -1408,7 +1409,7 @@ mod tests {
             ModelConfig {
                 provider: "failing".to_string(),
                 model: "strong-upstream".to_string(),
-                context_window: 128_000,
+                context_window: Some(128_000),
                 input_cost_per_million: 2.0,
                 output_cost_per_million: 8.0,
                 quality: Some(90),
@@ -1416,6 +1417,7 @@ mod tests {
                 attributes: BTreeMap::new(),
                 display_badges: Vec::new(),
                 max_estimated_cost: None,
+                metadata_overrides: None,
             },
         );
         models.insert(
@@ -1423,7 +1425,7 @@ mod tests {
             ModelConfig {
                 provider: "healthy".to_string(),
                 model: "cheap-upstream".to_string(),
-                context_window: 128_000,
+                context_window: Some(128_000),
                 input_cost_per_million: 0.15,
                 output_cost_per_million: 0.60,
                 quality: Some(70),
@@ -1431,6 +1433,7 @@ mod tests {
                 attributes: BTreeMap::new(),
                 display_badges: Vec::new(),
                 max_estimated_cost: None,
+                metadata_overrides: None,
             },
         );
 
