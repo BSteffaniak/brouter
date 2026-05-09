@@ -8,6 +8,9 @@ max_request_body_bytes = 1048576
 
 [router]
 default_objective = "balanced"
+# Optional named profile for brouter/auto. Requests can also use model = "profile:<name>",
+# x-brouter-profile, or metadata.brouter_profile.
+# default_profile = "conserve_openai"
 debug_headers = true
 provider_failure_threshold = 3
 provider_cooldown_ms = 30000
@@ -22,6 +25,25 @@ strong = "strong_cloud"
 [router.groups]
 cloud = ["cheap_cloud", "strong_cloud"]
 
+[router.context]
+# Protect conversations from silently falling back to a smaller context window.
+safety_margin_ratio = 0.15
+preserve_session_context_floor = true
+allow_context_downgrade = false
+
+# Example quota-conservation profile: keep the same models available, but avoid
+# the priority lane and prefer cheaper/free candidates while quota is low.
+# [[router.profiles.conserve_openai.deny]]
+# attributes = { latency_class = "priority" }
+# reason = "priority lane disabled while quota is low"
+# hard = true
+#
+# [[router.profiles.conserve_openai.deny]]
+# providers = ["openai"]
+# reason = "prefer free/local models before OpenAI"
+# hard = false
+# penalty = 25.0
+
 [router.scoring]
 quality_weight = 1.0
 balanced_cost_weight = 20.0
@@ -31,6 +53,7 @@ strongest_quality_weight = 0.5
 first_message_reasoning_bonus = 8.0
 code_bonus = 15.0
 reasoning_bonus = 20.0
+policy_penalty = 30.0
 
 [[router.rules]]
 name = "private-local"

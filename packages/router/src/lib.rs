@@ -8,10 +8,11 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use brouter_api_models::{ChatCompletionRequest, ReasoningEffort};
-use brouter_provider_models::{ModelCapability, RouteableModel};
+use brouter_provider_models::{ModelCapability, ModelId, RouteableModel};
 use brouter_router_models::{
-    PromptFeatures, PromptIntent, ReasoningLevel, RoutingDecision, RoutingObjective, RoutingRule,
-    ScoredCandidate, ScoringWeights,
+    CandidateDenyRule, CandidateSelector, ContextPolicy, ExcludedCandidate, PromptFeatures,
+    PromptIntent, ReasoningLevel, RoutingDecision, RoutingObjective, RoutingOptions,
+    RoutingProfile, RoutingRule, ScoredCandidate, ScoringWeights,
 };
 use thiserror::Error;
 
@@ -29,6 +30,8 @@ pub struct Router {
     objective: RoutingObjective,
     weights: ScoringWeights,
     rules: Vec<RoutingRule>,
+    profiles: BTreeMap<String, RoutingProfile>,
+    context_policy: ContextPolicy,
 }
 
 impl Router {
@@ -40,7 +43,7 @@ impl Router {
 
     /// Creates a deterministic router with custom scoring weights.
     #[must_use]
-    pub const fn new_with_scoring(
+    pub fn new_with_scoring(
         models: Vec<RouteableModel>,
         objective: RoutingObjective,
         weights: ScoringWeights,
@@ -50,12 +53,14 @@ impl Router {
             objective,
             weights,
             rules: Vec::new(),
+            profiles: BTreeMap::new(),
+            context_policy: ContextPolicy::default(),
         }
     }
 
     /// Creates a deterministic router with custom scoring weights and rules.
     #[must_use]
-    pub const fn new_with_rules(
+    pub fn new_with_rules(
         models: Vec<RouteableModel>,
         objective: RoutingObjective,
         weights: ScoringWeights,
@@ -66,6 +71,28 @@ impl Router {
             objective,
             weights,
             rules,
+            profiles: BTreeMap::new(),
+            context_policy: ContextPolicy::default(),
+        }
+    }
+
+    /// Creates a deterministic router with profiles and context policy.
+    #[must_use]
+    pub const fn new_with_policy(
+        models: Vec<RouteableModel>,
+        objective: RoutingObjective,
+        weights: ScoringWeights,
+        rules: Vec<RoutingRule>,
+        profiles: BTreeMap<String, RoutingProfile>,
+        context_policy: ContextPolicy,
+    ) -> Self {
+        Self {
+            models,
+            objective,
+            weights,
+            rules,
+            profiles,
+            context_policy,
         }
     }
 
@@ -98,7 +125,30 @@ impl Router {
         &self,
         request: &ChatCompletionRequest,
         is_first_message: bool,
-        allowed_models: Option<&[brouter_provider_models::ModelId]>,
+        allowed_models: Option<&[ModelId]>,
+    ) -> Result<RoutingDecision, RouterError> {
+        self.route_chat_with_options(
+            request,
+            is_first_message,
+            RoutingOptions {
+                allowed_models: allowed_models.map(<[ModelId]>::to_vec),
+                profile: None,
+                session_context_tokens: None,
+            },
+        )
+    }
+
+    /// Selects a model using explicit routing options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no configured model satisfies the request and
+    /// routing options.
+    pub fn route_chat_with_options(
+        &self,
+        request: &ChatCompletionRequest,
+        is_first_message: bool,
+        options: RoutingOptions,
     ) -> Result<RoutingDecision, RouterError> {
         let prompt_text = request_prompt_text(request);
         let latest_user_text = request_latest_user_text(request);
@@ -108,16 +158,28 @@ impl Router {
             .unwrap_or(prompt_text.as_str());
         let mut features =
             analyze_prompt_texts(classification_text, &prompt_text, request, is_first_message);
-        let objective = self.apply_rules(&classification_text.to_lowercase(), &mut features);
-        let explicit_model = if allowed_models.is_none() && !is_auto_model(&request.model) {
-            Some(vec![brouter_provider_models::ModelId::new(
-                request.model.clone(),
-            )])
+        let profile = options
+            .profile
+            .as_deref()
+            .and_then(|profile| self.profiles.get(profile));
+        let rule_objective = self.apply_rules(&classification_text.to_lowercase(), &mut features);
+        let objective = profile
+            .and_then(|profile| profile.objective)
+            .unwrap_or(rule_objective);
+        apply_context_policy(
+            &mut features,
+            profile
+                .and_then(|profile| profile.context_policy)
+                .unwrap_or(self.context_policy),
+            options.session_context_tokens,
+        );
+        let explicit_model = if options.allowed_models.is_none() && !is_auto_model(&request.model) {
+            Some(vec![ModelId::new(request.model.clone())])
         } else {
             None
         };
-        let allowed_models = allowed_models.or(explicit_model.as_deref());
-        self.route_features_with_objective(features, objective, allowed_models)
+        let allowed_models = options.allowed_models.or(explicit_model);
+        self.route_features_with_objective(features, objective, allowed_models.as_deref(), profile)
     }
 
     /// Selects a model for precomputed prompt features.
@@ -129,16 +191,19 @@ impl Router {
     pub fn route_features(&self, features: PromptFeatures) -> Result<RoutingDecision, RouterError> {
         let mut features = features;
         let objective = self.apply_rules("", &mut features);
-        self.route_features_with_objective(features, objective, None)
+        apply_context_policy(&mut features, self.context_policy, None);
+        self.route_features_with_objective(features, objective, None, None)
     }
 
     fn route_features_with_objective(
         &self,
         features: PromptFeatures,
         objective: RoutingObjective,
-        allowed_models: Option<&[brouter_provider_models::ModelId]>,
+        allowed_models: Option<&[ModelId]>,
+        profile: Option<&RoutingProfile>,
     ) -> Result<RoutingDecision, RouterError> {
-        let mut candidates = self.scored_candidates(&features, objective, allowed_models);
+        let (mut candidates, excluded_candidates) =
+            self.scored_candidates(&features, objective, allowed_models, profile);
         candidates.sort_by(compare_candidate_scores);
         let selected = candidates.first().ok_or(RouterError::NoCandidate)?;
         let selected_model = selected.model_id.clone();
@@ -149,6 +214,7 @@ impl Router {
             features,
             reasons,
             candidates,
+            excluded_candidates,
         })
     }
 
@@ -156,14 +222,26 @@ impl Router {
         &self,
         features: &PromptFeatures,
         objective: RoutingObjective,
-        allowed_models: Option<&[brouter_provider_models::ModelId]>,
-    ) -> Vec<ScoredCandidate> {
-        self.models
-            .iter()
-            .filter(|model| allowed_models.is_none_or(|allowed| allowed.contains(&model.id)))
-            .filter(|model| model_satisfies_features(model, features, objective))
-            .map(|model| score_model(model, features, objective, self.weights))
-            .collect()
+        allowed_models: Option<&[ModelId]>,
+        profile: Option<&RoutingProfile>,
+    ) -> (Vec<ScoredCandidate>, Vec<ExcludedCandidate>) {
+        let mut candidates = Vec::new();
+        let mut excluded = Vec::new();
+        for model in &self.models {
+            if let Some(reason) =
+                candidate_exclusion_reason(model, features, objective, allowed_models, profile)
+            {
+                excluded.push(ExcludedCandidate {
+                    model_id: model.id.clone(),
+                    reason,
+                });
+                continue;
+            }
+            let mut candidate = score_model(model, features, objective, self.weights);
+            apply_soft_denies(model, profile, self.weights, &mut candidate);
+            candidates.push(candidate);
+        }
+        (candidates, excluded)
     }
 
     fn apply_rules(&self, lower_prompt: &str, features: &mut PromptFeatures) -> RoutingObjective {
@@ -207,7 +285,9 @@ pub fn analyze_chat_request(
 }
 
 fn is_auto_model(model: &str) -> bool {
-    matches!(model, "auto" | "brouter/auto") || model.starts_with("group:")
+    matches!(model, "auto" | "brouter/auto")
+        || model.starts_with("group:")
+        || model.starts_with("profile:")
 }
 
 fn request_prompt_text(request: &ChatCompletionRequest) -> String {
@@ -252,10 +332,15 @@ fn analyze_prompt_texts(
         required_capabilities.push(ModelCapability::Json);
     }
 
+    let estimated_input_tokens = estimate_tokens(token_prompt);
+    let estimated_output_tokens = request.max_tokens.unwrap_or(1_024);
+
     PromptFeatures {
         intent,
         reasoning,
-        estimated_input_tokens: estimate_tokens(token_prompt),
+        estimated_input_tokens,
+        estimated_output_tokens,
+        required_context_tokens: estimated_input_tokens.saturating_add(estimated_output_tokens),
         required_capabilities,
         preferred_capabilities: Vec::new(),
         required_attributes: BTreeMap::new(),
@@ -382,22 +467,128 @@ fn estimate_tokens(prompt: &str) -> u32 {
     u32::try_from(token_estimate).unwrap_or(u32::MAX)
 }
 
-fn model_satisfies_features(
+fn apply_context_policy(
+    features: &mut PromptFeatures,
+    context_policy: ContextPolicy,
+    session_context_tokens: Option<u32>,
+) {
+    let current_requirement = features
+        .estimated_input_tokens
+        .saturating_add(features.estimated_output_tokens);
+    let current_requirement =
+        add_safety_margin(current_requirement, context_policy.safety_margin_ratio);
+    let session_requirement = if context_policy.preserve_session_context_floor
+        && !context_policy.allow_context_downgrade
+    {
+        session_context_tokens.unwrap_or_default()
+    } else {
+        0
+    };
+    features.required_context_tokens = current_requirement.max(session_requirement);
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn add_safety_margin(tokens: u32, margin_ratio: f64) -> u32 {
+    if !margin_ratio.is_finite() || margin_ratio <= 0.0 {
+        return tokens;
+    }
+    let multiplier = 1.0 + margin_ratio;
+    if multiplier >= f64::from(u32::MAX) {
+        return u32::MAX;
+    }
+    let with_margin = (f64::from(tokens) * multiplier).ceil();
+    if with_margin >= f64::from(u32::MAX) {
+        u32::MAX
+    } else {
+        with_margin as u32
+    }
+}
+
+fn candidate_exclusion_reason(
     model: &RouteableModel,
     features: &PromptFeatures,
     objective: RoutingObjective,
-) -> bool {
+    allowed_models: Option<&[ModelId]>,
+    profile: Option<&RoutingProfile>,
+) -> Option<String> {
+    if allowed_models.is_some_and(|allowed| !allowed.contains(&model.id)) {
+        return Some("not in requested model group or allowlist".to_string());
+    }
+    if let Some(profile) = profile
+        && !profile.allow.is_empty()
+        && !profile
+            .allow
+            .iter()
+            .any(|selector| selector_matches_model(selector, model))
+    {
+        return Some("not allowed by routing profile".to_string());
+    }
+    if let Some(deny) = hard_matching_deny(profile, model) {
+        return Some(format!("denied by routing profile: {}", deny.reason));
+    }
     if objective == RoutingObjective::LocalOnly && !model.has_capability(ModelCapability::Local) {
-        return false;
+        return Some("local-only objective requires local capability".to_string());
     }
-    if model.context_window < features.estimated_input_tokens {
-        return false;
+    if model.context_window < features.required_context_tokens {
+        return Some(format!(
+            "context_window {} below required context {}",
+            model.context_window, features.required_context_tokens
+        ));
     }
-    features
+    if let Some(capability) = features
         .required_capabilities
         .iter()
-        .all(|capability| model.has_capability(*capability))
-        && attributes_match(&model.attributes, &features.required_attributes)
+        .find(|capability| !model.has_capability(**capability))
+    {
+        return Some(format!("missing required capability {capability:?}"));
+    }
+    if !attributes_match(&model.attributes, &features.required_attributes) {
+        return Some("missing required routing attributes".to_string());
+    }
+    None
+}
+
+fn hard_matching_deny<'a>(
+    profile: Option<&'a RoutingProfile>,
+    model: &RouteableModel,
+) -> Option<&'a CandidateDenyRule> {
+    profile.and_then(|profile| {
+        profile
+            .deny
+            .iter()
+            .find(|deny| deny.hard && selector_matches_model(&deny.selector, model))
+    })
+}
+
+fn selector_matches_model(selector: &CandidateSelector, model: &RouteableModel) -> bool {
+    (selector.models.is_empty() || selector.models.contains(&model.id))
+        && (selector.providers.is_empty() || selector.providers.contains(&model.provider))
+        && selector
+            .capabilities
+            .iter()
+            .all(|capability| model.has_capability(*capability))
+        && attributes_match(&model.attributes, &selector.attributes)
+}
+
+fn apply_soft_denies(
+    model: &RouteableModel,
+    profile: Option<&RoutingProfile>,
+    weights: ScoringWeights,
+    candidate: &mut ScoredCandidate,
+) {
+    let Some(profile) = profile else {
+        return;
+    };
+    for deny in &profile.deny {
+        if deny.hard || !selector_matches_model(&deny.selector, model) {
+            continue;
+        }
+        let penalty = deny.penalty.unwrap_or(weights.policy_penalty);
+        candidate.score -= penalty;
+        candidate
+            .reasons
+            .push(format!("soft-deny penalty {penalty}: {}", deny.reason));
+    }
 }
 
 fn score_model(
@@ -406,7 +597,7 @@ fn score_model(
     objective: RoutingObjective,
     weights: ScoringWeights,
 ) -> ScoredCandidate {
-    let estimated_cost = estimate_cost(model, features.estimated_input_tokens);
+    let estimated_cost = estimate_cost(model, features);
     let mut score = base_quality_score(model, features, weights);
     let mut reasons = vec![format!("quality score {}", model.quality)];
 
@@ -537,10 +728,11 @@ fn apply_session_bias(
     }
 }
 
-fn estimate_cost(model: &RouteableModel, input_tokens: u32) -> f64 {
-    let input_cost = f64::from(input_tokens) / 1_000_000.0 * model.input_cost_per_million;
-    let output_tokens = 1_000.0;
-    let output_cost = output_tokens / 1_000_000.0 * model.output_cost_per_million;
+fn estimate_cost(model: &RouteableModel, features: &PromptFeatures) -> f64 {
+    let input_cost =
+        f64::from(features.estimated_input_tokens) / 1_000_000.0 * model.input_cost_per_million;
+    let output_cost =
+        f64::from(features.estimated_output_tokens) / 1_000_000.0 * model.output_cost_per_million;
     input_cost + output_cost
 }
 
@@ -661,6 +853,78 @@ mod tests {
         assert!(decision.features.matched_rules.is_empty());
     }
 
+    #[test]
+    fn profile_hard_deny_excludes_matching_models() {
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "conserve".to_string(),
+            RoutingProfile {
+                objective: None,
+                allow: Vec::new(),
+                deny: vec![CandidateDenyRule {
+                    selector: CandidateSelector {
+                        attributes: BTreeMap::from([(
+                            "latency_class".to_string(),
+                            "priority".to_string(),
+                        )]),
+                        ..CandidateSelector::default()
+                    },
+                    reason: "priority lane disabled while quota is low".to_string(),
+                    hard: true,
+                    penalty: None,
+                }],
+                context_policy: None,
+            },
+        );
+        let router = Router::new_with_policy(
+            priority_lane_models(),
+            RoutingObjective::Balanced,
+            ScoringWeights::default(),
+            Vec::new(),
+            profiles,
+            ContextPolicy::default(),
+        );
+
+        let decision = router
+            .route_chat_with_options(
+                &chat_request("urgent please answer quickly"),
+                true,
+                RoutingOptions {
+                    profile: Some("conserve".to_string()),
+                    ..RoutingOptions::default()
+                },
+            )
+            .expect("router should choose non-denied model");
+
+        assert_eq!(decision.selected_model, ModelId::new("openai_max_strong"));
+        assert!(decision.excluded_candidates.iter().any(|excluded| {
+            excluded.model_id == ModelId::new("openai_max_strong_priority")
+                && excluded.reason.contains("priority lane disabled")
+        }));
+    }
+
+    #[test]
+    fn session_context_floor_prevents_unsafe_downgrade() {
+        let router = Router::new(context_floor_models(), RoutingObjective::Balanced);
+
+        let decision = router
+            .route_chat_with_options(
+                &chat_request("short follow-up"),
+                false,
+                RoutingOptions {
+                    session_context_tokens: Some(140_000),
+                    ..RoutingOptions::default()
+                },
+            )
+            .expect("router should preserve session context floor");
+
+        assert_eq!(decision.selected_model, ModelId::new("long_context"));
+        assert!(decision.excluded_candidates.iter().any(|excluded| {
+            excluded.model_id == ModelId::new("small_context")
+                && excluded.reason.contains("below required context")
+        }));
+    }
+
     fn priority_trigger_router() -> Router {
         Router::new_with_rules(
             priority_lane_models(),
@@ -745,6 +1009,35 @@ mod tests {
                 capabilities: vec![ModelCapability::Chat, ModelCapability::Reasoning],
                 attributes: BTreeMap::from([("latency_class".to_string(), "priority".to_string())]),
                 display_badges: vec!["priority".to_string()],
+            },
+        ]
+    }
+
+    fn context_floor_models() -> Vec<RouteableModel> {
+        vec![
+            RouteableModel {
+                id: ModelId::new("small_context"),
+                provider: ProviderId::new("cloud"),
+                upstream_model: "small".to_string(),
+                context_window: 100_000,
+                input_cost_per_million: 0.0,
+                output_cost_per_million: 0.0,
+                quality: 99,
+                capabilities: vec![ModelCapability::Chat],
+                attributes: BTreeMap::new(),
+                display_badges: Vec::new(),
+            },
+            RouteableModel {
+                id: ModelId::new("long_context"),
+                provider: ProviderId::new("cloud"),
+                upstream_model: "long".to_string(),
+                context_window: 200_000,
+                input_cost_per_million: 0.0,
+                output_cost_per_million: 0.0,
+                quality: 80,
+                capabilities: vec![ModelCapability::Chat],
+                attributes: BTreeMap::new(),
+                display_badges: Vec::new(),
             },
         ]
     }

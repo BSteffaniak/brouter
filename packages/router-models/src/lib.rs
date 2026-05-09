@@ -100,6 +100,7 @@ pub struct ScoringWeights {
     pub first_message_reasoning_bonus: f64,
     pub code_bonus: f64,
     pub reasoning_bonus: f64,
+    pub policy_penalty: f64,
 }
 
 impl Default for ScoringWeights {
@@ -113,8 +114,80 @@ impl Default for ScoringWeights {
             first_message_reasoning_bonus: 8.0,
             code_bonus: 15.0,
             reasoning_bonus: 20.0,
+            policy_penalty: 30.0,
         }
     }
+}
+
+/// Context safety settings used before model scoring.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ContextPolicy {
+    pub safety_margin_ratio: f64,
+    pub preserve_session_context_floor: bool,
+    pub allow_context_downgrade: bool,
+}
+
+impl Default for ContextPolicy {
+    fn default() -> Self {
+        Self {
+            safety_margin_ratio: 0.15,
+            preserve_session_context_floor: true,
+            allow_context_downgrade: false,
+        }
+    }
+}
+
+/// Runtime options for a single routing request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutingOptions {
+    pub allowed_models: Option<Vec<ModelId>>,
+    pub profile: Option<String>,
+    pub session_context_tokens: Option<u32>,
+}
+
+/// Candidate selector used by profile allow and deny policies.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateSelector {
+    pub models: Vec<ModelId>,
+    pub providers: Vec<brouter_provider_models::ProviderId>,
+    pub capabilities: Vec<ModelCapability>,
+    pub attributes: BTreeMap<String, String>,
+}
+
+impl CandidateSelector {
+    /// Returns true when the selector does not constrain candidates.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.models.is_empty()
+            && self.providers.is_empty()
+            && self.capabilities.is_empty()
+            && self.attributes.is_empty()
+    }
+}
+
+/// Profile deny policy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CandidateDenyRule {
+    pub selector: CandidateSelector,
+    pub reason: String,
+    pub hard: bool,
+    pub penalty: Option<f64>,
+}
+
+/// Named routing profile.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RoutingProfile {
+    pub objective: Option<RoutingObjective>,
+    pub allow: Vec<CandidateSelector>,
+    pub deny: Vec<CandidateDenyRule>,
+    pub context_policy: Option<ContextPolicy>,
+}
+
+/// Candidate excluded before scoring, with an explainable reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExcludedCandidate {
+    pub model_id: ModelId,
+    pub reason: String,
 }
 
 /// Configurable routing rule.
@@ -136,6 +209,8 @@ pub struct PromptFeatures {
     pub intent: PromptIntent,
     pub reasoning: ReasoningLevel,
     pub estimated_input_tokens: u32,
+    pub estimated_output_tokens: u32,
+    pub required_context_tokens: u32,
     pub required_capabilities: Vec<ModelCapability>,
     pub preferred_capabilities: Vec<ModelCapability>,
     pub required_attributes: BTreeMap<String, String>,
@@ -161,4 +236,6 @@ pub struct RoutingDecision {
     pub features: PromptFeatures,
     pub reasons: Vec<String>,
     pub candidates: Vec<ScoredCandidate>,
+    #[serde(default)]
+    pub excluded_candidates: Vec<ExcludedCandidate>,
 }

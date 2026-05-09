@@ -19,12 +19,14 @@ use axum::{Json, Router as AxumRouter};
 use brouter_api_models::{
     ChatCompletionRequest, EmbeddingsRequest, ErrorResponse, ModelListResponse, ModelObject,
 };
-use brouter_config::{ConfigError, routeable_models, routing_rules, scoring_weights};
+use brouter_config::{
+    ConfigError, context_policy, routeable_models, routing_profiles, routing_rules, scoring_weights,
+};
 use brouter_config_models::BrouterConfig;
 use brouter_provider::{ProviderClient, ProviderRegistry};
 use brouter_provider_models::{ModelCapability, ModelId, ProviderId, RouteableModel};
 use brouter_router::{Router, RouterError};
-use brouter_router_models::{RoutingDecision, RoutingObjective};
+use brouter_router_models::{RoutingDecision, RoutingObjective, RoutingOptions};
 use brouter_telemetry::{TelemetryError, TelemetryStore, now_millis};
 use brouter_telemetry_models::UsageEvent;
 use serde::{Deserialize, Serialize};
@@ -69,6 +71,8 @@ struct AppState {
     model_budgets: BTreeMap<ModelId, f64>,
     provider_budgets: BTreeMap<ProviderId, f64>,
     groups: BTreeMap<String, Vec<ModelId>>,
+    default_profile: Option<String>,
+    session_context_tokens: Arc<Mutex<BTreeMap<String, u32>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -122,11 +126,13 @@ fn build_app_with_api_key(
     api_key: Option<String>,
 ) -> AxumRouter {
     let objective = RoutingObjective::from_name(&config.router.default_objective);
-    let router = Router::new_with_rules(
+    let router = Router::new_with_policy(
         routeable_models(config),
         objective,
         scoring_weights(config),
         routing_rules(config),
+        routing_profiles(config),
+        context_policy(config),
     );
     let state = AppState {
         router,
@@ -168,6 +174,8 @@ fn build_app_with_api_key(
                 )
             })
             .collect(),
+        default_profile: config.router.default_profile.clone(),
+        session_context_tokens: Arc::new(Mutex::new(BTreeMap::new())),
     };
 
     let app = AxumRouter::new()
@@ -823,15 +831,76 @@ async fn route_request(
     };
     let is_first_message = !has_session;
     let allowed_models = group_models(state, &request.model);
-    state
+    let session_context_tokens = session_id
+        .as_deref()
+        .and_then(|id| session_context_tokens(state, id));
+    let profile = requested_profile(state, headers, request);
+    let decision = state
         .router
-        .route_chat_for_models(request, is_first_message, allowed_models.as_deref())
-        .map_err(|error| router_error_response(&error))
+        .route_chat_with_options(
+            request,
+            is_first_message,
+            RoutingOptions {
+                allowed_models,
+                profile,
+                session_context_tokens,
+            },
+        )
+        .map_err(|error| router_error_response(&error))?;
+    if let Some(session_id) = session_id {
+        update_session_context_tokens(
+            state,
+            &session_id,
+            decision.features.required_context_tokens,
+        );
+    }
+    Ok(decision)
 }
 
 fn group_models(state: &AppState, model: &str) -> Option<Vec<ModelId>> {
     let group_name = model.strip_prefix("group:").unwrap_or(model);
     state.groups.get(group_name).cloned()
+}
+
+fn requested_profile(
+    state: &AppState,
+    headers: &HeaderMap,
+    request: &ChatCompletionRequest,
+) -> Option<String> {
+    header_value(headers, "x-brouter-profile")
+        .map(ToOwned::to_owned)
+        .or_else(|| metadata_string(request, "brouter_profile"))
+        .or_else(|| {
+            request
+                .model
+                .strip_prefix("profile:")
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| state.default_profile.clone())
+}
+
+fn metadata_string(request: &ChatCompletionRequest, key: &str) -> Option<String> {
+    request
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(key))
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+}
+
+fn session_context_tokens(state: &AppState, session_id: &str) -> Option<u32> {
+    state
+        .session_context_tokens
+        .lock()
+        .ok()
+        .and_then(|context| context.get(session_id).copied())
+}
+
+fn update_session_context_tokens(state: &AppState, session_id: &str, required_context_tokens: u32) {
+    if let Ok(mut context) = state.session_context_tokens.lock() {
+        let entry = context.entry(session_id.to_string()).or_default();
+        *entry = (*entry).max(required_context_tokens);
+    }
 }
 
 fn authorize(

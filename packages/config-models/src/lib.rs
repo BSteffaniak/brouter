@@ -75,16 +75,22 @@ const fn default_max_request_body_bytes() -> usize {
 pub struct RouterConfig {
     #[serde(default = "default_objective")]
     pub default_objective: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_profile: Option<String>,
     #[serde(default)]
     pub debug_headers: bool,
     #[serde(default)]
     pub scoring: ScoringConfig,
+    #[serde(default)]
+    pub context: ContextConfig,
     #[serde(default)]
     pub rules: Vec<RouterRuleConfig>,
     #[serde(default)]
     pub aliases: BTreeMap<String, String>,
     #[serde(default)]
     pub groups: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub profiles: BTreeMap<String, RouterProfileConfig>,
     #[serde(default)]
     pub classifier: Option<ClassifierConfig>,
     #[serde(default = "default_provider_failure_threshold")]
@@ -101,11 +107,14 @@ impl Default for RouterConfig {
     fn default() -> Self {
         Self {
             default_objective: default_objective(),
+            default_profile: None,
             debug_headers: false,
             scoring: ScoringConfig::default(),
+            context: ContextConfig::default(),
             rules: Vec::new(),
             aliases: BTreeMap::new(),
             groups: BTreeMap::new(),
+            profiles: BTreeMap::new(),
             classifier: None,
             provider_failure_threshold: default_provider_failure_threshold(),
             provider_cooldown_ms: default_provider_cooldown_ms(),
@@ -146,6 +155,104 @@ pub struct ScoringConfig {
     pub code_bonus: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_bonus: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_penalty: Option<f64>,
+}
+
+/// Context safety configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContextConfig {
+    #[serde(default = "default_context_safety_margin_ratio")]
+    pub safety_margin_ratio: f64,
+    #[serde(default = "default_preserve_session_context_floor")]
+    pub preserve_session_context_floor: bool,
+    #[serde(default)]
+    pub allow_context_downgrade: bool,
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            safety_margin_ratio: default_context_safety_margin_ratio(),
+            preserve_session_context_floor: default_preserve_session_context_floor(),
+            allow_context_downgrade: false,
+        }
+    }
+}
+
+const fn default_context_safety_margin_ratio() -> f64 {
+    0.15
+}
+
+const fn default_preserve_session_context_floor() -> bool {
+    true
+}
+
+/// Named router profile configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RouterProfileConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    #[serde(default)]
+    pub allow: Vec<CandidateSelectorConfig>,
+    #[serde(default)]
+    pub deny: Vec<DenyRuleConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextConfig>,
+}
+
+/// Candidate selector configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CandidateSelectorConfig {
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub providers: Vec<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub attributes: BTreeMap<String, String>,
+}
+
+/// Candidate deny rule configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DenyRuleConfig {
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub providers: Vec<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub attributes: BTreeMap<String, String>,
+    #[serde(default = "default_deny_reason")]
+    pub reason: String,
+    #[serde(default = "default_hard_deny")]
+    pub hard: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub penalty: Option<f64>,
+}
+
+impl Default for DenyRuleConfig {
+    fn default() -> Self {
+        Self {
+            models: Vec::new(),
+            providers: Vec::new(),
+            capabilities: Vec::new(),
+            attributes: BTreeMap::new(),
+            reason: default_deny_reason(),
+            hard: default_hard_deny(),
+            penalty: None,
+        }
+    }
+}
+
+fn default_deny_reason() -> String {
+    "denied by routing profile".to_string()
+}
+
+const fn default_hard_deny() -> bool {
+    true
 }
 
 /// Configurable router rule.

@@ -8,7 +8,10 @@ use std::path::Path;
 
 use brouter_config_models::{BrouterConfig, ProviderKind};
 use brouter_provider_models::{ModelId, ProviderId, RouteableModel};
-use brouter_router_models::{RoutingObjective, RoutingRule, ScoringWeights};
+use brouter_router_models::{
+    CandidateDenyRule, CandidateSelector, ContextPolicy, RoutingObjective, RoutingProfile,
+    RoutingRule, ScoringWeights,
+};
 use thiserror::Error;
 
 /// Configuration loading and validation error.
@@ -126,9 +129,29 @@ pub enum ConfigWarning {
         group: String,
         model_id: String,
     },
+    UnknownDefaultProfile {
+        profile: String,
+    },
+    UnknownProfileModel {
+        profile: String,
+        model_id: String,
+    },
+    UnknownProfileProvider {
+        profile: String,
+        provider_id: String,
+    },
+    UnknownProfileCapability {
+        profile: String,
+        capability: String,
+    },
+    UnknownProfileObjective {
+        profile: String,
+        objective: String,
+    },
 }
 
 impl std::fmt::Display for ConfigWarning {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ServerApiKeyEnvMissing { env_var } => write!(
@@ -204,6 +227,34 @@ impl std::fmt::Display for ConfigWarning {
                     "group {group} references unknown model {model_id}"
                 )
             }
+            Self::UnknownDefaultProfile { profile } => {
+                write!(
+                    formatter,
+                    "router default profile {profile} is not configured"
+                )
+            }
+            Self::UnknownProfileModel { profile, model_id } => write!(
+                formatter,
+                "profile {profile} references unknown model {model_id}"
+            ),
+            Self::UnknownProfileProvider {
+                profile,
+                provider_id,
+            } => write!(
+                formatter,
+                "profile {profile} references unknown provider {provider_id}"
+            ),
+            Self::UnknownProfileCapability {
+                profile,
+                capability,
+            } => write!(
+                formatter,
+                "profile {profile} declares unknown capability {capability}"
+            ),
+            Self::UnknownProfileObjective { profile, objective } => write!(
+                formatter,
+                "profile {profile} declares unknown objective {objective}"
+            ),
         }
     }
 }
@@ -216,6 +267,7 @@ pub fn validate_config_warnings(config: &BrouterConfig) -> Vec<ConfigWarning> {
     collect_provider_warnings(config, &mut warnings);
     collect_model_warnings(config, &mut warnings);
     collect_alias_warnings(config, &mut warnings);
+    collect_profile_warnings(config, &mut warnings);
     collect_rule_warnings(config, &mut warnings);
     warnings
 }
@@ -288,6 +340,73 @@ fn collect_alias_warnings(config: &BrouterConfig, warnings: &mut Vec<ConfigWarni
                     model_id: model_id.clone(),
                 });
             }
+        }
+    }
+}
+
+fn collect_profile_warnings(config: &BrouterConfig, warnings: &mut Vec<ConfigWarning>) {
+    if let Some(default_profile) = &config.router.default_profile
+        && !config.router.profiles.contains_key(default_profile)
+    {
+        warnings.push(ConfigWarning::UnknownDefaultProfile {
+            profile: default_profile.clone(),
+        });
+    }
+    for (profile_name, profile) in &config.router.profiles {
+        if let Some(objective) = &profile.objective
+            && !is_known_objective(objective)
+        {
+            warnings.push(ConfigWarning::UnknownProfileObjective {
+                profile: profile_name.clone(),
+                objective: objective.clone(),
+            });
+        }
+        for selector in &profile.allow {
+            collect_selector_warnings(config, warnings, profile_name, selector);
+        }
+        for deny in &profile.deny {
+            let selector = brouter_config_models::CandidateSelectorConfig {
+                models: deny.models.clone(),
+                providers: deny.providers.clone(),
+                capabilities: deny.capabilities.clone(),
+                attributes: deny.attributes.clone(),
+            };
+            collect_selector_warnings(config, warnings, profile_name, &selector);
+        }
+    }
+}
+
+fn collect_selector_warnings(
+    config: &BrouterConfig,
+    warnings: &mut Vec<ConfigWarning>,
+    profile_name: &str,
+    selector: &brouter_config_models::CandidateSelectorConfig,
+) {
+    for model_id in &selector.models {
+        if !config.models.contains_key(model_id) {
+            warnings.push(ConfigWarning::UnknownProfileModel {
+                profile: profile_name.to_string(),
+                model_id: model_id.clone(),
+            });
+        }
+    }
+    for provider_id in &selector.providers {
+        if !config.providers.contains_key(provider_id) {
+            warnings.push(ConfigWarning::UnknownProfileProvider {
+                profile: profile_name.to_string(),
+                provider_id: provider_id.clone(),
+            });
+        }
+    }
+    for capability in &selector.capabilities {
+        if capability
+            .parse::<brouter_provider_models::ModelCapability>()
+            .is_err()
+        {
+            warnings.push(ConfigWarning::UnknownProfileCapability {
+                profile: profile_name.to_string(),
+                capability: capability.clone(),
+            });
         }
     }
 }
@@ -407,6 +526,96 @@ pub fn scoring_weights(config: &BrouterConfig) -> ScoringWeights {
             .scoring
             .reasoning_bonus
             .unwrap_or(defaults.reasoning_bonus),
+        policy_penalty: config
+            .router
+            .scoring
+            .policy_penalty
+            .unwrap_or(defaults.policy_penalty),
+    }
+}
+
+/// Converts context configuration into a runtime context policy.
+#[must_use]
+pub const fn context_policy(config: &BrouterConfig) -> ContextPolicy {
+    ContextPolicy {
+        safety_margin_ratio: config.router.context.safety_margin_ratio,
+        preserve_session_context_floor: config.router.context.preserve_session_context_floor,
+        allow_context_downgrade: config.router.context.allow_context_downgrade,
+    }
+}
+
+/// Converts configured router profiles into runtime routing profiles.
+#[must_use]
+pub fn routing_profiles(
+    config: &BrouterConfig,
+) -> std::collections::BTreeMap<String, RoutingProfile> {
+    config
+        .router
+        .profiles
+        .iter()
+        .map(|(name, profile)| {
+            (
+                name.clone(),
+                RoutingProfile {
+                    objective: profile
+                        .objective
+                        .as_deref()
+                        .map(RoutingObjective::from_name),
+                    allow: profile.allow.iter().map(selector_config).collect(),
+                    deny: profile
+                        .deny
+                        .iter()
+                        .map(|deny| CandidateDenyRule {
+                            selector: deny_selector_config(deny),
+                            reason: deny.reason.clone(),
+                            hard: deny.hard,
+                            penalty: deny.penalty,
+                        })
+                        .collect(),
+                    context_policy: profile.context.as_ref().map(|context| ContextPolicy {
+                        safety_margin_ratio: context.safety_margin_ratio,
+                        preserve_session_context_floor: context.preserve_session_context_floor,
+                        allow_context_downgrade: context.allow_context_downgrade,
+                    }),
+                },
+            )
+        })
+        .collect()
+}
+
+fn selector_config(selector: &brouter_config_models::CandidateSelectorConfig) -> CandidateSelector {
+    CandidateSelector {
+        models: selector.models.iter().cloned().map(ModelId::new).collect(),
+        providers: selector
+            .providers
+            .iter()
+            .cloned()
+            .map(ProviderId::new)
+            .collect(),
+        capabilities: selector
+            .capabilities
+            .iter()
+            .filter_map(|capability| capability.parse().ok())
+            .collect(),
+        attributes: selector.attributes.clone(),
+    }
+}
+
+fn deny_selector_config(deny: &brouter_config_models::DenyRuleConfig) -> CandidateSelector {
+    CandidateSelector {
+        models: deny.models.iter().cloned().map(ModelId::new).collect(),
+        providers: deny
+            .providers
+            .iter()
+            .cloned()
+            .map(ProviderId::new)
+            .collect(),
+        capabilities: deny
+            .capabilities
+            .iter()
+            .filter_map(|capability| capability.parse().ok())
+            .collect(),
+        attributes: deny.attributes.clone(),
     }
 }
 

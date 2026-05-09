@@ -30,7 +30,7 @@ patterns used by the sibling projects in this checkout.
 `/v1/chat/completions` supports non-streaming and streaming OpenAI-compatible
 upstreams, provider timeouts, fallback attempts for retryable failures,
 provider cooldowns after repeated failures, Anthropic non-streaming and streaming
-conversion, OpenAI-compatible embeddings forwarding, configurable scoring/routing rules, generic model/provider route attributes, and optional SQLite telemetry via
+conversion, OpenAI-compatible embeddings forwarding, configurable scoring/routing rules, named routing profiles with allow/deny policy, context-window safety for session-aware model switching, generic model/provider route attributes, and optional SQLite telemetry via
 `switchy_database`. Successful chat responses include brouter headers such as
 `x-brouter-selected-model`, `x-brouter-provider`, `x-brouter-attributes`, and
 `x-brouter-display-badges`. `/v1/brouter/usage` supports `session_id`, `model`,

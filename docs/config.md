@@ -13,6 +13,7 @@
 ## `[router]`
 
 - `default_objective`: `balanced`, `cheapest`, `fastest`, `strongest`, `local_only`
+- `default_profile` optional profile name used by `brouter/auto`
 - `debug_headers` boolean
 - `provider_failure_threshold` integer
 - `provider_cooldown_ms` integer
@@ -20,6 +21,52 @@
 - `max_session_estimated_cost` optional float; per-session budget using `x-brouter-session` or `metadata.session_id`
 - `aliases` map of alias model IDs to configured model IDs
 - `groups` map of group names to model ID arrays; clients can request `group:<name>`
+
+Profiles can be selected with `model = "profile:<name>"`, `x-brouter-profile`, or request metadata `brouter_profile`. Profile allow rules are hard allowlists. Hard deny rules exclude candidates; soft deny rules apply a scoring penalty.
+
+## `[router.context]`
+
+- `safety_margin_ratio` float, default `0.15`; added to the estimated input plus output context requirement
+- `preserve_session_context_floor` boolean, default `true`; keeps later requests in a session from falling back below the highest context requirement seen in that server process
+- `allow_context_downgrade` boolean, default `false`; when true, session high-water context does not block smaller models if the current request fits
+
+## `[router.profiles.<name>]`
+
+- `objective` optional routing objective override
+- `context` optional profile-specific context policy with the same fields as `[router.context]`
+- `allow` array of candidate selectors
+- `deny` array of candidate deny rules
+
+Candidate selectors support:
+
+- `models` array of model IDs
+- `providers` array of provider IDs
+- `capabilities` array
+- `attributes` map of required model attributes
+
+Deny rules use the same selector fields plus:
+
+- `reason` string shown in route explanations
+- `hard` boolean, default `true`; `false` keeps the candidate but penalizes its score
+- `penalty` optional float for soft deny rules
+
+Example:
+
+```toml
+[router]
+default_profile = "conserve_openai"
+
+[[router.profiles.conserve_openai.deny]]
+attributes = { latency_class = "priority" }
+reason = "priority lane disabled while quota is low"
+hard = true
+
+[[router.profiles.conserve_openai.deny]]
+providers = ["openai"]
+reason = "prefer free/local models before OpenAI"
+hard = false
+penalty = 25.0
+```
 
 ## `[[router.rules]]`
 
@@ -44,6 +91,7 @@ All fields are optional floats:
 - `first_message_reasoning_bonus`
 - `code_bonus`
 - `reasoning_bonus`
+- `policy_penalty`
 
 ## `[telemetry]`
 
