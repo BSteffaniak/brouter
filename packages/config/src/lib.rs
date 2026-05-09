@@ -4,7 +4,7 @@
 
 //! Configuration loading, validation, and conversion helpers for brouter.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use brouter_catalog::FallbackCatalog;
 use brouter_catalog_models::{
@@ -24,6 +24,8 @@ use thiserror::Error;
 /// Configuration loading and validation error.
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("failed to find configuration file, tried: {paths}")]
+    ConfigPathNotFound { paths: String },
     #[error("failed to read configuration file {path}: {source}")]
     Read {
         path: String,
@@ -41,6 +43,73 @@ pub enum ConfigError {
     },
     #[error("model {model_id} has context_window = 0")]
     EmptyContextWindow { model_id: String },
+}
+
+/// Resolves a brouter config file path using the following priority:
+///
+/// 1. `cli_path` — an explicit path passed via `--config`
+/// 2. `$BROUTER_CONFIG` environment variable
+/// 3. XDG default: `$XDG_CONFIG_HOME/brouter/brouter.toml`,
+///    falling back to `$HOME/.config/brouter/brouter.toml`
+/// 4. `./brouter.toml` as a last resort
+///
+/// # Errors
+///
+/// Returns [`ConfigError::ConfigPathNotFound`] when no config file is found at any
+/// of the candidate paths.
+pub fn resolve_config_path(cli_path: Option<&Path>) -> Result<PathBuf, ConfigError> {
+    let candidates = build_config_paths(cli_path);
+    for candidate in &candidates {
+        if candidate.exists() {
+            return Ok(candidate.clone());
+        }
+    }
+    let paths = candidates
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(ConfigError::ConfigPathNotFound { paths })
+}
+
+fn build_config_paths(cli_path: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    if let Some(p) = cli_path {
+        paths.push(p.to_path_buf());
+    }
+    if let Some(env) = std::env::var_os("BROUTER_CONFIG") {
+        let p = PathBuf::from(env);
+        if !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
+    if let Some(xdg) = xdg_config_path()
+        && !paths.contains(&xdg)
+    {
+        paths.push(xdg);
+    }
+    let local = PathBuf::from("brouter.toml");
+    if !paths.contains(&local) {
+        paths.push(local);
+    }
+    paths
+}
+
+fn xdg_config_path() -> Option<PathBuf> {
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| {
+                let mut p = PathBuf::from(h);
+                p.push(".config");
+                p
+            })
+        })?;
+    let mut p = config_home;
+    p.push("brouter");
+    p.push("brouter.toml");
+    Some(p)
 }
 
 /// Loads and validates a brouter TOML configuration file.

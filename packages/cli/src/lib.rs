@@ -18,8 +18,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use brouter_api_models::{ChatCompletionRequest, ChatMessage, MessageContent};
 use brouter_config::{
-    apply_default_config, load_config, routeable_models, routing_rules, scoring_weights,
-    validate_config_warnings,
+    apply_default_config, load_config, resolve_config_path, routeable_models, routing_rules,
+    scoring_weights, validate_config_warnings,
 };
 use brouter_config_models::{BrouterConfig, ProviderConfig, ProviderKind};
 use brouter_router::Router;
@@ -40,24 +40,29 @@ pub async fn run_cli() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { config } => serve(&config).await,
+        Command::Serve { config } => serve(config.as_deref()).await,
         Command::CheckConfig {
             config,
             strict,
             json,
-        } => check_config(&config, strict, json),
+        } => check_config(&resolve_and_load(config.as_deref())?, strict, json),
         Command::PrintExampleConfig => {
             print_example_config();
             Ok(())
         }
         Command::Auth { command } => auth(command).await,
-        Command::Doctor { config } => doctor(&config).await,
+        Command::Doctor { config } => doctor(&resolve_and_load(config.as_deref())?).await,
         Command::Route {
             config,
             prompt,
             first_message,
             objective,
-        } => explain_route(&config, &prompt, first_message, objective.as_deref()),
+        } => explain_route(
+            &resolve_and_load(config.as_deref())?,
+            &prompt,
+            first_message,
+            objective.as_deref(),
+        ),
     }
 }
 
@@ -74,21 +79,31 @@ fn init_tracing() {
     }
 }
 
-async fn serve(config: &Path) -> Result<()> {
-    let config = if config.exists() {
-        load_config(config)?
-    } else {
-        let mut config = BrouterConfig::default();
-        apply_default_config(&mut config);
-        config
-    };
-    brouter_server::serve(config).await?;
+fn resolve_and_load(config: Option<&Path>) -> Result<BrouterConfig> {
+    let path = resolve_config_path(config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(load_config(&path)?)
+}
+
+/// Runs brouter with the configuration at the resolved path, or with a
+/// default configuration if no config file is found.
+async fn serve(config: Option<&Path>) -> Result<()> {
+    match resolve_config_path(config) {
+        Ok(path) => {
+            let config = load_config(&path)?;
+            brouter_server::serve(config).await?;
+        }
+        Err(brouter_config::ConfigError::ConfigPathNotFound { .. }) => {
+            let mut config = BrouterConfig::default();
+            apply_default_config(&mut config);
+            brouter_server::serve(config).await?;
+        }
+        Err(e) => return Err(e.into()),
+    }
     Ok(())
 }
 
-fn check_config(config: &Path, strict: bool, json_output: bool) -> Result<()> {
-    let config = load_config(config)?;
-    let warnings = validate_config_warnings(&config);
+fn check_config(config: &BrouterConfig, strict: bool, json_output: bool) -> Result<()> {
+    let warnings = validate_config_warnings(config);
     if json_output {
         println!(
             "{}",
@@ -119,9 +134,8 @@ fn check_config(config: &Path, strict: bool, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-async fn doctor(config: &Path) -> Result<()> {
-    let config = load_config(config)?;
-    let warnings = validate_config_warnings(&config);
+async fn doctor(config: &BrouterConfig) -> Result<()> {
+    let warnings = validate_config_warnings(config);
     println!(
         "config ok: {} providers, {} models, {} warnings",
         config.providers.len(),
@@ -137,7 +151,7 @@ async fn doctor(config: &Path) -> Result<()> {
         .build()?;
     let mut failures = 0_u32;
     for (provider_id, provider) in &config.providers {
-        match check_provider(&client, &config, provider_id, provider).await {
+        match check_provider(&client, config, provider_id, provider).await {
             Ok(message) => println!("provider {provider_id}: ok ({message})"),
             Err(error) => {
                 failures = failures.saturating_add(1);
@@ -820,21 +834,20 @@ struct OpenAiDeviceTokenResponse {
 }
 
 fn explain_route(
-    config: &Path,
+    config: &BrouterConfig,
     prompt: &str,
     first_message: bool,
     objective: Option<&str>,
 ) -> Result<()> {
-    let config = load_config(config)?;
     let objective = objective.map_or_else(
         || RoutingObjective::from_name(&config.router.default_objective),
         RoutingObjective::from_name,
     );
     let router = Router::new_with_rules(
-        routeable_models(&config),
+        routeable_models(config),
         objective,
-        scoring_weights(&config),
-        routing_rules(&config),
+        scoring_weights(config),
+        routing_rules(config),
     );
     let decision = router.route_chat(&prompt_request(prompt), first_message)?;
     println!("{}", serde_json::to_string_pretty(&decision)?);
@@ -905,14 +918,14 @@ enum Command {
     /// Starts the local HTTP router service.
     Serve {
         /// Path to the brouter TOML config.
-        #[arg(long, default_value = "brouter.toml")]
-        config: PathBuf,
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Validates the brouter TOML config.
     CheckConfig {
         /// Path to the brouter TOML config.
-        #[arg(long, default_value = "brouter.toml")]
-        config: PathBuf,
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Treat validation warnings as errors.
         #[arg(long)]
         strict: bool,
@@ -930,14 +943,14 @@ enum Command {
     /// Validates config and checks provider reachability.
     Doctor {
         /// Path to the brouter TOML config.
-        #[arg(long, default_value = "brouter.toml")]
-        config: PathBuf,
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Explains how a prompt would be routed.
     Route {
         /// Path to the brouter TOML config.
-        #[arg(long, default_value = "brouter.toml")]
-        config: PathBuf,
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Prompt text to classify and route.
         prompt: String,
         /// Treat the prompt as the first message in a session.
