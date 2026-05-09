@@ -191,3 +191,68 @@ pub fn now_millis() -> u64 {
             u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use brouter_catalog_models::MetadataProvenance;
+    use brouter_introspection_models::{
+        AccountSnapshot, AccountStatus, ResourceKind, ResourcePool, ResourceScope, ResourceUnit,
+        SnapshotSource, SnapshotSourceKind,
+    };
+
+    use super::*;
+
+    #[test]
+    fn low_resource_pool_penalizes_and_disables_attributes() {
+        let provider = ProviderId::new("openrouter");
+        let snapshot = IntrospectionSnapshot {
+            provider: provider.clone(),
+            fetched_at_ms: now_millis(),
+            source: SnapshotSource {
+                kind: SnapshotSourceKind::ProviderApi,
+                endpoint: None,
+                label: None,
+            },
+            catalog: None,
+            account: Some(AccountSnapshot {
+                account_id: None,
+                status: AccountStatus::Available,
+                pools: vec![ResourcePool {
+                    id: "credits".to_string(),
+                    scope: ResourceScope::Provider,
+                    kind: ResourceKind::MonetaryCredit,
+                    unit: ResourceUnit::Usd,
+                    remaining: Some(2.0),
+                    total: Some(10.0),
+                    used: Some(8.0),
+                    refill_at_ms: None,
+                    reset_at_ms: None,
+                    expires_at_ms: None,
+                    applies_to: ResourceSelector {
+                        providers: vec![provider],
+                        ..ResourceSelector::default()
+                    },
+                    provenance: MetadataProvenance::default(),
+                }],
+            }),
+            warnings: Vec::new(),
+        };
+
+        let effects = dynamic_policy_effects(
+            vec![snapshot],
+            DynamicPolicyConfig::default(),
+            &BTreeMap::from([("latency_class".to_string(), "priority".to_string())]),
+        );
+
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, DynamicPolicyEffect::Penalize { .. }))
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, DynamicPolicyEffect::DisableAttribute { .. }))
+        );
+    }
+}

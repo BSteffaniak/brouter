@@ -16,8 +16,9 @@ use brouter_api_models::{
 use brouter_catalog_models::{MetadataProvenance, MetadataSource};
 use brouter_config_models::{BrouterConfig, ProviderConfig, ProviderKind};
 use brouter_introspection_models::{
-    CatalogModel, IntrospectionRequest, IntrospectionSnapshot, IntrospectionWarning, MetadataField,
-    ModelCatalogSnapshot, ModelMetadataFields, SnapshotSource,
+    AccountSnapshot, AccountStatus, CatalogModel, IntrospectionRequest, IntrospectionSnapshot,
+    IntrospectionWarning, MetadataField, ModelCatalogSnapshot, ModelMetadataFields, ResourceKind,
+    ResourcePool, ResourceScope, ResourceSelector, ResourceUnit, SnapshotSource,
 };
 use brouter_provider_models::{ModelCapability, ProviderId, RouteableModel};
 use bytes::Bytes;
@@ -64,6 +65,11 @@ impl ProviderRegistry {
     pub fn provider_ids(&self) -> Vec<ProviderId> {
         self.providers.keys().cloned().collect()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthHeader {
+    Bearer,
 }
 
 /// Client used to forward requests to upstream providers.
@@ -234,11 +240,74 @@ impl ProviderClient {
                 .ok_or_else(|| ProviderError::MissingBaseUrl {
                     provider_id: provider_id.to_string(),
                 })?;
-        let url = format!("{}/models", base_url.trim_end_matches('/'));
-        if !request.include_catalog {
-            return Ok(empty_introspection_snapshot(provider_id, &url));
-        }
-        let mut builder = self.http.get(&url);
+        let catalog_url = format!("{}/models", base_url.trim_end_matches('/'));
+        let catalog = if request.include_catalog {
+            Some(
+                self.fetch_openai_compatible_catalog(provider_id, provider, &catalog_url)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let account = if request.include_account && is_openrouter_provider(provider_id, base_url) {
+            Some(
+                self.fetch_openrouter_account(provider_id, provider, base_url)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let warnings = if request.include_account && account.is_none() {
+            vec![IntrospectionWarning::new(
+                "account_unsupported",
+                "OpenAI-compatible account introspection is only implemented for OpenRouter-compatible /auth/key endpoints",
+            )]
+        } else {
+            Vec::new()
+        };
+        Ok(IntrospectionSnapshot {
+            provider: provider_id.clone(),
+            fetched_at_ms: unix_millis(),
+            source: SnapshotSource::provider_api(catalog_url),
+            catalog,
+            account,
+            warnings,
+        })
+    }
+
+    async fn fetch_openai_compatible_catalog(
+        &self,
+        provider_id: &ProviderId,
+        provider: &ProviderConfig,
+        url: &str,
+    ) -> Result<ModelCatalogSnapshot, ProviderError> {
+        let value = self
+            .get_provider_json(provider_id, provider, url, AuthHeader::Bearer)
+            .await?;
+        Ok(openai_compatible_catalog(&value))
+    }
+
+    async fn fetch_openrouter_account(
+        &self,
+        provider_id: &ProviderId,
+        provider: &ProviderConfig,
+        base_url: &str,
+    ) -> Result<AccountSnapshot, ProviderError> {
+        let url = format!("{}/auth/key", base_url.trim_end_matches('/'));
+        let value = self
+            .get_provider_json(provider_id, provider, &url, AuthHeader::Bearer)
+            .await?;
+        Ok(openrouter_account_snapshot(provider_id, &value))
+    }
+
+    async fn get_provider_json(
+        &self,
+        provider_id: &ProviderId,
+        provider: &ProviderConfig,
+        url: &str,
+        auth_header: AuthHeader,
+    ) -> Result<Value, ProviderError> {
+        let mut builder = self.http.get(url);
         if let Some(timeout) = provider_timeout(provider) {
             builder = builder.timeout(timeout);
         }
@@ -247,7 +316,9 @@ impl ProviderClient {
                 env_var: api_key_env.clone(),
                 provider_id: provider_id.to_string(),
             })?;
-            builder = builder.bearer_auth(api_key);
+            builder = match auth_header {
+                AuthHeader::Bearer => builder.bearer_auth(api_key),
+            };
         }
         let response = builder.send().await?;
         let status = response.status();
@@ -255,18 +326,10 @@ impl ProviderClient {
         if !status.is_success() {
             return Err(ProviderError::Introspection {
                 provider_id: provider_id.to_string(),
-                message: format!("GET /models returned {status}: {body}"),
+                message: format!("GET {url} returned {status}: {body}"),
             });
         }
-        let value = serde_json::from_str::<Value>(&body).unwrap_or(Value::String(body));
-        Ok(IntrospectionSnapshot {
-            provider: provider_id.clone(),
-            fetched_at_ms: unix_millis(),
-            source: SnapshotSource::provider_api(url),
-            catalog: Some(openai_compatible_catalog(&value)),
-            account: None,
-            warnings: Vec::new(),
-        })
+        Ok(serde_json::from_str::<Value>(&body).unwrap_or(Value::String(body)))
     }
 
     async fn anthropic_introspection(
@@ -513,6 +576,65 @@ pub(crate) fn apply_attribute_mappings(
             object.insert(field.clone(), field_value.clone());
         }
     }
+}
+
+fn openrouter_account_snapshot(provider_id: &ProviderId, value: &Value) -> AccountSnapshot {
+    let data = value.get("data").unwrap_or(value);
+    let usage = data.get("usage").and_then(value_as_f64);
+    let limit = data.get("limit").and_then(value_as_f64);
+    let remaining = data
+        .get("limit_remaining")
+        .and_then(value_as_f64)
+        .or_else(|| {
+            limit
+                .zip(usage)
+                .map(|(limit, usage)| (limit - usage).max(0.0))
+        });
+    let status = if data
+        .get("disabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        AccountStatus::Disabled
+    } else if remaining == Some(0.0) {
+        AccountStatus::Exhausted
+    } else {
+        AccountStatus::Available
+    };
+    let provenance = MetadataProvenance::new(MetadataSource::ProviderApi);
+    let mut pools = Vec::new();
+    if usage.is_some() || limit.is_some() || remaining.is_some() {
+        pools.push(ResourcePool {
+            id: "openrouter-key-credits".to_string(),
+            scope: ResourceScope::Provider,
+            kind: ResourceKind::MonetaryCredit,
+            unit: ResourceUnit::Usd,
+            remaining,
+            total: limit,
+            used: usage,
+            refill_at_ms: None,
+            reset_at_ms: None,
+            expires_at_ms: None,
+            applies_to: ResourceSelector {
+                providers: vec![provider_id.clone()],
+                ..ResourceSelector::default()
+            },
+            provenance,
+        });
+    }
+    AccountSnapshot {
+        account_id: data
+            .get("hash")
+            .or_else(|| data.get("id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        status,
+        pools,
+    }
+}
+
+fn is_openrouter_provider(provider_id: &ProviderId, base_url: &str) -> bool {
+    provider_id.as_str().contains("openrouter") || base_url.contains("openrouter.ai")
 }
 
 fn openai_compatible_catalog(value: &Value) -> ModelCatalogSnapshot {
@@ -1029,6 +1151,7 @@ mod tests {
             auth_profile: None,
             auth_vault_path: None,
             introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
+            resource_pools: Vec::new(),
             attribute_mappings: BTreeMap::new(),
         };
         let mut request = chat_request(false);
@@ -1073,6 +1196,31 @@ mod tests {
                 .expect("capabilities should exist")
                 .contains(&ModelCapability::Tools)
         );
+    }
+
+    #[tokio::test]
+    async fn openrouter_introspection_maps_account_credits() {
+        let upstream = spawn_openrouter_upstream().await;
+        let mut config = test_config(upstream);
+        let provider = config
+            .providers
+            .remove("fake")
+            .expect("fake provider should exist");
+        config.providers.insert("openrouter".to_string(), provider);
+        let registry = ProviderRegistry::from_config(&config);
+        let snapshot = ProviderClient::new()
+            .introspect(
+                &registry,
+                &ProviderId::new("openrouter"),
+                IntrospectionRequest::default(),
+            )
+            .await
+            .expect("introspection should succeed");
+
+        let account = snapshot.account.expect("account should be mapped");
+        assert_eq!(account.pools[0].remaining, Some(7.5));
+        assert_eq!(account.pools[0].total, Some(10.0));
+        assert_eq!(account.pools[0].used, Some(2.5));
     }
 
     #[tokio::test]
@@ -1222,6 +1370,36 @@ mod tests {
         base_url(address)
     }
 
+    async fn spawn_openrouter_upstream() -> String {
+        async fn models() -> Json<Value> {
+            Json(json!({"data": []}))
+        }
+        async fn auth_key() -> Json<Value> {
+            Json(json!({
+                "data": {
+                    "hash": "key-hash",
+                    "usage": 2.5,
+                    "limit": 10.0,
+                    "limit_remaining": 7.5,
+                    "is_free_tier": false
+                }
+            }))
+        }
+        let app = AxumRouter::new()
+            .route("/v1/models", axum::routing::get(models))
+            .route("/v1/auth/key", axum::routing::get(auth_key));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("address should be available");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("fake upstream should serve");
+        });
+        base_url(address)
+    }
+
     async fn spawn_models_upstream() -> String {
         async fn models() -> Json<Value> {
             Json(json!({
@@ -1287,6 +1465,7 @@ mod tests {
                 auth_profile: None,
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
+                resource_pools: Vec::new(),
                 attribute_mappings: BTreeMap::new(),
             },
         );
@@ -1328,6 +1507,7 @@ mod tests {
                 auth_profile: None,
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
+                resource_pools: Vec::new(),
                 attribute_mappings: BTreeMap::new(),
             },
         );

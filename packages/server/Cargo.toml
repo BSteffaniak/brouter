@@ -13,6 +13,7 @@ version     = { workspace = true }
 [dependencies]
 axum                         = { workspace = true, features = ["http1", "json", "query", "tokio"] }
 brouter_api_models           = { workspace = true }
+brouter_catalog_models       = { workspace = true }
 brouter_config               = { workspace = true }
 brouter_config_models        = { workspace = true }
 brouter_introspection        = { workspace = true }
@@ -38,6 +39,7 @@ tower = { workspace = true, features = ["util"] }
 default = []
 fail-on-warnings = [
     "brouter_api_models/fail-on-warnings",
+    "brouter_catalog_models/fail-on-warnings",
     "brouter_config/fail-on-warnings",
     "brouter_config_models/fail-on-warnings",
     "brouter_introspection/fail-on-warnings",

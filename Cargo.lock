@@ -656,6 +656,7 @@ dependencies = [
 name = "brouter_introspection"
 version = "0.1.0"
 dependencies = [
+ "brouter_catalog_models",
  "brouter_introspection_models",
  "brouter_provider_models",
  "serde",
@@ -731,6 +732,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "brouter_api_models",
+ "brouter_catalog_models",
  "brouter_config",
  "brouter_config_models",
  "brouter_introspection",

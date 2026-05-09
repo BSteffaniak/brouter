@@ -19,6 +19,7 @@ use axum::{Json, Router as AxumRouter};
 use brouter_api_models::{
     ChatCompletionRequest, EmbeddingsRequest, ErrorResponse, ModelListResponse, ModelObject,
 };
+use brouter_catalog_models::{MetadataProvenance, MetadataSource};
 use brouter_config::{
     ConfigError, context_policy, routeable_models_with_introspection, routing_profiles,
     routing_rules, scoring_weights,
@@ -26,7 +27,9 @@ use brouter_config::{
 use brouter_config_models::BrouterConfig;
 use brouter_introspection::{DynamicPolicyConfig, dynamic_policy_effects};
 use brouter_introspection_models::{
-    DynamicPolicyEffect, IntrospectionRequest, IntrospectionSnapshot,
+    AccountSnapshot, AccountStatus, DynamicPolicyEffect, IntrospectionRequest,
+    IntrospectionSnapshot, ResourceKind, ResourcePool, ResourceScope, ResourceSelector,
+    ResourceUnit, SnapshotSource, SnapshotSourceKind,
 };
 use brouter_provider::{ProviderClient, ProviderRegistry};
 use brouter_provider_models::{ModelCapability, ModelId, ProviderId, RouteableModel};
@@ -113,7 +116,7 @@ pub async fn serve(config: BrouterConfig) -> Result<(), ServerError> {
     let address = parse_bind_address(&bind_address)?;
     let telemetry = telemetry_store(&config).await?;
     let api_key = server_api_key(&config)?;
-    let snapshots = refresh_introspection_snapshots(&config).await;
+    let snapshots = introspection_snapshots(&config).await;
     let app = build_app_with_api_key_and_introspection(&config, telemetry, api_key, snapshots);
     let listener = tokio::net::TcpListener::bind(address)
         .await
@@ -246,6 +249,11 @@ fn apply_cors(app: AxumRouter, allowed_origins: &[String]) -> AxumRouter {
     app.layer(layer)
 }
 
+async fn introspection_snapshots(config: &BrouterConfig) -> Vec<IntrospectionSnapshot> {
+    let live = refresh_introspection_snapshots(config).await;
+    merge_configured_resource_pools(config, live)
+}
+
 async fn refresh_introspection_snapshots(config: &BrouterConfig) -> Vec<IntrospectionSnapshot> {
     if !config.router.metadata.refresh_on_startup {
         return Vec::new();
@@ -271,6 +279,155 @@ async fn refresh_introspection_snapshots(config: &BrouterConfig) -> Vec<Introspe
         }
     }
     snapshots
+}
+
+fn merge_configured_resource_pools(
+    config: &BrouterConfig,
+    mut snapshots: Vec<IntrospectionSnapshot>,
+) -> Vec<IntrospectionSnapshot> {
+    for (provider_id, provider) in &config.providers {
+        if provider.resource_pools.is_empty() {
+            continue;
+        }
+        let provider_id = ProviderId::new(provider_id.clone());
+        let snapshot_index = snapshots
+            .iter()
+            .position(|snapshot| snapshot.provider == provider_id);
+        let configured_pools = provider
+            .resource_pools
+            .iter()
+            .map(|pool| configured_resource_pool(&provider_id, pool))
+            .collect::<Vec<_>>();
+        if let Some(index) = snapshot_index {
+            let account = snapshots[index]
+                .account
+                .get_or_insert_with(|| AccountSnapshot {
+                    account_id: None,
+                    status: AccountStatus::Unknown,
+                    pools: Vec::new(),
+                });
+            for pool in configured_pools {
+                merge_resource_pool(&mut account.pools, pool);
+            }
+        } else {
+            snapshots.push(IntrospectionSnapshot {
+                provider: provider_id,
+                fetched_at_ms: now_millis(),
+                source: SnapshotSource {
+                    kind: SnapshotSourceKind::Runtime,
+                    endpoint: None,
+                    label: Some("configured_resource_pools".to_string()),
+                },
+                catalog: None,
+                account: Some(AccountSnapshot {
+                    account_id: None,
+                    status: AccountStatus::Unknown,
+                    pools: configured_pools,
+                }),
+                warnings: Vec::new(),
+            });
+        }
+    }
+    snapshots
+}
+
+fn merge_resource_pool(pools: &mut Vec<ResourcePool>, configured: ResourcePool) {
+    if let Some(existing) = pools.iter_mut().find(|pool| pool.id == configured.id) {
+        existing.total = existing.total.or(configured.total);
+        existing.remaining = existing.remaining.or_else(|| {
+            configured.remaining.or_else(|| {
+                existing
+                    .total
+                    .zip(existing.used)
+                    .map(|(total, used)| (total - used).max(0.0))
+            })
+        });
+        existing.used = existing.used.or(configured.used);
+        existing.refill_at_ms = existing.refill_at_ms.or(configured.refill_at_ms);
+        existing.reset_at_ms = existing.reset_at_ms.or(configured.reset_at_ms);
+        existing.expires_at_ms = existing.expires_at_ms.or(configured.expires_at_ms);
+    } else {
+        pools.push(configured);
+    }
+}
+
+fn configured_resource_pool(
+    provider_id: &ProviderId,
+    pool: &brouter_config_models::ResourcePoolConfig,
+) -> ResourcePool {
+    let mut selector = configured_resource_selector(&pool.applies_to);
+    if selector.providers.is_empty() {
+        selector.providers.push(provider_id.clone());
+    }
+    ResourcePool {
+        id: pool.id.clone(),
+        scope: resource_scope(&pool.scope),
+        kind: resource_kind(&pool.kind),
+        unit: resource_unit(&pool.unit),
+        remaining: pool.remaining,
+        total: pool.total,
+        used: pool.used,
+        refill_at_ms: pool.refill_at_ms,
+        reset_at_ms: pool.reset_at_ms,
+        expires_at_ms: pool.expires_at_ms,
+        applies_to: selector,
+        provenance: MetadataProvenance::new(MetadataSource::UserConfig),
+    }
+}
+
+fn configured_resource_selector(
+    selector: &brouter_config_models::ResourceSelectorConfig,
+) -> ResourceSelector {
+    ResourceSelector {
+        providers: selector
+            .providers
+            .iter()
+            .cloned()
+            .map(ProviderId::new)
+            .collect(),
+        upstream_models: selector.upstream_models.clone(),
+        configured_models: selector.models.iter().cloned().map(ModelId::new).collect(),
+        attributes: selector.attributes.clone(),
+        capabilities: selector
+            .capabilities
+            .iter()
+            .filter_map(|capability| capability.parse().ok())
+            .collect(),
+    }
+}
+
+fn resource_scope(value: &str) -> ResourceScope {
+    match value {
+        "provider" => ResourceScope::Provider,
+        "account" => ResourceScope::Account,
+        "model" => ResourceScope::Model,
+        "attribute" => ResourceScope::Attribute,
+        _ => ResourceScope::Unknown,
+    }
+}
+
+fn resource_kind(value: &str) -> ResourceKind {
+    match value {
+        "monetary_credit" => ResourceKind::MonetaryCredit,
+        "subscription_allowance" => ResourceKind::SubscriptionAllowance,
+        "token_budget" => ResourceKind::TokenBudget,
+        "request_budget" => ResourceKind::RequestBudget,
+        "rate_limit" => ResourceKind::RateLimit,
+        "priority_allowance" => ResourceKind::PriorityAllowance,
+        _ => ResourceKind::Unknown,
+    }
+}
+
+fn resource_unit(value: &str) -> ResourceUnit {
+    match value {
+        "usd" => ResourceUnit::Usd,
+        "tokens" => ResourceUnit::Tokens,
+        "requests" => ResourceUnit::Requests,
+        "requests_per_minute" => ResourceUnit::RequestsPerMinute,
+        "tokens_per_minute" => ResourceUnit::TokensPerMinute,
+        "percent" => ResourceUnit::Percent,
+        _ => ResourceUnit::Unknown,
+    }
 }
 
 async fn telemetry_store(config: &BrouterConfig) -> Result<TelemetryStore, TelemetryError> {
@@ -1418,6 +1575,7 @@ mod tests {
                 auth_profile: None,
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
+                resource_pools: Vec::new(),
                 attribute_mappings: BTreeMap::new(),
             },
         );
@@ -1454,6 +1612,7 @@ mod tests {
                 auth_profile: None,
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
+                resource_pools: Vec::new(),
                 attribute_mappings: BTreeMap::new(),
             },
         );
@@ -1469,6 +1628,7 @@ mod tests {
                 auth_profile: None,
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
+                resource_pools: Vec::new(),
                 attribute_mappings: BTreeMap::new(),
             },
         );

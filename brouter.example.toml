@@ -102,6 +102,15 @@ timeout_ms = 60000
 # enabled = true
 # catalog = true
 # account = false
+# Optional configured/user-managed budget pool. Live usage can be merged with
+# these totals/refill timestamps when provider account APIs expose partial data.
+# [[providers.openai.resource_pools]]
+# id = "monthly-api-budget"
+# scope = "provider"
+# kind = "monetary_credit"
+# unit = "usd"
+# total = 100.0
+# refill_at_ms = 1764547200000
 # Optional provider-level per-request estimated cost budget.
 # max_estimated_cost = 0.05
 

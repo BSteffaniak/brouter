@@ -131,7 +131,7 @@ All fields are optional floats:
 - `introspection` optional live introspection settings
 - `attribute_mappings` optional nested map from attribute name/value to provider request edits. Each mapping can add top-level `request_fields` or remove top-level `omit_request_fields`.
 
-Provider introspection is generic: adapters translate provider API responses into provider-neutral catalog/account snapshots. Current adapters fetch OpenAI-compatible `/models` metadata, including OpenRouter-style `context_length`, `pricing`, and `supported_parameters` when present, and Anthropic `/models` as a partial catalog. Missing fields continue through the generic resolver to user overrides and the fallback catalog.
+Provider introspection is generic: adapters translate provider API responses into provider-neutral catalog/account snapshots. Current adapters fetch OpenAI-compatible `/models` metadata, including OpenRouter-style `context_length`, `pricing`, and `supported_parameters` when present, OpenRouter-compatible `/auth/key` credit/account data, and Anthropic `/models` as a partial catalog. Missing fields continue through the generic resolver to user overrides and the fallback catalog.
 
 ```toml
 [providers.openrouter.introspection]
@@ -141,6 +141,20 @@ account = false
 ```
 
 Snapshots can be inspected with `GET /v1/brouter/introspection`.
+
+Configured resource pools can provide totals/refill timestamps when a live API only exposes usage, or can define entirely user-managed budgets:
+
+```toml
+[[providers.openai.resource_pools]]
+id = "monthly-api-budget"
+scope = "provider"
+kind = "monetary_credit"
+unit = "usd"
+total = 100.0
+refill_at_ms = 1764547200000
+```
+
+Supported pool kinds include `monetary_credit`, `subscription_allowance`, `token_budget`, `request_budget`, `rate_limit`, and `priority_allowance`. Supported units include `usd`, `tokens`, `requests`, `requests_per_minute`, `tokens_per_minute`, and `percent`.
 
 `openai-codex` expects brouter-owned sshenv keys such as
 `BROUTER_OPENAI_CODEX_ACCESS_TOKEN`, `BROUTER_OPENAI_CODEX_REFRESH_TOKEN`,

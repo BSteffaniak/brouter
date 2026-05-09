@@ -403,7 +403,50 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub introspection: ProviderIntrospectionConfig,
     #[serde(default)]
+    pub resource_pools: Vec<ResourcePoolConfig>,
+    #[serde(default)]
     pub attribute_mappings: BTreeMap<String, BTreeMap<String, AttributeRequestMapping>>,
+}
+
+/// Configured provider resource pool used with live account usage.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ResourcePoolConfig {
+    pub id: String,
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub unit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refill_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
+    #[serde(default)]
+    pub applies_to: ResourceSelectorConfig,
+}
+
+/// Configured resource selector.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourceSelectorConfig {
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub upstream_models: Vec<String>,
+    #[serde(default)]
+    pub providers: Vec<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub attributes: BTreeMap<String, String>,
 }
 
 /// Provider live introspection configuration.

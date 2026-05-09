@@ -1114,6 +1114,7 @@ mod tests {
                 auth_profile: None,
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
+                resource_pools: Vec::new(),
                 attribute_mappings: std::collections::BTreeMap::new(),
             },
         );
@@ -1152,6 +1153,7 @@ mod tests {
                 auth_profile: None,
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
+                resource_pools: Vec::new(),
                 attribute_mappings: std::collections::BTreeMap::new(),
             },
         );
@@ -1197,6 +1199,7 @@ mod tests {
                 auth_profile: None,
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
+                resource_pools: Vec::new(),
                 attribute_mappings: std::collections::BTreeMap::new(),
             },
         );
@@ -1251,6 +1254,7 @@ mod tests {
                 auth_profile: None,
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
+                resource_pools: Vec::new(),
                 attribute_mappings: std::collections::BTreeMap::new(),
             },
         );
