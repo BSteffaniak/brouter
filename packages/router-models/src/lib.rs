@@ -292,6 +292,12 @@ pub struct JudgeTrigger {
     pub rule_triggered: bool,
 }
 
+/// Returns true when the judge should fire based on trigger config, score gap, and rule match.
+#[must_use]
+pub fn should_fire_trigger(trigger: &JudgeTrigger, top_2_gap: f64, rule_triggered: bool) -> bool {
+    top_2_gap < trigger.score_gap_threshold || (trigger.rule_triggered && rule_triggered)
+}
+
 #[derive(Debug, Clone)]
 pub struct JudgeShortlistConfig {
     pub size: usize,

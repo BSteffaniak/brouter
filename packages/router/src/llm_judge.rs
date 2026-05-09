@@ -94,6 +94,7 @@ pub fn build_judge_prompt(
 }
 
 /// Parse the judge response and validate the model selection.
+#[allow(clippy::must_use_candidate)]
 pub fn parse_judge_response(
     raw: &str,
     shortlist: &[ScoredCandidate],

@@ -19,10 +19,11 @@ use axum::{Json, Router as AxumRouter};
 use brouter_api_models::{
     ChatCompletionRequest, EmbeddingsRequest, ErrorResponse, ModelListResponse, ModelObject,
 };
+use brouter_catalog_models::ResolvedModelMetadata;
 use brouter_catalog_models::{MetadataProvenance, MetadataSource};
 use brouter_config::{
-    ConfigError, context_policy, routeable_models_with_introspection, routing_profiles,
-    routing_rules, scoring_weights,
+    ConfigError, context_policy, llm_judge_config, routeable_models_with_introspection,
+    routing_profiles, routing_rules, scoring_weights,
 };
 use brouter_config_models::BrouterConfig;
 use brouter_introspection::{DynamicPolicyConfig, dynamic_policy_effects};
@@ -33,8 +34,13 @@ use brouter_introspection_models::{
 };
 use brouter_provider::{ProviderClient, ProviderRegistry};
 use brouter_provider_models::{ModelCapability, ModelId, ProviderId, RouteableModel};
-use brouter_router::{Router, RouterError};
-use brouter_router_models::{RoutingDecision, RoutingObjective, RoutingOptions};
+use brouter_router::{
+    DEFAULT_JUDGE_SYSTEM_PROMPT, Router, RouterError, build_judge_prompt, judge_request,
+    parse_judge_response, should_fire_trigger, top_2_score_gap,
+};
+use brouter_router_models::{
+    JudgeConfig, JudgeSessionContext, RoutingDecision, RoutingObjective, RoutingOptions,
+};
 use brouter_telemetry::{TelemetryError, TelemetryStore, now_millis};
 use brouter_telemetry_models::UsageEvent;
 use serde::{Deserialize, Serialize};
@@ -83,6 +89,7 @@ struct AppState {
     session_context_tokens: Arc<Mutex<BTreeMap<String, u32>>>,
     introspection_snapshots: Vec<IntrospectionSnapshot>,
     dynamic_policy_effects: Vec<DynamicPolicyEffect>,
+    llm_judge: Option<JudgeConfig>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -209,6 +216,7 @@ fn build_app_with_api_key_and_introspection(
         session_context_tokens: Arc::new(Mutex::new(BTreeMap::new())),
         introspection_snapshots,
         dynamic_policy_effects,
+        llm_judge: llm_judge_config(config),
     };
 
     let app = AxumRouter::new()
@@ -533,7 +541,7 @@ async fn metrics(
         .telemetry
         .events()
         .await
-        .map_err(|error| telemetry_error_response(&error))?;
+        .map_err(&|e| telemetry_error_response(&e))?;
     let summary = summarize_usage(&events);
     Ok(format!(
         "# TYPE brouter_requests_total counter\nbrouter_requests_total {}\n# TYPE brouter_request_success_total counter\nbrouter_request_success_total {}\n# TYPE brouter_estimated_cost_total counter\nbrouter_estimated_cost_total {}\n# TYPE brouter_latency_ms_sum counter\nbrouter_latency_ms_sum {}\n",
@@ -981,6 +989,27 @@ fn route_headers(
         fallback_used(attempted_model_id, decision),
     );
     insert_route_attribute_headers(&mut headers, model);
+    if let Some(reasoning) = &decision.reasoning {
+        insert_header(
+            &mut headers,
+            "x-brouter-reasoning-model",
+            reasoning.model_id.as_str(),
+        );
+        insert_header(
+            &mut headers,
+            "x-brouter-reasoning-rationale",
+            &reasoning.rationale,
+        );
+        insert_header(
+            &mut headers,
+            "x-brouter-reasoning-overridden",
+            if reasoning.overridden {
+                "true"
+            } else {
+                "false"
+            },
+        );
+    }
     headers
 }
 
@@ -1049,7 +1078,7 @@ async fn route_request(
             .telemetry
             .has_session(id)
             .await
-            .map_err(|error| telemetry_error_response(&error))?,
+            .map_err(&|e| telemetry_error_response(&e))?,
         None => false,
     };
     let is_first_message = !has_session;
@@ -1078,7 +1107,92 @@ async fn route_request(
             decision.features.required_context_tokens,
         );
     }
+    let decision = invoke_llm_judge(state, &decision)
+        .await
+        .map_err(&|e| router_error_response(&e))?
+        .unwrap_or(decision);
     Ok(decision)
+}
+
+async fn invoke_llm_judge(
+    state: &AppState,
+    decision: &RoutingDecision,
+) -> Result<Option<RoutingDecision>, RouterError> {
+    let Some(judge_config) = state.llm_judge.as_ref() else {
+        return Ok(None);
+    };
+    let rule_matched = decision.features.matched_rules.iter().any(|name| {
+        state
+            .router
+            .rules()
+            .iter()
+            .any(|r| &r.name == name && r.llm_judge)
+    });
+    let gap = top_2_score_gap(&decision.candidates);
+    let should_fire = should_fire_trigger(&judge_config.trigger, gap, rule_matched);
+    if !should_fire {
+        return Ok(None);
+    }
+    let judge_model_id = judge_config.model.clone();
+    let system_prompt = judge_config
+        .system_prompt
+        .as_deref()
+        .unwrap_or(DEFAULT_JUDGE_SYSTEM_PROMPT);
+    let session_context = build_judge_session_context(state);
+    let prompt_text = extract_prompt_text(&decision.features);
+    let user_prompt = build_judge_prompt(
+        &prompt_text,
+        &format!("{:?}", decision.features.intent),
+        decision.objective,
+        &decision.candidates[..decision.candidates.len().min(judge_config.shortlist.size)],
+        &session_context,
+    );
+    let judge_request = judge_request(judge_config, system_prompt, &user_prompt);
+    let judge_response = state
+        .provider_client
+        .chat_completions(
+            &state.providers,
+            &RouteableModel {
+                id: judge_model_id.clone(),
+                provider: judge_config
+                    .provider
+                    .clone()
+                    .unwrap_or_else(|| ProviderId::new("local")),
+                upstream_model: judge_model_id.to_string(),
+                context_window: 128_000,
+                input_cost_per_million: 0.0,
+                output_cost_per_million: 0.0,
+                quality: 50,
+                capabilities: vec![],
+                attributes: BTreeMap::new(),
+                display_badges: vec![],
+                metadata: ResolvedModelMetadata::default(),
+            },
+            &judge_request,
+        )
+        .await
+        .map_err(|e| RouterError::Judge {
+            source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
+        })?;
+    let raw_text = judge_response.body.to_string();
+    let reasoning = parse_judge_response(&raw_text, &decision.candidates, &judge_model_id);
+    let mut updated = decision.clone();
+    updated.reasoning = Some(reasoning);
+    if updated.reasoning.as_ref().is_some_and(|r| r.overridden) {
+        updated.selected_model = updated.reasoning.as_ref().unwrap().chosen_model.clone();
+    }
+    Ok(Some(updated))
+}
+
+fn build_judge_session_context(_state: &AppState) -> JudgeSessionContext {
+    JudgeSessionContext::default()
+}
+
+fn extract_prompt_text(features: &brouter_router_models::PromptFeatures) -> String {
+    format!(
+        "intent={:?}, reasoning={:?}",
+        features.intent, features.reasoning
+    )
 }
 
 fn group_models(state: &AppState, model: &str) -> Option<Vec<ModelId>> {

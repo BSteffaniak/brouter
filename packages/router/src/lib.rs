@@ -23,12 +23,22 @@ use thiserror::Error;
 #[allow(unused_imports)]
 pub use brouter_router_models::{
     JudgeConfig, JudgeOutput, JudgeSessionContext, JudgeShortlistConfig, JudgeTrigger,
-    RecentDecision,
+    RecentDecision, should_fire_trigger,
+};
+
+// Re-export llm_judge helpers for use by the server package.
+pub use llm_judge::{
+    DEFAULT_JUDGE_SYSTEM_PROMPT, build_judge_prompt, judge_request, parse_judge_response,
+    top_2_score_gap,
 };
 #[derive(Debug, Error)]
 pub enum RouterError {
     #[error("no configured model can satisfy the request")]
     NoCandidate,
+    #[error("LLM judge call failed: {source}")]
+    Judge {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 /// Deterministic prompt router.
@@ -108,6 +118,12 @@ impl Router {
     #[must_use]
     pub fn models(&self) -> &[RouteableModel] {
         &self.models
+    }
+
+    /// Returns configured routing rules.
+    #[must_use]
+    pub fn rules(&self) -> &[RoutingRule] {
+        &self.rules
     }
 
     /// Selects a model for a chat completion request.
