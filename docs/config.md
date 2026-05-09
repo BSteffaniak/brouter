@@ -24,8 +24,8 @@
 ## `[[router.rules]]`
 
 - `name` string
-- `when_contains` array of prompt substrings
-- `intent` optional string
+- `when_contains` array of substrings matched against the latest user message
+- `intent` optional string; detected from the latest user message, not system/developer context
 - `objective` optional routing objective
 - `prefer_capabilities` array
 - `require_capabilities` array

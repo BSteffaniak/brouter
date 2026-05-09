@@ -100,9 +100,15 @@ impl Router {
         is_first_message: bool,
         allowed_models: Option<&[brouter_provider_models::ModelId]>,
     ) -> Result<RoutingDecision, RouterError> {
-        let prompt = request_prompt_text(request);
-        let mut features = analyze_prompt(&prompt, request, is_first_message);
-        let objective = self.apply_rules(&prompt.to_lowercase(), &mut features);
+        let prompt_text = request_prompt_text(request);
+        let latest_user_text = request_latest_user_text(request);
+        let classification_text = latest_user_text
+            .as_deref()
+            .filter(|text| !text.is_empty())
+            .unwrap_or(prompt_text.as_str());
+        let mut features =
+            analyze_prompt_texts(classification_text, &prompt_text, request, is_first_message);
+        let objective = self.apply_rules(&classification_text.to_lowercase(), &mut features);
         let explicit_model = if allowed_models.is_none() && !is_auto_model(&request.model) {
             Some(vec![brouter_provider_models::ModelId::new(
                 request.model.clone(),
@@ -191,7 +197,13 @@ pub fn analyze_chat_request(
     request: &ChatCompletionRequest,
     is_first_message: bool,
 ) -> PromptFeatures {
-    analyze_prompt(&request_prompt_text(request), request, is_first_message)
+    let prompt_text = request_prompt_text(request);
+    let latest_user_text = request_latest_user_text(request);
+    let classification_text = latest_user_text
+        .as_deref()
+        .filter(|text| !text.is_empty())
+        .unwrap_or(prompt_text.as_str());
+    analyze_prompt_texts(classification_text, &prompt_text, request, is_first_message)
 }
 
 fn is_auto_model(model: &str) -> bool {
@@ -207,12 +219,22 @@ fn request_prompt_text(request: &ChatCompletionRequest) -> String {
         .join("\n")
 }
 
-fn analyze_prompt(
-    prompt: &str,
+fn request_latest_user_text(request: &ChatCompletionRequest) -> Option<String> {
+    request
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role.eq_ignore_ascii_case("user"))
+        .map(|message| message.content.as_text())
+}
+
+fn analyze_prompt_texts(
+    classification_prompt: &str,
+    token_prompt: &str,
     request: &ChatCompletionRequest,
     is_first_message: bool,
 ) -> PromptFeatures {
-    let lower_prompt = prompt.to_lowercase();
+    let lower_prompt = classification_prompt.to_lowercase();
     let intent = detect_intent(&lower_prompt);
     let reasoning = request.reasoning_effort.map_or_else(
         || detect_reasoning(&lower_prompt, intent, is_first_message),
@@ -233,7 +255,7 @@ fn analyze_prompt(
     PromptFeatures {
         intent,
         reasoning,
-        estimated_input_tokens: estimate_tokens(prompt),
+        estimated_input_tokens: estimate_tokens(token_prompt),
         required_capabilities,
         preferred_capabilities: Vec::new(),
         required_attributes: BTreeMap::new(),
@@ -575,16 +597,106 @@ mod tests {
         assert_eq!(decision.features.matched_rules, vec!["private-local"]);
     }
 
+    #[test]
+    fn latest_user_message_drives_intent_over_system_context() {
+        let router = Router::new_with_rules(
+            priority_lane_models(),
+            RoutingObjective::Balanced,
+            ScoringWeights::default(),
+            vec![RoutingRule {
+                name: "planning-priority".to_string(),
+                when_contains: Vec::new(),
+                intent: Some(PromptIntent::Planning),
+                objective: None,
+                prefer_capabilities: Vec::new(),
+                require_capabilities: Vec::new(),
+                prefer_attributes: BTreeMap::from([(
+                    "latency_class".to_string(),
+                    "priority".to_string(),
+                )]),
+                require_attributes: BTreeMap::new(),
+            }],
+        );
+
+        let decision = router
+            .route_chat(
+                &chat_request_with_system("plan debug architecture", "hello"),
+                true,
+            )
+            .expect("router should choose a model");
+
+        assert_eq!(decision.selected_model, ModelId::new("openai_max_strong"));
+        assert!(decision.features.matched_rules.is_empty());
+    }
+
+    #[test]
+    fn explicit_priority_trigger_can_prefer_priority_lane() {
+        let router = priority_trigger_router();
+
+        let decision = router
+            .route_chat(&chat_request("urgent please answer quickly"), true)
+            .expect("router should choose a model");
+
+        assert_eq!(
+            decision.selected_model,
+            ModelId::new("openai_max_strong_priority")
+        );
+        assert_eq!(decision.features.matched_rules, vec!["explicit-priority"]);
+    }
+
+    #[test]
+    fn explicit_priority_trigger_is_not_sticky_across_user_messages() {
+        let decision = priority_trigger_router()
+            .route_chat(
+                &chat_request_with_messages(vec![
+                    chat_message("user", "urgent please answer quickly"),
+                    chat_message("assistant", "ok"),
+                    chat_message("user", "hello"),
+                ]),
+                false,
+            )
+            .expect("router should choose a model");
+
+        assert_eq!(decision.selected_model, ModelId::new("openai_max_strong"));
+        assert!(decision.features.matched_rules.is_empty());
+    }
+
+    fn priority_trigger_router() -> Router {
+        Router::new_with_rules(
+            priority_lane_models(),
+            RoutingObjective::Balanced,
+            ScoringWeights::default(),
+            vec![RoutingRule {
+                name: "explicit-priority".to_string(),
+                when_contains: vec!["urgent".to_string()],
+                intent: None,
+                objective: None,
+                prefer_capabilities: Vec::new(),
+                require_capabilities: Vec::new(),
+                prefer_attributes: BTreeMap::from([(
+                    "latency_class".to_string(),
+                    "priority".to_string(),
+                )]),
+                require_attributes: BTreeMap::new(),
+            }],
+        )
+    }
+
     fn chat_request(prompt: &str) -> ChatCompletionRequest {
+        chat_request_with_messages(vec![chat_message("user", prompt)])
+    }
+
+    fn chat_request_with_system(system: &str, user: &str) -> ChatCompletionRequest {
+        chat_request_with_messages(vec![
+            chat_message("system", system),
+            chat_message("user", user),
+        ])
+    }
+
+    fn chat_request_with_messages(messages: Vec<ChatMessage>) -> ChatCompletionRequest {
         ChatCompletionRequest {
             model: "auto".to_string(),
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: MessageContent::Text(prompt.to_string()),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-            }],
+            messages,
             temperature: None,
             top_p: None,
             max_tokens: None,
@@ -596,6 +708,45 @@ mod tests {
             metadata: None,
             extra: std::collections::BTreeMap::new(),
         }
+    }
+
+    fn chat_message(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.to_string(),
+            content: MessageContent::Text(content.to_string()),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn priority_lane_models() -> Vec<RouteableModel> {
+        vec![
+            RouteableModel {
+                id: ModelId::new("openai_max_strong"),
+                provider: ProviderId::new("openai_max"),
+                upstream_model: "gpt-5.5".to_string(),
+                context_window: 1_050_000,
+                input_cost_per_million: 0.0,
+                output_cost_per_million: 0.0,
+                quality: 98,
+                capabilities: vec![ModelCapability::Chat, ModelCapability::Reasoning],
+                attributes: BTreeMap::from([("latency_class".to_string(), "standard".to_string())]),
+                display_badges: vec!["standard".to_string()],
+            },
+            RouteableModel {
+                id: ModelId::new("openai_max_strong_priority"),
+                provider: ProviderId::new("openai_max"),
+                upstream_model: "gpt-5.5".to_string(),
+                context_window: 1_050_000,
+                input_cost_per_million: 0.0,
+                output_cost_per_million: 0.0,
+                quality: 98,
+                capabilities: vec![ModelCapability::Chat, ModelCapability::Reasoning],
+                attributes: BTreeMap::from([("latency_class".to_string(), "priority".to_string())]),
+                display_badges: vec!["priority".to_string()],
+            },
+        ]
     }
 
     fn test_models() -> Vec<RouteableModel> {

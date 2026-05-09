@@ -42,6 +42,10 @@ require_capabilities = ["local"]
 name = "debug-code-reasoning"
 intent = "debugging"
 prefer_capabilities = ["reasoning"]
+
+[[router.rules]]
+name = "explicit-priority"
+when_contains = ["priority", "urgent", "asap", "low latency", "quick response"]
 prefer_attributes = { latency_class = "priority" }
 
 [telemetry]
