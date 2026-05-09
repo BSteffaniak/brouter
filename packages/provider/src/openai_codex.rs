@@ -9,11 +9,11 @@ use brouter_config_models::ProviderConfig;
 use brouter_provider_models::RouteableModel;
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
-use crate::{ProviderError, ProviderResponse, ProviderStreamResponse, raw_stream_response};
+use crate::{ProviderError, ProviderResponse, ProviderStreamResponse};
 
 const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -55,7 +55,7 @@ pub async fn chat_completions(
     if !(200..300).contains(&status) {
         return Ok(ProviderResponse {
             status,
-            body: serde_json::from_str(&text).unwrap_or(Value::String(text)),
+            body: codex_error_body(status, &text),
         });
     }
     Ok(ProviderResponse {
@@ -75,7 +75,7 @@ pub async fn chat_completions_response(
     let response = send_codex_request(http, provider, model, request, &auth).await?;
     let status = response.status().as_u16();
     if !response.status().is_success() {
-        return Ok(raw_stream_response(response));
+        return Ok(codex_error_stream_response(response).await);
     }
 
     let upstream = response.bytes_stream();
@@ -350,6 +350,7 @@ async fn send_codex_request(
         .post(OPENAI_CODEX_API_ENDPOINT)
         .bearer_auth(&auth.access_token)
         .header("OpenAI-Beta", "responses=experimental")
+        .header("originator", "brouter")
         .header("User-Agent", "brouter/0.1.0")
         .header("accept", "text/event-stream")
         .json(&body);
@@ -357,13 +358,41 @@ async fn send_codex_request(
         builder = builder.timeout(std::time::Duration::from_millis(timeout));
     }
     if let Some(account_id) = &auth.account_id {
-        builder = builder.header("chatgpt-account-id", account_id);
+        builder = builder.header("ChatGPT-Account-Id", account_id);
+    }
+    if let Some(session_id) = codex_session_id(request) {
+        builder = builder.header("session_id", session_id);
     }
     Ok(builder.send().await?)
 }
 
+#[derive(Debug, Serialize)]
+struct CodexResponsesRequest {
+    model: String,
+    instructions: String,
+    input: Vec<Value>,
+    stream: bool,
+    store: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<Value>,
+    tool_choice: &'static str,
+    parallel_tool_calls: bool,
+    text: CodexTextOptions,
+    include: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexTextOptions {
+    verbosity: &'static str,
+}
+
 fn codex_request_body(model: &RouteableModel, request: &ChatCompletionRequest) -> Value {
-    let instructions = system_instructions(request);
     let input = request
         .messages
         .iter()
@@ -375,22 +404,61 @@ fn codex_request_body(model: &RouteableModel, request: &ChatCompletionRequest) -
             .filter_map(openai_tool_to_responses_tool)
             .collect()
     });
-    json!({
-        "model": model.upstream_model,
-        "instructions": instructions,
-        "input": input,
-        "stream": true,
-        "store": false,
-        "tools": tools,
-        "tool_choice": "auto",
-        "parallel_tool_calls": true,
-        "text": {"verbosity": "low"},
-        "include": ["reasoning.encrypted_content"],
-        "prompt_cache_key": request.metadata.as_ref().and_then(|metadata| metadata.get("session_id")).and_then(Value::as_str),
-        "temperature": request.temperature,
-        "max_output_tokens": request.max_tokens,
-        "top_p": request.top_p,
-    })
+    let body = CodexResponsesRequest {
+        model: model.upstream_model.clone(),
+        instructions: codex_instructions(request),
+        input,
+        stream: true,
+        store: false,
+        tools,
+        tool_choice: "auto",
+        parallel_tool_calls: true,
+        text: CodexTextOptions { verbosity: "low" },
+        include: vec!["reasoning.encrypted_content"],
+        prompt_cache_key: codex_session_id(request),
+        temperature: request.temperature,
+        top_p: request.top_p,
+    };
+    serde_json::to_value(body).unwrap_or_else(|_| json!({}))
+}
+
+fn codex_session_id(request: &ChatCompletionRequest) -> Option<String> {
+    request
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("session_id"))
+        .and_then(Value::as_str)
+        .or_else(|| request.extra.get("session_id").and_then(Value::as_str))
+        .filter(|session_id| !session_id.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
+async fn codex_error_stream_response(response: reqwest::Response) -> ProviderStreamResponse {
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap_or_default();
+    let body =
+        serde_json::to_vec(&codex_error_body(status, &text)).unwrap_or_else(|_| text.into_bytes());
+    ProviderStreamResponse {
+        status,
+        stream: Box::pin(stream::once(async move { Ok(Bytes::from(body)) })),
+    }
+}
+
+fn codex_error_body(status: u16, text: &str) -> Value {
+    if text.trim().is_empty() {
+        return json!({
+            "error": {
+                "message": format!("ChatGPT/Codex upstream returned {status} with an empty body"),
+                "type": "upstream_error",
+                "code": status,
+            }
+        });
+    }
+    serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string()))
+}
+
+fn codex_instructions(request: &ChatCompletionRequest) -> String {
+    system_instructions(request).unwrap_or_else(|| "You are a helpful assistant.".to_string())
 }
 
 fn system_instructions(request: &ChatCompletionRequest) -> Option<String> {
