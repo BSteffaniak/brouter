@@ -514,6 +514,8 @@ pub struct ProviderConfig {
     pub resource_pools: Vec<ResourcePoolConfig>,
     #[serde(default)]
     pub attribute_mappings: BTreeMap<String, BTreeMap<String, AttributeRequestMapping>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub omit_request_fields: Vec<String>,
 }
 
 /// Configured provider resource pool used with live account usage.

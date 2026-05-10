@@ -242,6 +242,7 @@ fn insert_auto_provider(config: &mut BrouterConfig, provider_id: &str, preset: &
         introspection: ProviderIntrospectionConfig::default(),
         resource_pools: Vec::new(),
         attribute_mappings: std::collections::BTreeMap::new(),
+        omit_request_fields: Vec::new(),
     };
     apply_provider_preset(&mut provider, preset);
     config.providers.insert(provider_id.to_string(), provider);
@@ -1600,6 +1601,7 @@ mod tests {
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
                 attribute_mappings: std::collections::BTreeMap::new(),
+                omit_request_fields: Vec::new(),
             },
         );
         config.models.insert(
@@ -1640,6 +1642,7 @@ mod tests {
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
                 attribute_mappings: std::collections::BTreeMap::new(),
+                omit_request_fields: Vec::new(),
             },
         );
         config.models.insert(
@@ -1687,6 +1690,7 @@ mod tests {
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
                 attribute_mappings: std::collections::BTreeMap::new(),
+                omit_request_fields: Vec::new(),
             },
         );
         config.models.insert(
@@ -1743,6 +1747,7 @@ mod tests {
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
                 attribute_mappings: std::collections::BTreeMap::new(),
+                omit_request_fields: Vec::new(),
             },
         );
         config.models.insert(

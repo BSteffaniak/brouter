@@ -1797,6 +1797,7 @@ mod tests {
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
                 attribute_mappings: BTreeMap::new(),
+                omit_request_fields: Vec::new(),
             },
         );
         config.models.insert(
@@ -1835,6 +1836,7 @@ mod tests {
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
                 attribute_mappings: BTreeMap::new(),
+                omit_request_fields: Vec::new(),
             },
         );
         providers.insert(
@@ -1852,6 +1854,7 @@ mod tests {
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
                 attribute_mappings: BTreeMap::new(),
+                omit_request_fields: Vec::new(),
             },
         );
 

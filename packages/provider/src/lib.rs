@@ -561,6 +561,10 @@ fn openai_compatible_request_body(
         )
         | None => {}
     }
+    // Remove fields that this provider doesn't support.
+    for field_name in &provider.omit_request_fields {
+        object.remove(field_name);
+    }
     apply_attribute_mappings(provider, model, &mut body);
     body
 }
@@ -1235,6 +1239,7 @@ mod tests {
             introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
             resource_pools: Vec::new(),
             attribute_mappings: BTreeMap::new(),
+            omit_request_fields: Vec::new(),
         };
         let mut request = chat_request(false);
 
@@ -1550,6 +1555,7 @@ mod tests {
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
                 attribute_mappings: BTreeMap::new(),
+                omit_request_fields: Vec::new(),
             },
         );
         let mut models = BTreeMap::new();
@@ -1593,6 +1599,7 @@ mod tests {
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
                 attribute_mappings: BTreeMap::new(),
+                omit_request_fields: Vec::new(),
             },
         );
         let mut models = BTreeMap::new();
