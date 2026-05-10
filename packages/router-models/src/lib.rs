@@ -215,6 +215,7 @@ pub struct RoutingRule {
 pub struct PromptFeatures {
     pub intent: PromptIntent,
     pub reasoning: ReasoningLevel,
+    pub original_prompt: String,
     pub estimated_input_tokens: u32,
     pub estimated_output_tokens: u32,
     pub required_context_tokens: u32,

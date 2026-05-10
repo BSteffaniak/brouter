@@ -458,7 +458,7 @@ const fn default_llm_judge_structured() -> bool {
 }
 
 const fn default_llm_judge_max_tokens() -> u32 {
-    256
+    4096
 }
 
 const fn default_llm_judge_temperature() -> f64 {

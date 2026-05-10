@@ -4,7 +4,7 @@
 
 //! Command-line interface for brouter.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
@@ -30,7 +30,7 @@ use brouter_router::{
     DEFAULT_JUDGE_SYSTEM_PROMPT, build_judge_prompt, judge_request, parse_judge_response,
     should_fire_trigger, top_2_score_gap,
 };
-use brouter_router_models::{JudgeConfig, JudgeSessionContext, RoutingDecision, RoutingObjective};
+use brouter_router_models::{JudgeConfig, RoutingDecision, RoutingObjective, ScoredCandidate};
 use clap::{Parser, Subcommand};
 use rand::TryRngCore as _;
 use serde::Deserialize;
@@ -998,20 +998,6 @@ async fn maybe_invoke_judge(
         .system_prompt
         .as_deref()
         .unwrap_or(DEFAULT_JUDGE_SYSTEM_PROMPT);
-    let session_context = JudgeSessionContext::default();
-    let prompt_text = format!(
-        "intent={:?}, reasoning={:?}",
-        decision.features.intent, decision.features.reasoning
-    );
-    let user_prompt = build_judge_prompt(
-        &prompt_text,
-        &format!("{:?}", decision.features.intent),
-        decision.objective,
-        &decision.candidates[..decision.candidates.len().min(judge_config.shortlist.size)],
-        &session_context,
-    );
-    let judge_request = judge_request(judge_config, system_prompt, &user_prompt);
-
     // Build the list of candidate judge models from ALL configured models, grouped by
     // provider (judge model first, then others from same provider, then other providers).
     // Within each provider group, sort by quality ascending so cheaper/faster models are tried first.
@@ -1054,10 +1040,15 @@ async fn maybe_invoke_judge(
     }
 
     // Try each judge model in fallback order until one succeeds.
+    // Track failed judge providers so we can filter them from candidate shortlist.
     let registry = ProviderRegistry::from_config(config);
     let client = ProviderClient::new();
     let mut raw_text = String::new();
     let mut used_judge_id = judge_model_id;
+    let mut failed_judge_providers: BTreeSet<ProviderId> = BTreeSet::new();
+
+    // Start with all candidates - will be filtered as judge providers fail.
+    let mut active_candidates: Vec<_> = decision.candidates.clone();
 
     for candidate_id in &judge_model_ids {
         debug!(
@@ -1080,9 +1071,30 @@ async fn maybe_invoke_judge(
                 |m| (m.upstream_model.clone(), m.provider.clone()),
             );
 
+        // Skip judge providers that have already failed (don't retry).
+        if failed_judge_providers.contains(&provider_id) {
+            debug!(
+                model_id = %candidate_id,
+                provider = %provider_id,
+                "skipping judge model (provider already failed)"
+            );
+            continue;
+        }
+
+        // Build fresh judge request with current filtered candidates.
+        let session_context = brouter_router_models::JudgeSessionContext::default();
+        let judge_user_prompt = build_judge_prompt(
+            &decision.features.original_prompt,
+            &format!("{:?}", decision.features.intent),
+            decision.objective,
+            &active_candidates,
+            &session_context,
+        );
+        let judge_req = judge_request(judge_config, system_prompt, &judge_user_prompt);
+
         let judge_model = RouteableModel {
             id: candidate_id.clone(),
-            provider: provider_id,
+            provider: provider_id.clone(),
             upstream_model,
             context_window: 128_000,
             input_cost_per_million: 0.0,
@@ -1095,7 +1107,7 @@ async fn maybe_invoke_judge(
         };
 
         match client
-            .chat_completions(&registry, &judge_model, &judge_request)
+            .chat_completions(&registry, &judge_model, &judge_req)
             .await
         {
             Ok(response) => {
@@ -1104,9 +1116,15 @@ async fn maybe_invoke_judge(
                 if !body.trim_start().starts_with('{') {
                     tracing_warn!(
                         model_id = %candidate_id,
+                        provider = %provider_id,
                         bytes = body.len(),
                         sample = %body.trim().chars().take(300).collect::<String>(),
                         "judge returned non-JSON"
+                    );
+                    failed_judge_providers.insert(provider_id.clone());
+                    filter_candidates_by_failed_providers(
+                        &mut active_candidates,
+                        &failed_judge_providers,
                     );
                     continue;
                 }
@@ -1114,20 +1132,33 @@ async fn maybe_invoke_judge(
                 if let Some(err_msg) = extract_api_error(&body) {
                     tracing_warn!(
                         model_id = %candidate_id,
+                        provider = %provider_id,
                         error = %err_msg,
                         response = %body.trim().chars().take(500).collect::<String>(),
                         "judge API error"
                     );
+                    failed_judge_providers.insert(provider_id.clone());
+                    filter_candidates_by_failed_providers(
+                        &mut active_candidates,
+                        &failed_judge_providers,
+                    );
                     continue;
                 }
-                // Validate response is actually parseable as judge JSON
-                let parsed_result = parse_judge_response(&body, &decision.candidates, candidate_id);
+                // Validate response is actually parseable as judge JSON.
+                // Use active candidates (filtered by healthy providers).
+                let parsed_result = parse_judge_response(&body, &active_candidates, candidate_id);
                 if let Some(err) = &parsed_result.error {
                     tracing_warn!(
                         model_id = %candidate_id,
+                        provider = %provider_id,
                         parse_error = %err,
                         sample = %body.trim().chars().take(500).collect::<String>(),
                         "judge parse failure"
+                    );
+                    failed_judge_providers.insert(provider_id.clone());
+                    filter_candidates_by_failed_providers(
+                        &mut active_candidates,
+                        &failed_judge_providers,
                     );
                     continue;
                 }
@@ -1140,19 +1171,25 @@ async fn maybe_invoke_judge(
             Err(e) => {
                 tracing_warn!(
                     model_id = %candidate_id,
+                    provider = %provider_id,
                     error = %e,
                     "judge unavailable"
+                );
+                failed_judge_providers.insert(provider_id.clone());
+                filter_candidates_by_failed_providers(
+                    &mut active_candidates,
+                    &failed_judge_providers,
                 );
             }
         }
     }
 
+    // Final validation using filtered candidates (judge was prompted with active models).
     let reasoning = if raw_text.is_empty() {
         tracing_warn!("all judge models failed, using original decision");
         return Ok(decision.clone());
     } else {
-        // raw_text is already validated JSON from loop
-        parse_judge_response(&raw_text, &decision.candidates, used_judge_id)
+        parse_judge_response(&raw_text, &active_candidates, used_judge_id)
     };
     let mut updated = decision.clone();
     updated.reasoning = Some(reasoning);
@@ -1160,6 +1197,17 @@ async fn maybe_invoke_judge(
         updated.selected_model = updated.reasoning.as_ref().unwrap().chosen_model.clone();
     }
     Ok(updated)
+}
+
+/// Filters candidates by removing any whose provider is in the failed set.
+fn filter_candidates_by_failed_providers(
+    candidates: &mut Vec<ScoredCandidate>,
+    failed_providers: &BTreeSet<ProviderId>,
+) {
+    candidates.retain(|c| {
+        let provider_id = ProviderId::new(&c.provider);
+        !failed_providers.contains(&provider_id)
+    });
 }
 
 /// Returns the API error message from a judge response if it looks like an API error.

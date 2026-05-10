@@ -383,6 +383,7 @@ fn analyze_prompt_texts(
     PromptFeatures {
         intent,
         reasoning,
+        original_prompt: token_prompt.to_string(),
         estimated_input_tokens,
         estimated_output_tokens,
         required_context_tokens: estimated_input_tokens.saturating_add(estimated_output_tokens),

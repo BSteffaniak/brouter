@@ -24,6 +24,7 @@ Your role: given the original prompt, a ranked shortlist of model candidates, an
 Rules:
 - You may only select from the provided shortlist. Do not invent or assume models.
 - The deterministic scores are a strong signal, not a constraint. Use your judgment.
+- CRITICAL: Do NOT use internal reasoning, chain-of-thought, or thinking blocks. Output JSON directly.
 - Keep your explanation concise.
 
 Output format (JSON, no additional text):
@@ -62,7 +63,7 @@ struct OpenAiChoice {
 #[derive(Debug, Deserialize)]
 struct OpenAiMessage {
     content: Option<String>,
-    #[serde(default)]
+    #[serde(alias = "reasoning_content", default)]
     reasoning: Option<String>,
 }
 
@@ -72,17 +73,34 @@ pub fn normalize_judge_response(raw: &str) -> String {
     let trimmed = raw.trim();
 
     // Try to parse as OpenAI wrapped format (see OpenAiResponse struct).
-    if let Ok(response) = serde_json::from_str::<OpenAiResponse>(trimmed) {
-        let content = response
-            .choices
-            .first()
-            .and_then(|c| c.message.content.as_ref());
-        if let Some(inner) = content {
-            let content_str = inner.trim();
-            if content_str.starts_with('{')
+    if let Ok(response) = serde_json::from_str::<OpenAiResponse>(trimmed)
+        && let Some(choice) = response.choices.first()
+    {
+        // First try content field (normal response)
+        if let Some(content) = choice.message.content.as_ref() {
+            let content_str = content.trim();
+            if !content_str.is_empty()
+                && content_str.starts_with('{')
                 && serde_json::from_str::<serde_json::Value>(content_str).is_ok()
             {
                 return content_str.to_string();
+            }
+        }
+        // Fallback: try reasoning field (some models put thinking here)
+        if let Some(reasoning) = choice.message.reasoning.as_ref() {
+            let reasoning_str = reasoning.trim();
+            // Try to extract JSON from the reasoning text
+            if let Some(json_start) = reasoning_str.find('{') {
+                let potential_json = &reasoning_str[json_start..];
+                if serde_json::from_str::<serde_json::Value>(potential_json).is_ok() {
+                    // Extract just the JSON portion
+                    if let Some(json_end) = potential_json.find('}') {
+                        let json_only = &potential_json[..=json_end];
+                        if serde_json::from_str::<JudgeResponse>(json_only).is_ok() {
+                            return json_only.to_string();
+                        }
+                    }
+                }
             }
         }
     }
@@ -163,7 +181,9 @@ pub fn parse_judge_response(
     match parsed {
         Ok(response) => {
             let raw_model = response.selected_model;
-            let chosen_id = ModelId::new(raw_model.clone());
+            // Try to normalize the model name to match shortlist
+            let chosen_id = find_matching_candidate(&raw_model, shortlist)
+                .unwrap_or_else(|| ModelId::new(raw_model.clone()));
             let top_pick = shortlist.first().map(|c| c.model_id.clone());
             let overridden = top_pick.as_ref().is_some_and(|top| top != &chosen_id);
             let valid = shortlist.iter().any(|c| c.model_id == chosen_id);
@@ -208,6 +228,47 @@ pub fn parse_judge_response(
     }
 }
 
+/// Attempts to find a matching candidate from the shortlist for the given model name.
+/// Handles provider-prefixed model names (e.g., "anthropic/claude-3-opus-v1")
+/// and tries to match against known shortlist models.
+fn find_matching_candidate(model_name: &str, shortlist: &[ScoredCandidate]) -> Option<ModelId> {
+    // 1. Try exact match
+    let exact = ModelId::new(model_name);
+    if shortlist.iter().any(|c| c.model_id == exact) {
+        return Some(exact);
+    }
+
+    // 2. Try stripping provider prefix (e.g., "anthropic/claude-3-opus" -> "claude-3-opus")
+    if let Some(slash_pos) = model_name.find('/') {
+        let stripped = ModelId::new(&model_name[slash_pos + 1..]);
+        if shortlist.iter().any(|c| c.model_id == stripped) {
+            return Some(stripped);
+        }
+    }
+
+    // 3. Try stripping version suffixes (e.g., "claude-3-opus-20240229" -> "claude-3-opus")
+    let stripped = model_name
+        .split('-')
+        .take(3) // e.g., claude-3-opus
+        .collect::<Vec<_>>()
+        .join("-");
+    let stripped_id = ModelId::new(&stripped);
+    if shortlist.iter().any(|c| c.model_id == stripped_id) {
+        return Some(stripped_id);
+    }
+
+    // 4. Try matching just the base model name
+    for candidate in shortlist {
+        let cand_str = candidate.model_id.as_str();
+        // Check if candidate contains the model_name as a substring
+        if cand_str.contains(model_name) || model_name.contains(cand_str) {
+            return Some(candidate.model_id.clone());
+        }
+    }
+
+    None
+}
+
 /// Build a chat completion request for the judge model.
 #[must_use]
 pub fn judge_request(
@@ -233,8 +294,6 @@ pub fn judge_request(
                 tool_call_id: None,
             },
         ],
-        // Omit temperature if it would be 0.0 to avoid issues with providers that don't support it.
-        // Omit temperature if 0.0 to avoid issues with providers that don't support it.
         temperature: (config.output.temperature > 0.0).then_some(config.output.temperature),
         top_p: None,
         max_tokens: Some(config.output.max_tokens),
