@@ -142,6 +142,8 @@ pub fn apply_default_config(config: &mut BrouterConfig) {
     apply_provider_presets(config);
     apply_env_provider_autodetection(config);
     apply_default_dynamic_policy(config);
+    // Apply auto-detected omit_request_fields after presets and manual configs
+    apply_default_omit_request_fields(config);
 }
 
 fn apply_provider_presets(config: &mut BrouterConfig) {
@@ -202,6 +204,17 @@ fn apply_provider_preset(provider: &mut ProviderConfig, preset: &str) {
             provider.introspection.enabled = true;
             provider.introspection.catalog = true;
         }
+        "deepseek" => {
+            provider.kind = ProviderKind::OpenAiCompatible;
+            provider
+                .base_url
+                .get_or_insert_with(|| "https://api.deepseek.com/v1".to_string());
+            provider
+                .api_key_env
+                .get_or_insert_with(|| "DEEPSEEK_API_KEY".to_string());
+            provider.introspection.enabled = true;
+            provider.introspection.catalog = true;
+        }
         _ => {}
     }
 }
@@ -219,6 +232,9 @@ fn apply_env_provider_autodetection(config: &mut BrouterConfig) {
     }
     if std::env::var_os("OLLAMA_HOST").is_some() {
         added_provider |= insert_auto_provider(config, "ollama", "ollama");
+    }
+    if std::env::var_os("DEEPSEEK_API_KEY").is_some() {
+        added_provider |= insert_auto_provider(config, "deepseek", "deepseek");
     }
     if added_provider {
         config.router.metadata.refresh_on_startup = true;
@@ -247,6 +263,35 @@ fn insert_auto_provider(config: &mut BrouterConfig, provider_id: &str, preset: &
     apply_provider_preset(&mut provider, preset);
     config.providers.insert(provider_id.to_string(), provider);
     true
+}
+
+/// Returns default `omit_request_fields` based on provider `kind` and `base_url`.
+/// This is the auto-detection layer - only applied if manual config is empty.
+fn default_omit_request_fields(_kind: ProviderKind, base_url: Option<&str>) -> Vec<String> {
+    // DeepSeek: requires omitting reasoning_effort and thinking
+    // Their API errors if these fields are sent without proper handling
+    if let Some(url) = base_url {
+        let url_lower = url.to_lowercase();
+        if url_lower.contains("deepseek.com") || url_lower.contains("deepseekai") {
+            return vec!["reasoning_effort".to_string(), "thinking".to_string()];
+        }
+    }
+    // Add more provider-specific auto-detection here as needed
+    Vec::new()
+}
+
+/// Applies auto-detected `omit_request_fields` for providers that don't have manual config.
+/// Priority: Attribute-level > Provider-level Manual > Provider-level Auto-detected
+fn apply_default_omit_request_fields(config: &mut BrouterConfig) {
+    for provider in config.providers.values_mut() {
+        // Only auto-detect if manual config is empty
+        if provider.omit_request_fields.is_empty() {
+            let detected = default_omit_request_fields(provider.kind, provider.base_url.as_deref());
+            if !detected.is_empty() {
+                provider.omit_request_fields = detected;
+            }
+        }
+    }
 }
 
 fn apply_default_dynamic_policy(config: &mut BrouterConfig) {

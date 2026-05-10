@@ -147,6 +147,12 @@ timeout_ms = 60000
 #
 # [providers.openai_max.attribute_mappings.latency_class.standard]
 # omit_request_fields = ["service_tier"]
+#
+# Provider-level omit_request_fields removes fields from ALL requests to this provider.
+# This is useful for providers that error on certain fields (e.g., reasoning_effort).
+# Manual config here takes priority over auto-detected defaults.
+# [providers.deepseek]
+# omit_request_fields = ["reasoning_effort", "thinking"]
 
 [models.fast_local]
 provider = "ollama"
