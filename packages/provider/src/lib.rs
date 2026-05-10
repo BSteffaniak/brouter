@@ -312,9 +312,11 @@ impl ProviderClient {
             builder = builder.timeout(timeout);
         }
         if let Some(api_key_env) = &provider.api_key_env {
-            let api_key = std::env::var(api_key_env).map_err(|_| ProviderError::MissingApiKey {
-                env_var: api_key_env.clone(),
-                provider_id: provider_id.to_string(),
+            let api_key = resolve_api_key_from_provider(provider, api_key_env).map_err(|e| {
+                ProviderError::Auth {
+                    provider_id: provider_id.to_string(),
+                    message: e,
+                }
             })?;
             builder = match auth_header {
                 AuthHeader::Bearer => builder.bearer_auth(api_key),
@@ -354,9 +356,11 @@ impl ProviderClient {
             builder = builder.timeout(timeout);
         }
         if let Some(api_key_env) = &provider.api_key_env {
-            let api_key = std::env::var(api_key_env).map_err(|_| ProviderError::MissingApiKey {
-                env_var: api_key_env.clone(),
-                provider_id: provider_id.to_string(),
+            let api_key = resolve_api_key_from_provider(provider, api_key_env).map_err(|e| {
+                ProviderError::Auth {
+                    provider_id: provider_id.to_string(),
+                    message: e,
+                }
             })?;
             builder = builder.header("x-api-key", api_key);
         }
@@ -404,9 +408,11 @@ impl ProviderClient {
             request_builder = request_builder.timeout(timeout);
         }
         if let Some(api_key_env) = &provider.api_key_env {
-            let api_key = std::env::var(api_key_env).map_err(|_| ProviderError::MissingApiKey {
-                env_var: api_key_env.clone(),
-                provider_id: model.provider.to_string(),
+            let api_key = resolve_api_key_from_provider(provider, api_key_env).map_err(|e| {
+                ProviderError::Auth {
+                    provider_id: model.provider.to_string(),
+                    message: e,
+                }
             })?;
             request_builder = request_builder.header("x-api-key", api_key);
         }
@@ -445,9 +451,11 @@ impl ProviderClient {
             request_builder = request_builder.timeout(timeout);
         }
         if let Some(api_key_env) = &provider.api_key_env {
-            let api_key = std::env::var(api_key_env).map_err(|_| ProviderError::MissingApiKey {
-                env_var: api_key_env.clone(),
-                provider_id: model.provider.to_string(),
+            let api_key = resolve_api_key_from_provider(provider, api_key_env).map_err(|e| {
+                ProviderError::Auth {
+                    provider_id: model.provider.to_string(),
+                    message: e,
+                }
             })?;
             request_builder = request_builder.header("x-api-key", api_key);
         }
@@ -475,9 +483,11 @@ impl ProviderClient {
             request_builder = request_builder.timeout(timeout);
         }
         if let Some(api_key_env) = &provider.api_key_env {
-            let api_key = std::env::var(api_key_env).map_err(|_| ProviderError::MissingApiKey {
-                env_var: api_key_env.clone(),
-                provider_id: model.provider.to_string(),
+            let api_key = resolve_api_key_from_provider(provider, api_key_env).map_err(|e| {
+                ProviderError::Auth {
+                    provider_id: model.provider.to_string(),
+                    message: e,
+                }
             })?;
             request_builder = request_builder.bearer_auth(api_key);
         }
@@ -507,9 +517,11 @@ impl ProviderClient {
             request_builder = request_builder.timeout(timeout);
         }
         if let Some(api_key_env) = &provider.api_key_env {
-            let api_key = std::env::var(api_key_env).map_err(|_| ProviderError::MissingApiKey {
-                env_var: api_key_env.clone(),
-                provider_id: model.provider.to_string(),
+            let api_key = resolve_api_key_from_provider(provider, api_key_env).map_err(|e| {
+                ProviderError::Auth {
+                    provider_id: model.provider.to_string(),
+                    message: e,
+                }
             })?;
             request_builder = request_builder.bearer_auth(api_key);
         }
@@ -1081,6 +1093,75 @@ fn anthropic_response_to_openai(response: &Value, model: &RouteableModel) -> Val
                 + usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
         }
     })
+}
+
+/// Resolves an API key from the provider configuration.
+/// First checks for an environment variable, then falls back to sshenv vault.
+fn resolve_api_key_from_provider(
+    provider: &ProviderConfig,
+    env_var: &str,
+) -> Result<String, String> {
+    // First try environment variable.
+    if let Ok(api_key) = std::env::var(env_var) {
+        return Ok(api_key);
+    }
+
+    // Fall back to sshenv vault if auth_backend is "sshenv".
+    if provider.auth_backend.as_deref().unwrap_or("sshenv") == "sshenv" {
+        let profile = provider.auth_profile.as_ref().ok_or_else(|| {
+            "provider has sshenv auth_backend but no auth_profile set".to_string()
+        })?;
+        let vault = provider
+            .auth_vault_path
+            .as_ref()
+            .map_or_else(default_provider_auth_vault_path, |path| {
+                expand_tilde_path(path)
+            });
+        let vault_display = vault.display().to_string();
+        let store = sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(&vault));
+        let values = store
+            .get_profile(profile)
+            .map_err(|e| format!("failed to read sshenv auth profile {profile}: {e}"))?
+            .ok_or_else(|| {
+                format!("sshenv auth profile {profile} was not found in {vault_display}")
+            })?;
+
+        // Try with BROUTER_ prefix first, then without.
+        let prefixed_key = format!("BROUTER_{env_var}");
+        if let Some(value) = values.get(&prefixed_key) {
+            return Ok(value.to_string());
+        }
+        if let Some(value) = values.get(env_var) {
+            return Ok(value.to_string());
+        }
+
+        return Err(format!(
+            "sshenv auth profile {profile} does not contain {env_var}"
+        ));
+    }
+
+    Err(format!(
+        "environment variable {env_var} is not set and no sshenv fallback configured"
+    ))
+}
+
+#[allow(clippy::or_fun_call, clippy::unnecessary_fallible_conversions)]
+fn default_provider_auth_vault_path() -> std::path::PathBuf {
+    let default = {
+        let home = std::env::var("HOME").unwrap_or_default();
+        std::path::PathBuf::from(home).join(".local/state/brouter/auth/vault")
+    };
+    std::env::var("BROUTER_AUTH_VAULT").map_or(default, std::path::PathBuf::from)
+}
+
+#[allow(clippy::option_if_let_else)]
+fn expand_tilde_path(path: &str) -> std::path::PathBuf {
+    if let Some(stripped) = path.strip_prefix("~/") {
+        let home = std::env::var("HOME").unwrap_or_default();
+        std::path::PathBuf::from(home).join(stripped)
+    } else {
+        std::path::PathBuf::from(path)
+    }
 }
 
 #[cfg(test)]

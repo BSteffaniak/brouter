@@ -35,6 +35,7 @@ use clap::{Parser, Subcommand};
 use rand::TryRngCore as _;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
+use tracing::{debug, info, warn as tracing_warn};
 use zeroize::Zeroizing;
 
 /// Runs the brouter command-line interface.
@@ -47,7 +48,7 @@ pub async fn run_cli() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { config } => serve(config.as_deref()).await,
+        Command::Serve { config, port } => serve(config.as_deref(), port).await,
         Command::CheckConfig {
             config,
             strict,
@@ -98,19 +99,20 @@ fn resolve_and_load(config: Option<&Path>) -> Result<BrouterConfig> {
 
 /// Runs brouter with the configuration at the resolved path, or with a
 /// default configuration if no config file is found.
-async fn serve(config: Option<&Path>) -> Result<()> {
-    match resolve_config_path(config) {
-        Ok(path) => {
-            let config = load_config(&path)?;
-            brouter_server::serve(config).await?;
-        }
+async fn serve(config: Option<&Path>, port_override: Option<u16>) -> Result<()> {
+    let mut config = match resolve_config_path(config) {
+        Ok(path) => load_config(&path)?,
         Err(brouter_config::ConfigError::ConfigPathNotFound { .. }) => {
             let mut config = BrouterConfig::default();
             apply_default_config(&mut config);
-            brouter_server::serve(config).await?;
+            config
         }
         Err(e) => return Err(e.into()),
+    };
+    if let Some(port) = port_override {
+        config.server.port = port;
     }
+    brouter_server::serve(config).await?;
     Ok(())
 }
 
@@ -246,6 +248,14 @@ async fn auth(command: AuthCommand) -> Result<()> {
                 api_key,
             } => login_openrouter(profile, vault, recipient_key, api_key),
         },
+        AuthCommand::OpencodeZen { command } => match command {
+            OpencodeZenAuthCommand::Login {
+                profile,
+                vault,
+                recipient_key,
+                api_key,
+            } => login_opencode_zen(profile, vault, recipient_key, api_key),
+        },
         AuthCommand::Openaicom { command } => match command {
             OpenaicomAuthCommand::Login {
                 profile,
@@ -325,6 +335,23 @@ fn login_openrouter(
     set_auth_secret(&store, &profile, "OPENROUTER_API_KEY", api_key)?;
     println!(
         "OpenRouter API key saved to profile {profile} in {}",
+        vault.display()
+    );
+    Ok(())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn login_opencode_zen(
+    profile: String,
+    vault: PathBuf,
+    recipient_key: Option<String>,
+    api_key: Option<String>,
+) -> Result<()> {
+    let api_key = resolve_api_key(api_key, "OPENCODE_API_KEY", "OpenCode Zen")?;
+    let store = open_auth_store(&vault, recipient_key)?;
+    set_auth_secret(&store, &profile, "OPENCODE_API_KEY", api_key)?;
+    println!(
+        "OpenCode Zen API key saved to profile {profile} in {}",
         vault.display()
     );
     Ok(())
@@ -985,32 +1012,46 @@ async fn maybe_invoke_judge(
     );
     let judge_request = judge_request(judge_config, system_prompt, &user_prompt);
 
-    // Build the list of candidate judge models, in fallback order:
-    // 1. The configured primary judge model
-    // 2. Other models from the same provider (to avoid propagating provider failures)
-    // 3. Models from other providers
+    // Build the list of candidate judge models from ALL configured models, grouped by
+    // provider (judge model first, then others from same provider, then other providers).
+    // Within each provider group, sort by quality ascending so cheaper/faster models are tried first.
     let models = routeable_models(config);
     let primary_provider = judge_config.provider.clone();
-    let judge_model_ids: Vec<ModelId> = std::iter::once(judge_model_id.clone())
-        .chain(
-            models
+    let mut judge_model_ids: Vec<ModelId> = vec![judge_model_id.clone()];
+    // Collect remaining models grouped by provider, sorted by quality ascending (cheapest first).
+    let mut by_provider: std::collections::BTreeMap<String, Vec<ModelId>> =
+        std::collections::BTreeMap::new();
+    for m in models.iter().filter(|m| &m.id != judge_model_id) {
+        by_provider
+            .entry(m.provider.to_string())
+            .or_default()
+            .push(m.id.clone());
+    }
+    // Sort each provider group by quality ascending (lower quality = cheaper/faster).
+    for ids in by_provider.values_mut() {
+        ids.sort_by(|a_id, b_id| {
+            let a_quality = models
                 .iter()
-                .filter(|m| {
-                    &m.id != judge_model_id
-                        && primary_provider.as_ref().is_some_and(|p| &m.provider == p)
-                })
-                .map(|m| m.id.clone()),
-        )
-        .chain(
-            models
+                .find(|m| &m.id == a_id)
+                .map_or(0.0, |m| f64::from(m.quality));
+            let b_quality = models
                 .iter()
-                .filter(|m| {
-                    &m.id != judge_model_id
-                        && primary_provider.as_ref().is_some_and(|p| &m.provider != p)
-                })
-                .map(|m| m.id.clone()),
-        )
-        .collect();
+                .find(|m| &m.id == b_id)
+                .map_or(0.0, |m| f64::from(m.quality));
+            a_quality
+                .partial_cmp(&b_quality)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    // Append same-provider models first (to avoid propagating provider failures), then other providers.
+    if let Some(pp) = &primary_provider
+        && let Some(same) = by_provider.remove(&pp.to_string())
+    {
+        judge_model_ids.extend(same);
+    }
+    for (_, ids) in by_provider {
+        judge_model_ids.extend(ids);
+    }
 
     // Try each judge model in fallback order until one succeeds.
     let registry = ProviderRegistry::from_config(config);
@@ -1019,48 +1060,98 @@ async fn maybe_invoke_judge(
     let mut used_judge_id = judge_model_id;
 
     for candidate_id in &judge_model_ids {
-        let judge_model = models
-            .iter()
-            .find(|m| &m.id == candidate_id)
-            .cloned()
-            .unwrap_or_else(|| RouteableModel {
-                id: candidate_id.clone(),
-                provider: judge_config
-                    .provider
-                    .clone()
-                    .unwrap_or_else(|| ProviderId::new("local")),
-                upstream_model: candidate_id.to_string(),
-                context_window: 128_000,
-                input_cost_per_million: 0.0,
-                output_cost_per_million: 0.0,
-                quality: 50,
-                capabilities: vec![],
-                attributes: BTreeMap::new(),
-                display_badges: vec![],
-                metadata: ResolvedModelMetadata::default(),
-            });
+        debug!(
+            model_id = %candidate_id,
+            "trying judge model"
+        );
+
+        // Look up the actual model config to get the correct provider.
+        let (upstream_model, provider_id) =
+            models.iter().find(|m| &m.id == candidate_id).map_or_else(
+                || {
+                    (
+                        candidate_id.to_string(),
+                        judge_config
+                            .provider
+                            .clone()
+                            .unwrap_or_else(|| ProviderId::new("local")),
+                    )
+                },
+                |m| (m.upstream_model.clone(), m.provider.clone()),
+            );
+
+        let judge_model = RouteableModel {
+            id: candidate_id.clone(),
+            provider: provider_id,
+            upstream_model,
+            context_window: 128_000,
+            input_cost_per_million: 0.0,
+            output_cost_per_million: 0.0,
+            quality: 50,
+            capabilities: vec![],
+            attributes: BTreeMap::new(),
+            display_badges: vec![],
+            metadata: ResolvedModelMetadata::default(),
+        };
 
         match client
             .chat_completions(&registry, &judge_model, &judge_request)
             .await
         {
             Ok(response) => {
-                raw_text = response.body.to_string();
+                let body = response.body.to_string();
+                // Skip non-JSON responses (e.g. HTML error pages)
+                if !body.trim_start().starts_with('{') {
+                    tracing_warn!(
+                        model_id = %candidate_id,
+                        bytes = body.len(),
+                        sample = %body.trim().chars().take(300).collect::<String>(),
+                        "judge returned non-JSON"
+                    );
+                    continue;
+                }
+                // Skip JSON error responses (e.g. usage limit reached)
+                if let Some(err_msg) = extract_api_error(&body) {
+                    tracing_warn!(
+                        model_id = %candidate_id,
+                        error = %err_msg,
+                        response = %body.trim().chars().take(500).collect::<String>(),
+                        "judge API error"
+                    );
+                    continue;
+                }
+                // Validate response is actually parseable as judge JSON
+                let parsed_result = parse_judge_response(&body, &decision.candidates, candidate_id);
+                if let Some(err) = &parsed_result.error {
+                    tracing_warn!(
+                        model_id = %candidate_id,
+                        parse_error = %err,
+                        sample = %body.trim().chars().take(500).collect::<String>(),
+                        "judge parse failure"
+                    );
+                    continue;
+                }
+                // Accept this valid response
+                info!(model_id = %candidate_id, "judge succeeded");
+                raw_text = body;
                 used_judge_id = candidate_id;
                 break;
             }
             Err(e) => {
-                eprintln!("judge model unavailable ({candidate_id}), trying fallback: {e}");
+                tracing_warn!(
+                    model_id = %candidate_id,
+                    error = %e,
+                    "judge unavailable"
+                );
             }
         }
     }
 
-    let reasoning = if let Some(error_msg) = extract_api_error(&raw_text) {
-        // API returned an error response (e.g., usage limit). Return the original decision
-        // without LLM judge reasoning.
-        eprintln!("judge API error, preserving original decision: {error_msg}");
+    let reasoning = if raw_text.is_empty() {
+        tracing_warn!("all judge models failed, using original decision");
         return Ok(decision.clone());
     } else {
+        // raw_text is already validated JSON from loop
         parse_judge_response(&raw_text, &decision.candidates, used_judge_id)
     };
     let mut updated = decision.clone();
@@ -1136,6 +1227,11 @@ enum AuthCommand {
         #[command(subcommand)]
         command: OpenrouterAuthCommand,
     },
+    /// Manages `OpenCode` Zen credentials.
+    OpencodeZen {
+        #[command(subcommand)]
+        command: OpencodeZenAuthCommand,
+    },
     /// Manages `OpenAI` direct API credentials.
     Openaicom {
         #[command(subcommand)]
@@ -1182,6 +1278,25 @@ enum OpenrouterAuthCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum OpencodeZenAuthCommand {
+    /// Stores an `OpenCode` Zen API key in the sshenv vault.
+    Login {
+        /// sshenv profile to write.
+        #[arg(long, default_value = "opencode-zen")]
+        profile: String,
+        /// sshenv vault path to use.
+        #[arg(long, default_value_os_t = default_auth_vault_path())]
+        vault: PathBuf,
+        /// SSH public key or public-key file used when initializing a new vault.
+        #[arg(long)]
+        recipient_key: Option<String>,
+        /// `OpenCode` Zen API key (leave blank to interactively paste or read from env).
+        #[arg(long)]
+        api_key: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum OpenaicomAuthCommand {
     /// Stores an `OpenAI` API key in the sshenv vault.
     Login {
@@ -1207,6 +1322,9 @@ enum Command {
         /// Path to the brouter TOML config.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Override the server port (overrides config file setting).
+        #[arg(long, short = 'p')]
+        port: Option<u16>,
     },
     /// Validates the brouter TOML config.
     CheckConfig {

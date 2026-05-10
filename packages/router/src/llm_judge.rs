@@ -48,6 +48,49 @@ struct ApiErrorDetail {
     message: String,
 }
 
+/// OpenAI-compatible response wrapper format.
+#[derive(Debug, Deserialize)]
+struct OpenAiResponse {
+    choices: Vec<OpenAiChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiChoice {
+    message: OpenAiMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiMessage {
+    content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+}
+
+/// Normalizes a provider response to extract the raw judge JSON.
+#[must_use]
+pub fn normalize_judge_response(raw: &str) -> String {
+    let trimmed = raw.trim();
+
+    // Try to parse as OpenAI wrapped format (see OpenAiResponse struct).
+    if let Ok(response) = serde_json::from_str::<OpenAiResponse>(trimmed) {
+        let content = response
+            .choices
+            .first()
+            .and_then(|c| c.message.content.as_ref());
+        if let Some(inner) = content {
+            let content_str = inner.trim();
+            if content_str.starts_with('{')
+                && serde_json::from_str::<serde_json::Value>(content_str).is_ok()
+            {
+                return content_str.to_string();
+            }
+        }
+    }
+
+    // Fall through to direct JSON or code fence extraction (handled by extract_json).
+    trimmed.to_string()
+}
+
 /// Format capabilities as a comma-separated string.
 fn format_capabilities(caps: &[ModelCapability]) -> String {
     caps.iter()
@@ -113,7 +156,8 @@ pub fn parse_judge_response(
     judge_model: &ModelId,
 ) -> ModelReasoning {
     let trimmed = raw.trim();
-    let json_str = extract_json(trimmed);
+    // Normalize provider-specific response formats (e.g., OpenAI wrapped format).
+    let json_str = extract_json(&normalize_judge_response(trimmed));
     let parsed: Result<JudgeResponse, _> = serde_json::from_str(&json_str);
 
     match parsed {

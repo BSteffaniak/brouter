@@ -223,16 +223,18 @@ display_badges = ["priority"]
 # display_badges = ["priority"]
 
 # OpenCode Zen — OpenCode's own LLM service. Create credentials with:
-#   brouter auth openaicom login --profile opencode-zen [--api-key ...]
+#   brouter auth opencode-zen login --profile opencode-zen [--api-key ...]
 # [providers.opencode_zen]
 # kind = "open-ai-compatible"
-# base_url = "https://api.opencode.ai/v1"
-# api_key_env = "OPENCODE_API_KEY"
+# base_url = "https://opencode.ai/zen/v1"
+# auth_backend = "sshenv"
+# auth_profile = "opencode-zen"
+# auth_vault_path = "~/.local/state/brouter/auth/opencode_zen_vault"
 # timeout_ms = 60000
 #
 # [models.opencode_zen_fast]
 # provider = "opencode_zen"
-# model = "opencode/big-pickle"
+# model = "big-pickle"
 # context_window = 128000
 # input_cost_per_million = 0.0
 # output_cost_per_million = 0.0

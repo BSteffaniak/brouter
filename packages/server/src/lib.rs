@@ -46,6 +46,7 @@ use brouter_telemetry_models::UsageEvent;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tower_http::cors::{Any, CorsLayer};
+use tracing::{debug, warn};
 
 /// HTTP server startup error.
 #[derive(Debug, Error)]
@@ -1150,63 +1151,88 @@ async fn invoke_llm_judge(
     );
     let judge_request = judge_request(judge_config, system_prompt, &user_prompt);
 
-    // Build the list of candidate judge models, in fallback order:
-    // 1. The configured primary judge model
-    // 2. Other models from the same provider
-    // 3. Models from other providers
+    // Build the list of candidate judge models from ALL configured models, grouped by
+    // provider (judge model first, then others from same provider, then other providers).
+    // Within each provider group, sort by quality ascending so cheaper/faster models are tried first.
     let primary_provider = judge_config.provider.clone();
-    let judge_model_ids: Vec<ModelId> = std::iter::once(judge_model_id.clone())
-        .chain(
-            state
-                .router
-                .models()
+    let mut judge_model_ids: Vec<ModelId> = vec![judge_model_id.clone()];
+    let mut by_provider: std::collections::BTreeMap<String, Vec<ModelId>> =
+        std::collections::BTreeMap::new();
+    for m in state
+        .router
+        .models()
+        .iter()
+        .filter(|m| m.id != judge_model_id)
+    {
+        by_provider
+            .entry(m.provider.to_string())
+            .or_default()
+            .push(m.id.clone());
+    }
+    // Sort each provider group by quality ascending (lower quality = cheaper/faster).
+    for ids in by_provider.values_mut() {
+        let model_refs: Vec<_> = state.router.models().iter().collect();
+        ids.sort_by_key(|id| {
+            model_refs
                 .iter()
-                .filter(|m| {
-                    m.id != judge_model_id
-                        && primary_provider.as_ref().is_some_and(|p| &m.provider == p)
-                })
-                .map(|m| m.id.clone()),
-        )
-        .chain(
-            state
-                .router
-                .models()
-                .iter()
-                .filter(|m| {
-                    m.id != judge_model_id
-                        && primary_provider.as_ref().is_some_and(|p| &m.provider != p)
-                })
-                .map(|m| m.id.clone()),
-        )
-        .collect();
+                .find(|m| &m.id == id)
+                .map_or(0, |m| m.quality)
+        });
+    }
+    // Append same-provider models first, then other providers.
+    if let Some(pp) = &primary_provider
+        && let Some(same) = by_provider.remove(&pp.to_string())
+    {
+        judge_model_ids.extend(same);
+    }
+    for (_, ids) in by_provider {
+        judge_model_ids.extend(ids);
+    }
 
     // Try each judge model in fallback order until one succeeds.
     let mut raw_text = String::new();
     let mut used_judge_id = &judge_model_id;
 
+    debug!(
+        judge_model_id = %judge_model_id,
+        num_candidates = judge_model_ids.len(),
+        "starting judge fallback chain"
+    );
+
     for candidate_id in &judge_model_ids {
-        let judge_model = state
+        debug!(model_id = %candidate_id, "trying judge model");
+
+        // Look up the actual model config to get the correct provider.
+        let (upstream_model, provider_id) = state
             .router
             .models()
             .iter()
-            .find(|m| m.id == *candidate_id)
-            .cloned()
-            .unwrap_or_else(|| RouteableModel {
-                id: candidate_id.clone(),
-                provider: judge_config
-                    .provider
-                    .clone()
-                    .unwrap_or_else(|| ProviderId::new("local")),
-                upstream_model: candidate_id.to_string(),
-                context_window: 128_000,
-                input_cost_per_million: 0.0,
-                output_cost_per_million: 0.0,
-                quality: 50,
-                capabilities: vec![],
-                attributes: BTreeMap::new(),
-                display_badges: vec![],
-                metadata: ResolvedModelMetadata::default(),
-            });
+            .find(|m| &m.id == candidate_id)
+            .map_or_else(
+                || {
+                    (
+                        candidate_id.to_string(),
+                        judge_config
+                            .provider
+                            .clone()
+                            .unwrap_or_else(|| ProviderId::new("local")),
+                    )
+                },
+                |m| (m.upstream_model.clone(), m.provider.clone()),
+            );
+        let judge_model = RouteableModel {
+            id: candidate_id.clone(),
+            provider: provider_id,
+            upstream_model,
+            context_window: 128_000,
+            input_cost_per_million: 0.0,
+            output_cost_per_million: 0.0,
+            quality: 50,
+            capabilities: vec![],
+            attributes: BTreeMap::new(),
+            display_badges: vec![],
+            metadata: ResolvedModelMetadata::default(),
+        };
 
         match state
             .provider_client
@@ -1219,14 +1245,16 @@ async fn invoke_llm_judge(
                 break;
             }
             Err(e) => {
-                eprintln!("judge model unavailable ({candidate_id}), trying fallback: {e}");
+                warn!(model_id = %candidate_id, error = %e, "judge unavailable");
             }
         }
     }
 
     let reasoning = if let Some(error_msg) = extract_api_error(&raw_text) {
-        // API returned an error response (e.g., usage limit). Preserve the original decision.
-        eprintln!("judge API error, preserving original decision: {error_msg}");
+        warn!(error = %error_msg, "judge API error");
+        return Ok(None);
+    } else if raw_text.is_empty() {
+        warn!("all judge models failed");
         return Ok(None);
     } else {
         parse_judge_response(&raw_text, &decision.candidates, used_judge_id)
