@@ -736,15 +736,9 @@ name = "brouter_proxy"
 version = "0.1.0"
 dependencies = [
  "axum",
- "bytes",
- "futures-util",
  "http 1.4.0",
  "reqwest",
- "serde",
- "serde_json",
  "tokio",
- "tower",
- "tower-http",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -825,8 +819,6 @@ name = "brouter_telemetry_util"
 version = "0.1.0"
 dependencies = [
  "serde",
- "serde_json",
- "tracing",
 ]
 
 [[package]]
@@ -4385,7 +4377,6 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
- "tracing",
  "url",
 ]
 
