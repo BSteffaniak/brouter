@@ -1292,6 +1292,7 @@ fn prompt_request(prompt: &str) -> ChatCompletionRequest {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            extra: BTreeMap::new(),
         }],
         temperature: None,
         top_p: None,

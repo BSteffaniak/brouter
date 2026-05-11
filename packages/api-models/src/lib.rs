@@ -84,6 +84,11 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Provider-specific fields that aren't part of the canonical schema
+    /// (e.g. `DeepSeek`'s `reasoning_content` on assistant turns). Captured here
+    /// so they round-trip through brouter to the upstream provider unchanged.
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
 }
 
 /// OpenAI-compatible chat message content.
@@ -253,5 +258,29 @@ mod tests {
         );
         let serialized = serde_json::to_value(request).expect("request should serialize");
         assert_eq!(serialized["parallel_tool_calls"], json!(false));
+    }
+
+    #[test]
+    fn preserves_unknown_chat_message_fields() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "brouter/auto",
+            "messages": [{
+                "role": "assistant",
+                "content": "hi",
+                "reasoning_content": "because"
+            }]
+        }))
+        .expect("request should deserialize");
+
+        let assistant = &request.messages[0];
+        assert_eq!(
+            assistant.extra.get("reasoning_content"),
+            Some(&json!("because"))
+        );
+        let serialized = serde_json::to_value(&request).expect("request should serialize");
+        assert_eq!(
+            serialized["messages"][0]["reasoning_content"],
+            json!("because")
+        );
     }
 }

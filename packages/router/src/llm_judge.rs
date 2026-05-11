@@ -285,6 +285,7 @@ pub fn judge_request(
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
+                extra: BTreeMap::new(),
             },
             ChatMessage {
                 role: "user".to_string(),
@@ -292,6 +293,7 @@ pub fn judge_request(
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
+                extra: BTreeMap::new(),
             },
         ],
         temperature: (config.output.temperature > 0.0).then_some(config.output.temperature),

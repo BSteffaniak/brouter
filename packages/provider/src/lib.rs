@@ -1290,6 +1290,58 @@ mod tests {
         assert_eq!(body["reasoning_effort"], "high");
     }
 
+    #[test]
+    fn openai_compatible_request_preserves_assistant_reasoning_content() {
+        let model = RouteableModel {
+            id: ModelId::new("auto_selected"),
+            provider: ProviderId::new("fake"),
+            upstream_model: "deepseek-thinker".to_string(),
+            context_window: 8_192,
+            input_cost_per_million: 0.0,
+            output_cost_per_million: 0.0,
+            quality: 80,
+            capabilities: vec![ModelCapability::Chat, ModelCapability::Reasoning],
+            attributes: BTreeMap::new(),
+            display_badges: Vec::new(),
+            metadata: brouter_catalog_models::ResolvedModelMetadata::default(),
+        };
+        let provider = ProviderConfig {
+            kind: ProviderKind::OpenAiCompatible,
+            preset: None,
+            base_url: Some("http://localhost/v1".to_string()),
+            api_key_env: None,
+            timeout_ms: None,
+            max_estimated_cost: None,
+            auth_backend: None,
+            auth_profile: None,
+            auth_vault_path: None,
+            introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
+            resource_pools: Vec::new(),
+            attribute_mappings: BTreeMap::new(),
+            omit_request_fields: Vec::new(),
+        };
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "brouter/auto",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": "hello",
+                    "reasoning_content": "thinking trace"
+                },
+                {"role": "user", "content": "again"}
+            ]
+        }))
+        .expect("request should deserialize");
+
+        let body = openai_compatible_request_body(&provider, &model, &request);
+        assert_eq!(
+            body["messages"][1]["reasoning_content"],
+            json!("thinking trace"),
+            "assistant reasoning_content must round-trip to upstream"
+        );
+    }
+
     #[tokio::test]
     async fn openai_compatible_introspection_maps_rich_model_catalog() {
         let upstream = spawn_models_upstream().await;
@@ -1673,6 +1725,7 @@ mod tests {
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
+                extra: BTreeMap::new(),
             }],
             temperature: None,
             top_p: None,
