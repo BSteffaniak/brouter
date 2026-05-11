@@ -7,7 +7,9 @@
 //! - `PROXY_PORT` - Port to listen on (default: 8081)
 //! - `PROXY_BACKEND` - Backend URL to forward to (e.g., `http://127.0.0.1:8080`)
 
+#![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
+#![allow(clippy::multiple_crate_versions)]
 
 use axum::{
     Router, body::Body, extract::State, http::Request as HttpRequest, response::Response,

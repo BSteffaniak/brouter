@@ -32,3 +32,8 @@ uuid = { workspace = true, features = ["v4"] }
 [[bin]]
 name = "brouter-proxy"
 path = "src/main.rs"
+
+[features]
+default = []
+
+fail-on-warnings = []
