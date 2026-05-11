@@ -233,7 +233,6 @@ async fn main() {
 
     let app = Router::new()
         .route("/v1/{*path}", any(proxy_handler))
-        .route("/v1/*path", any(proxy_handler))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
