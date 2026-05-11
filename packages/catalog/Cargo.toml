@@ -14,7 +14,7 @@ version     = { workspace = true }
 brouter_catalog_models = { workspace = true }
 brouter_config_models  = { workspace = true }
 thiserror              = { workspace = true }
-toml                   = { workspace = true, features = ["parse"] }
+toml                   = { workspace = true, features = ["parse", "serde"] }
 
 [features]
 default          = []

@@ -19,7 +19,7 @@ brouter_introspection_models = { workspace = true }
 brouter_provider_models      = { workspace = true }
 bytes                        = { workspace = true }
 futures-util                 = { workspace = true }
-reqwest                      = { workspace = true, features = ["json", "rustls-tls", "stream"] }
+reqwest                      = { workspace = true, features = ["form", "json", "rustls", "stream"] }
 serde                        = { workspace = true, features = ["derive"] }
 serde_json                   = { workspace = true, features = ["std"] }
 sshenv_vault                 = { workspace = true }

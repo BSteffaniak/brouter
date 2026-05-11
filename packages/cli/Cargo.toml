@@ -32,7 +32,7 @@ brouter_router_models = { workspace = true }
 brouter_server = { workspace = true }
 clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
 rand = { workspace = true }
-reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+reqwest = { workspace = true, features = ["json", "rustls"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["std"] }
 sha2 = { workspace = true }
