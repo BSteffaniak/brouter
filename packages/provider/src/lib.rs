@@ -8,7 +8,7 @@ mod openai_codex;
 
 use std::collections::BTreeMap;
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use brouter_api_models::{
     ChatCompletionRequest, EmbeddingsRequest, MessageContent, ReasoningEffort,
@@ -478,6 +478,21 @@ impl ProviderClient {
         let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
         let upstream_request = openai_compatible_request_body(provider, model, request);
 
+        let request_body =
+            serde_json::to_string(&upstream_request).unwrap_or_else(|_| "{}".to_string());
+        // Structured logging: request initiated
+        tracing::info!(
+            component = "provider",
+            provider_id = %model.provider,
+            provider_kind = %provider.kind.debug_name(),
+            model_id = %model.id,
+            upstream_model = %model.upstream_model,
+            base_url = %base_url,
+            request_length = request_body.len(),
+            "provider request initiated"
+        );
+
+        let timer = Instant::now();
         let mut request_builder = self.http.post(url).json(&upstream_request);
         if let Some(timeout) = provider_timeout(provider) {
             request_builder = request_builder.timeout(timeout);
@@ -492,7 +507,30 @@ impl ProviderClient {
             request_builder = request_builder.bearer_auth(api_key);
         }
 
-        Ok(request_builder.send().await?)
+        let response = request_builder.send().await?;
+        let elapsed_ms = u64::try_from(timer.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let status = response.status().as_u16();
+
+        // Structured logging: response received
+        tracing::debug!(
+            component = "provider",
+            provider_id = %model.provider,
+            model_id = %model.id,
+            status = status,
+            elapsed_ms = elapsed_ms,
+            "provider response received"
+        );
+
+        // Trace level: full request body for debugging
+        tracing::trace!(
+            component = "provider",
+            provider_id = %model.provider,
+            model_id = %model.id,
+            upstream_model = %model.upstream_model,
+            request_body = %request_body,
+            "full request body"
+        );
+        Ok(response)
     }
 
     async fn openai_compatible_embeddings(

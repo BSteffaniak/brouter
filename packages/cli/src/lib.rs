@@ -1090,6 +1090,26 @@ async fn maybe_invoke_judge(
             &active_candidates,
             &session_context,
         );
+
+        // Structured logging: judge invocation
+        tracing::info!(
+            component = "judge",
+            judge_model = %candidate_id,
+            provider = %provider_id,
+            candidate_count = active_candidates.len(),
+            candidate_ids = ?active_candidates.iter().map(|c| c.model_id.as_str()).collect::<Vec<_>>(),
+            prompt_length = judge_user_prompt.len(),
+            "judge invocation started"
+        );
+
+        // Trace level: full judge prompt for debugging
+        tracing::trace!(
+            component = "judge",
+            judge_model = %candidate_id,
+            judge_prompt = %judge_user_prompt,
+            "full judge prompt"
+        );
+
         let judge_req = judge_request(judge_config, system_prompt, &judge_user_prompt);
 
         let judge_model = RouteableModel {
@@ -1163,7 +1183,21 @@ async fn maybe_invoke_judge(
                     continue;
                 }
                 // Accept this valid response
-                info!(model_id = %candidate_id, "judge succeeded");
+                info!(
+                    model_id = %candidate_id,
+                    provider = %provider_id,
+                    response_length = body.len(),
+                    "judge succeeded"
+                );
+
+                // Trace level: full judge response for debugging
+                tracing::trace!(
+                    component = "judge",
+                    judge_model = %candidate_id,
+                    judge_response = %body,
+                    "full judge response"
+                );
+
                 raw_text = body;
                 used_judge_id = candidate_id;
                 break;
@@ -1186,16 +1220,33 @@ async fn maybe_invoke_judge(
 
     // Final validation using filtered candidates (judge was prompted with active models).
     let reasoning = if raw_text.is_empty() {
-        tracing_warn!("all judge models failed, using original decision");
+        tracing_warn!(
+            component = "judge",
+            failed_providers = ?failed_judge_providers.iter().map(ProviderId::as_str).collect::<Vec<_>>(),
+            "all judge models failed, using original decision"
+        );
         return Ok(decision.clone());
     } else {
         parse_judge_response(&raw_text, &active_candidates, used_judge_id)
     };
+
     let mut updated = decision.clone();
     updated.reasoning = Some(reasoning);
     if updated.reasoning.as_ref().is_some_and(|r| r.overridden) {
         updated.selected_model = updated.reasoning.as_ref().unwrap().chosen_model.clone();
     }
+
+    // Structured logging: final routing decision
+    tracing::info!(
+        component = "router",
+        objective = ?decision.objective,
+        intent = ?decision.features.intent,
+        candidates_count = decision.candidates.len(),
+        selected_model = %updated.selected_model,
+        judge_overridden = %updated.reasoning.as_ref().is_some_and(|r| r.overridden),
+        "routing decision made"
+    );
+
     Ok(updated)
 }
 

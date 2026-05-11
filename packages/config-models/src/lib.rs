@@ -617,6 +617,16 @@ impl ProviderKind {
             _ => Self::OpenAiCompatible,
         }
     }
+
+    /// Returns a debug-friendly name for this provider kind.
+    #[must_use]
+    pub const fn debug_name(&self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "openai-compatible",
+            Self::Anthropic => "anthropic",
+            Self::OpenaiCodex => "openai-codex",
+        }
+    }
 }
 
 /// Model configuration used by the router.

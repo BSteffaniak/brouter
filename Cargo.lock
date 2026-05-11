@@ -697,6 +697,7 @@ dependencies = [
  "sshenv_vault",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "zeroize",
 ]
 
@@ -776,6 +777,15 @@ version = "0.1.0"
 dependencies = [
  "brouter_provider_models",
  "serde",
+]
+
+[[package]]
+name = "brouter_telemetry_util"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
