@@ -13,8 +13,9 @@ version     = { workspace = true }
 [dependencies]
 axum = { workspace = true, features = ["tokio", "http1", "http2"] }
 bytes = { workspace = true }
+futures-util = { workspace = true }
 http = { workspace = true }
-reqwest = { workspace = true, features = ["rustls"] }
+reqwest = { workspace = true, features = ["rustls", "stream"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["full"] }
@@ -34,6 +35,5 @@ name = "brouter-proxy"
 path = "src/main.rs"
 
 [features]
-default = []
-
+default          = []
 fail-on-warnings = []

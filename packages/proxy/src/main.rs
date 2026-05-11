@@ -15,7 +15,6 @@ use axum::{
     Router, body::Body, extract::State, http::Request as HttpRequest, response::Response,
     routing::any,
 };
-use bytes::Bytes;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -39,10 +38,7 @@ impl ProxyState {
         let backend_url =
             std::env::var("PROXY_BACKEND").unwrap_or_else(|_| DEFAULT_BACKEND.to_string());
 
-        info!(
-            backend_url = %backend_url,
-            "proxy configuration"
-        );
+        info!(backend_url = %backend_url, "proxy configuration");
 
         Self {
             backend_url,
@@ -54,8 +50,8 @@ impl ProxyState {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 async fn proxy_handler(State(state): State<ProxyState>, request: HttpRequest<Body>) -> Response {
+    #![allow(clippy::too_many_lines)]
     let request_id = Uuid::new_v4().to_string();
 
     // Get the full path including any path segments
@@ -105,11 +101,7 @@ async fn proxy_handler(State(state): State<ProxyState>, request: HttpRequest<Bod
     let body_bytes = match axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024).await {
         Ok(bytes) => bytes,
         Err(e) => {
-            warn!(
-                request_id = %request_id,
-                error = %e,
-                "failed to read request body"
-            );
+            warn!(request_id = %request_id, error = %e, "failed to read request body");
             return Response::builder()
                 .status(http::StatusCode::BAD_REQUEST)
                 .body(Body::from("Failed to read request body"))
@@ -125,11 +117,7 @@ async fn proxy_handler(State(state): State<ProxyState>, request: HttpRequest<Bod
         "DELETE" => state.client.delete(&backend_url),
         "PATCH" => state.client.patch(&backend_url),
         _ => {
-            warn!(
-                request_id = %request_id,
-                method = %method,
-                "unsupported HTTP method"
-            );
+            warn!(request_id = %request_id, method = %method, "unsupported HTTP method");
             return Response::builder()
                 .status(http::StatusCode::METHOD_NOT_ALLOWED)
                 .body(Body::from("Method not supported"))
@@ -171,13 +159,19 @@ async fn proxy_handler(State(state): State<ProxyState>, request: HttpRequest<Bod
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
-            let response_body = response.bytes().await.unwrap_or_else(|_| Bytes::new());
+
+            // Check if streaming response
+            let is_streaming = response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("event-stream") || v.contains("stream"));
 
             info!(
                 request_id = %request_id,
                 status = %status,
-                response_size = response_body.len(),
-                "received response from backend"
+                streaming = %is_streaming,
+                "forwarding response from backend"
             );
 
             // Build the response
@@ -192,14 +186,19 @@ async fn proxy_handler(State(state): State<ProxyState>, request: HttpRequest<Bod
                 builder = builder.header(key.as_str(), value.as_bytes());
             }
 
-            builder.body(Body::from(response_body)).unwrap()
+            if is_streaming {
+                // Stream the response body directly
+                let stream = response.bytes_stream();
+                let body = Body::from_stream(stream);
+                builder.body(body).unwrap()
+            } else {
+                // Buffer non-streaming responses
+                let body_bytes = response.bytes().await.unwrap_or_default();
+                builder.body(Body::from(body_bytes)).unwrap()
+            }
         }
         Err(e) => {
-            warn!(
-                request_id = %request_id,
-                error = %e,
-                "backend request failed"
-            );
+            warn!(request_id = %request_id, error = %e, "backend request failed");
             Response::builder()
                 .status(http::StatusCode::BAD_GATEWAY)
                 .body(Body::from(format!("Backend error: {e}")))
@@ -237,10 +236,7 @@ async fn main() {
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
-    info!(
-        addr = %addr,
-        "brouter-proxy listening"
-    );
+    info!(addr = %addr, "brouter-proxy listening");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();

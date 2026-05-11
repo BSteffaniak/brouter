@@ -74,6 +74,7 @@ switchy_database = { git = "https://github.com/MoosicBox/MoosicBox", branch = "m
 switchy_database_connection = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "switchy_database_connection", default-features = false }
 thiserror = { version = "2.0.18", default-features = false }
 tokio = { version = "1.52.3", default-features = false }
+tokio-stream = { version = "0.1.18", default-features = false }
 toml = { version = "1.1.2", default-features = false }
 tower = { version = "0.5.3", default-features = false }
 tower-http = { version = "0.6.10", default-features = false }
