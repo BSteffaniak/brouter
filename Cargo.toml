@@ -9,6 +9,7 @@ members = [
     "packages/config-models",
     "packages/introspection",
     "packages/introspection-models",
+    "packages/proxy",
     "packages/provider",
     "packages/provider-models",
     "packages/router",
@@ -59,8 +60,9 @@ base64 = { version = "0.22.1", default-features = false, features = ["std"] }
 bytes = { version = "1.11.0", default-features = false }
 clap = { version = "4.5.40", default-features = false }
 futures-util = { version = "0.3.32", default-features = false }
-rand = { version = "0.9.4", default-features = false, features = [
-    "os_rng",
+http = { version = "1.4.0", default-features = false }
+rand = { version = "0.10.1", default-features = false, features = [
+    "sys_rng",
     "std",
 ] }
 reqwest = { version = "0.12.28", default-features = false }
@@ -77,4 +79,5 @@ tower = { version = "0.5.3", default-features = false }
 tower-http = { version = "0.6.10", default-features = false }
 tracing = { version = "0.1.44", default-features = false }
 tracing-subscriber = { version = "0.3.20", default-features = false }
+uuid = { version = "1.23.1", default-features = false }
 zeroize = { version = "1.8.2", default-features = false, features = ["std"] }

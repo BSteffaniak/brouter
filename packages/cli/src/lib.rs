@@ -32,7 +32,7 @@ use brouter_router::{
 };
 use brouter_router_models::{JudgeConfig, RoutingDecision, RoutingObjective, ScoredCandidate};
 use clap::{Parser, Subcommand};
-use rand::TryRngCore as _;
+use rand::TryRng as _;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use tracing::{debug, info, warn as tracing_warn};
@@ -774,14 +774,14 @@ fn oauth_callback_url_from_text(input: &str) -> Option<&str> {
 
 fn random_urlsafe(bytes: usize) -> Result<String> {
     let mut data = vec![0_u8; bytes];
-    rand::rngs::OsRng.try_fill_bytes(&mut data)?;
+    rand::rngs::SysRng.try_fill_bytes(&mut data)?;
     Ok(URL_SAFE_NO_PAD.encode(data))
 }
 
 fn random_pkce_verifier(length: usize) -> Result<String> {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
     let mut data = vec![0_u8; length];
-    rand::rngs::OsRng.try_fill_bytes(&mut data)?;
+    rand::rngs::SysRng.try_fill_bytes(&mut data)?;
     Ok(data
         .into_iter()
         .map(|byte| char::from(CHARS[usize::from(byte) % CHARS.len()]))
