@@ -16,7 +16,6 @@ use axum::{
     routing::any,
 };
 use std::net::SocketAddr;
-use std::time::Duration;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use uuid::Uuid;
@@ -43,7 +42,6 @@ impl ProxyState {
         Self {
             backend_url,
             client: reqwest::Client::builder()
-                .timeout(Duration::from_mins(2))
                 .build()
                 .expect("failed to create HTTP client"),
         }
