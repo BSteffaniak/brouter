@@ -24,6 +24,7 @@ serde                        = { workspace = true, features = ["derive"] }
 serde_json                   = { workspace = true, features = ["std"] }
 sshenv_vault                 = { workspace = true }
 thiserror                    = { workspace = true }
+tokio                        = { workspace = true, features = ["time"] }
 tracing                      = { workspace = true }
 zeroize                      = { workspace = true }
 

@@ -13,7 +13,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
-use crate::{ProviderError, ProviderResponse, ProviderStreamResponse, apply_attribute_mappings};
+use crate::{
+    ProviderError, ProviderResponse, ProviderStreamResponse, RequestTimeoutScope,
+    apply_attribute_mappings, send_provider_request,
+};
 
 const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -49,7 +52,15 @@ pub async fn chat_completions(
 ) -> Result<ProviderResponse, ProviderError> {
     let mut auth = codex_auth(provider, model)?;
     refresh_auth_if_needed(http, &mut auth, model).await?;
-    let response = send_codex_request(http, provider, model, request, &auth).await?;
+    let response = send_codex_request(
+        http,
+        provider,
+        model,
+        request,
+        &auth,
+        RequestTimeoutScope::FullResponse,
+    )
+    .await?;
     let status = response.status().as_u16();
     let text = response.text().await?;
     if !(200..300).contains(&status) {
@@ -72,7 +83,15 @@ pub async fn chat_completions_response(
 ) -> Result<ProviderStreamResponse, ProviderError> {
     let mut auth = codex_auth(provider, model)?;
     refresh_auth_if_needed(http, &mut auth, model).await?;
-    let response = send_codex_request(http, provider, model, request, &auth).await?;
+    let response = send_codex_request(
+        http,
+        provider,
+        model,
+        request,
+        &auth,
+        RequestTimeoutScope::InitialResponse,
+    )
+    .await?;
     let status = response.status().as_u16();
     if !response.status().is_success() {
         return Ok(codex_error_stream_response(response).await);
@@ -344,6 +363,7 @@ async fn send_codex_request(
     model: &RouteableModel,
     request: &ChatCompletionRequest,
     auth: &CodexAuth,
+    timeout_scope: RequestTimeoutScope,
 ) -> Result<reqwest::Response, ProviderError> {
     let mut body = codex_request_body(model, request);
     apply_attribute_mappings(provider, model, &mut body);
@@ -355,16 +375,13 @@ async fn send_codex_request(
         .header("User-Agent", "brouter/0.1.0")
         .header("accept", "text/event-stream")
         .json(&body);
-    if let Some(timeout) = provider.timeout_ms {
-        builder = builder.timeout(std::time::Duration::from_millis(timeout));
-    }
     if let Some(account_id) = &auth.account_id {
         builder = builder.header("ChatGPT-Account-Id", account_id);
     }
     if let Some(session_id) = codex_session_id(request) {
         builder = builder.header("session_id", session_id);
     }
-    Ok(builder.send().await?)
+    send_provider_request(builder, provider, timeout_scope).await
 }
 
 #[derive(Debug, Serialize)]

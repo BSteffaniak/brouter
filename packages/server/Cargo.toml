@@ -33,7 +33,12 @@ tower-http                   = { workspace = true, features = ["cors"] }
 tracing                      = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+tokio = { workspace = true, features = [
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "time",
+] }
 tower = { workspace = true, features = ["util"] }
 
 [features]

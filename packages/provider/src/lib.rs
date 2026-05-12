@@ -145,7 +145,12 @@ impl ProviderClient {
         match provider.kind {
             ProviderKind::OpenAiCompatible => {
                 let response = self
-                    .openai_compatible_chat_completions(provider, model, request)
+                    .openai_compatible_chat_completions(
+                        provider,
+                        model,
+                        request,
+                        RequestTimeoutScope::FullResponse,
+                    )
                     .await?;
                 buffered_provider_response(response).await
             }
@@ -179,7 +184,12 @@ impl ProviderClient {
         match provider.kind {
             ProviderKind::OpenAiCompatible => {
                 let response = self
-                    .openai_compatible_chat_completions(provider, model, request)
+                    .openai_compatible_chat_completions(
+                        provider,
+                        model,
+                        request,
+                        RequestTimeoutScope::InitialResponse,
+                    )
                     .await?;
                 Ok(raw_stream_response(response))
             }
@@ -417,7 +427,9 @@ impl ProviderClient {
             request_builder = request_builder.header("x-api-key", api_key);
         }
 
-        let response = request_builder.send().await?;
+        let response =
+            send_provider_request(request_builder, provider, RequestTimeoutScope::FullResponse)
+                .await?;
         let status = response.status();
         let response = buffered_provider_response(response).await?;
         if status.is_success() {
@@ -459,7 +471,12 @@ impl ProviderClient {
             })?;
             request_builder = request_builder.header("x-api-key", api_key);
         }
-        Ok(request_builder.send().await?)
+        send_provider_request(
+            request_builder,
+            provider,
+            RequestTimeoutScope::InitialResponse,
+        )
+        .await
     }
 
     async fn openai_compatible_chat_completions(
@@ -467,6 +484,7 @@ impl ProviderClient {
         provider: &ProviderConfig,
         model: &RouteableModel,
         request: &ChatCompletionRequest,
+        timeout_scope: RequestTimeoutScope,
     ) -> Result<reqwest::Response, ProviderError> {
         let base_url =
             provider
@@ -494,9 +512,6 @@ impl ProviderClient {
 
         let timer = Instant::now();
         let mut request_builder = self.http.post(url).json(&upstream_request);
-        if let Some(timeout) = provider_timeout(provider) {
-            request_builder = request_builder.timeout(timeout);
-        }
         if let Some(api_key_env) = &provider.api_key_env {
             let api_key = resolve_api_key_from_provider(provider, api_key_env).map_err(|e| {
                 ProviderError::Auth {
@@ -507,7 +522,7 @@ impl ProviderClient {
             request_builder = request_builder.bearer_auth(api_key);
         }
 
-        let response = request_builder.send().await?;
+        let response = send_provider_request(request_builder, provider, timeout_scope).await?;
         let elapsed_ms = u64::try_from(timer.elapsed().as_millis()).unwrap_or(u64::MAX);
         let status = response.status().as_u16();
 
@@ -867,6 +882,33 @@ fn provider_timeout(provider: &ProviderConfig) -> Option<Duration> {
     provider.timeout_ms.map(Duration::from_millis)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestTimeoutScope {
+    FullResponse,
+    InitialResponse,
+}
+
+pub(crate) async fn send_provider_request(
+    builder: reqwest::RequestBuilder,
+    provider: &ProviderConfig,
+    scope: RequestTimeoutScope,
+) -> Result<reqwest::Response, ProviderError> {
+    let Some(timeout) = provider_timeout(provider) else {
+        return Ok(builder.send().await?);
+    };
+
+    if scope == RequestTimeoutScope::FullResponse {
+        return Ok(builder.timeout(timeout).send().await?);
+    }
+
+    tokio::time::timeout(timeout, builder.send())
+        .await
+        .map_err(|_| ProviderError::Timeout {
+            timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+        })?
+        .map_err(ProviderError::Http)
+}
+
 /// Provider response payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderResponse {
@@ -904,6 +946,8 @@ pub enum ProviderError {
         provider_id: String,
         message: String,
     },
+    #[error("upstream HTTP request timed out after {timeout_ms} ms")]
+    Timeout { timeout_ms: u64 },
     #[error("upstream HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
 }

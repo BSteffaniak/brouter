@@ -5,15 +5,12 @@
 //! HTTP server for brouter.
 
 use std::collections::BTreeMap;
-use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use futures_util::StreamExt;
-
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -727,15 +724,7 @@ async fn forward_streaming_with_fallbacks(
                         header::CONTENT_TYPE,
                         HeaderValue::from_static("text/event-stream"),
                     );
-                    let safe_stream = response
-                        .stream
-                        .take_while(|result| std::future::ready(result.is_ok()))
-                        .map(|result| {
-                            // take_while filters errors, unwrap is safe
-                            let bytes = result.unwrap();
-                            Ok::<Bytes, Infallible>(bytes)
-                        });
-                    return (status, response_headers, Body::from_stream(safe_stream))
+                    return (status, response_headers, Body::from_stream(response.stream))
                         .into_response();
                 }
                 last_status = Some(status);
@@ -1543,12 +1532,14 @@ struct HealthResponse {
 mod tests {
     use std::collections::BTreeMap;
     use std::net::SocketAddr;
+    use std::time::Duration;
 
-    use axum::body::{Body, to_bytes};
+    use axum::body::{Body, Bytes, to_bytes};
     use axum::http::{Method, Request};
     use axum::routing::post;
     use axum::{Json, Router as AxumRouter};
     use brouter_config_models::{ModelConfig, ProviderConfig, ProviderKind};
+    use futures_util::stream as futures_stream;
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
@@ -1707,6 +1698,48 @@ mod tests {
         assert!(body.contains("[DONE]"));
     }
 
+    #[tokio::test]
+    async fn streaming_completion_propagates_upstream_body_errors() {
+        let upstream = spawn_failing_streaming_upstream().await;
+        let config = single_provider_config(upstream);
+        let app = build_app(&config, TelemetryStore::memory());
+
+        let response = app
+            .oneshot(chat_request("hello", true))
+            .await
+            .expect("streaming request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            to_bytes(response.into_body(), 1024).await.is_err(),
+            "stream body errors must reach the caller instead of truncating silently"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_completion_provider_timeout_does_not_cap_response_body() {
+        let upstream = spawn_slow_streaming_upstream().await;
+        let mut config = single_provider_config(upstream);
+        config
+            .providers
+            .get_mut("healthy")
+            .expect("healthy provider should exist")
+            .timeout_ms = Some(100);
+        let app = build_app(&config, TelemetryStore::memory());
+
+        let response = app
+            .oneshot(chat_request("hello", true))
+            .await
+            .expect("streaming request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("slow stream body should not hit provider total timeout");
+        let body = String::from_utf8(bytes.to_vec()).expect("stream should be utf8");
+        assert!(body.contains("[DONE]"));
+    }
+
     async fn spawn_echo_upstream() -> String {
         async fn echo(Json(body): Json<Value>) -> Json<Value> {
             Json(json!({
@@ -1738,6 +1771,66 @@ mod tests {
                 HeaderValue::from_static("text/event-stream"),
             );
             (headers, "data: {\"choices\":[]}\n\ndata: [DONE]\n\n")
+        }
+        spawn_upstream(AxumRouter::new().route("/v1/chat/completions", post(stream))).await
+    }
+
+    async fn spawn_failing_streaming_upstream() -> String {
+        async fn stream() -> (HeaderMap, Body) {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            let stream = futures_stream::unfold(0_u8, |state| async move {
+                match state {
+                    0 => Some((
+                        Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                            b"data: {\"choices\":[]}\n\n",
+                        )),
+                        1,
+                    )),
+                    1 => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        Some((
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "simulated upstream stream timeout",
+                            )),
+                            2,
+                        ))
+                    }
+                    _ => None,
+                }
+            });
+            (headers, Body::from_stream(stream))
+        }
+        spawn_upstream(AxumRouter::new().route("/v1/chat/completions", post(stream))).await
+    }
+
+    async fn spawn_slow_streaming_upstream() -> String {
+        async fn stream() -> (HeaderMap, Body) {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            let stream = futures_stream::unfold(0_u8, |state| async move {
+                match state {
+                    0 => Some((
+                        Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                            b"data: {\"choices\":[]}\n\n",
+                        )),
+                        1,
+                    )),
+                    1 => {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        Some((Ok(Bytes::from_static(b"data: [DONE]\n\n")), 2))
+                    }
+                    _ => None,
+                }
+            });
+            (headers, Body::from_stream(stream))
         }
         spawn_upstream(AxumRouter::new().route("/v1/chat/completions", post(stream))).await
     }
