@@ -5,12 +5,15 @@
 //! HTTP server for brouter.
 
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use axum::body::Body;
+use futures_util::StreamExt;
+
+use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -724,7 +727,15 @@ async fn forward_streaming_with_fallbacks(
                         header::CONTENT_TYPE,
                         HeaderValue::from_static("text/event-stream"),
                     );
-                    return (status, response_headers, Body::from_stream(response.stream))
+                    let safe_stream = response
+                        .stream
+                        .take_while(|result| std::future::ready(result.is_ok()))
+                        .map(|result| {
+                            // take_while filters errors, unwrap is safe
+                            let bytes = result.unwrap();
+                            Ok::<Bytes, Infallible>(bytes)
+                        });
+                    return (status, response_headers, Body::from_stream(safe_stream))
                         .into_response();
                 }
                 last_status = Some(status);

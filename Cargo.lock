@@ -785,6 +785,7 @@ dependencies = [
  "brouter_router_models",
  "brouter_telemetry",
  "brouter_telemetry_models",
+ "futures-util",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
