@@ -28,13 +28,17 @@ Rules:
 - Keep your explanation concise.
 
 Output format (JSON, no additional text):
-{"selected_model": "<model_id from shortlist>", "reasoning": "<1-3 sentence explanation>"}"#;
+{"selected_model": "<model_id from shortlist>", "service_tier": "standard|priority|null", "reasoning_effort": "low|medium|high|null", "reasoning": "<1-3 sentence explanation>"}"#;
 
 /// Output format expected from the LLM judge.
 #[derive(Debug, Deserialize)]
 struct JudgeResponse {
     #[serde(alias = "model", alias = "selected_model")]
     selected_model: String,
+    #[serde(default)]
+    service_tier: Option<String>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
     reasoning: String,
 }
 
@@ -117,6 +121,14 @@ fn format_capabilities(caps: &[ModelCapability]) -> String {
         .join(", ")
 }
 
+fn format_attributes(attributes: &BTreeMap<String, String>) -> String {
+    attributes
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Build the judge prompt for a routing decision.
 #[must_use]
 pub fn build_judge_prompt(
@@ -131,11 +143,13 @@ pub fn build_judge_prompt(
         .enumerate()
         .map(|(i, c)| {
             format!(
-                "  {}. {} | provider: {} | capabilities: [{}] | quality: {} | est. cost: ${} | score: {}",
+                "  {}. {} | provider: {} | capabilities: [{}] | attributes: [{}] | badges: [{}] | quality: {} | est. cost: ${} | score: {}",
                 i + 1,
                 c.model_id,
                 c.provider,
                 format_capabilities(&c.capabilities),
+                format_attributes(&c.attributes),
+                c.display_badges.join(", "),
                 c.quality,
                 c.estimated_cost,
                 c.score
@@ -155,13 +169,25 @@ pub fn build_judge_prompt(
             .join("\n")
     };
 
+    let resource_lines = if session.resource_summary.is_empty() {
+        "  (no live quota data available)".to_string()
+    } else {
+        session
+            .resource_summary
+            .iter()
+            .map(|line| format!("  - {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
     let intent_str = format!("{intent:?}");
     let objective_str = format!("{objective:?}");
     format!(
-        "Original prompt: \"{prompt_text}\"\n\nIntent detected: {intent_str}\nObjective: {objective_str}\n\nSession context:\n  - previous requests: {count}\n  - accumulated cost: ${cost}\n  - recent decisions:\n{recent}\n\nStage 2 candidates (ranked by deterministic score):\n{candidates}\n\nSelect the best model and explain in JSON format:\n{{\"selected_model\": \"<model_id>\", \"reasoning\": \"<1-3 sentence explanation>\"}}",
+        "Original prompt: \"{prompt_text}\"\n\nIntent detected: {intent_str}\nObjective: {objective_str}\n\nSession context:\n  - previous requests: {count}\n  - accumulated cost: ${cost}\n  - recent decisions:\n{recent}\n\nLive provider resource/usage state:\n{resources}\n\nStage 2 candidates (ranked by deterministic score):\n{candidates}\n\nChoose the best safe route. Prefer standard service tier and lower reasoning when adequate; choose priority or high reasoning only when task urgency/complexity justifies spending that quota. Explain in JSON format:\n{{\"selected_model\": \"<model_id>\", \"service_tier\": \"standard|priority|null\", \"reasoning_effort\": \"low|medium|high|null\", \"reasoning\": \"<1-3 sentence explanation>\"}}",
         count = session.request_count,
         cost = session.accumulated_cost,
         recent = recent_lines,
+        resources = resource_lines,
         candidates = candidate_lines,
     )
 }
@@ -193,6 +219,8 @@ pub fn parse_judge_response(
                     model_id: judge_model.clone(),
                     rationale: response.reasoning,
                     chosen_model: chosen_id,
+                    service_tier: normalize_optional_choice(response.service_tier),
+                    reasoning_effort: normalize_optional_choice(response.reasoning_effort),
                     overridden,
                     error: None,
                 }
@@ -203,6 +231,8 @@ pub fn parse_judge_response(
                         "Judge returned unknown model '{raw_model}'. Falling back to deterministic top pick.",
                     ),
                     chosen_model: top_pick.unwrap_or_else(|| judge_model.clone()),
+                    service_tier: normalize_optional_choice(response.service_tier),
+                    reasoning_effort: normalize_optional_choice(response.reasoning_effort),
                     overridden: false,
                     error: Some(format!("invalid model '{raw_model}' returned by judge")),
                 }
@@ -221,11 +251,18 @@ pub fn parse_judge_response(
                 model_id: judge_model.clone(),
                 rationale: format!("Failed to parse judge response: {msg}"),
                 chosen_model: fallback,
+                service_tier: None,
+                reasoning_effort: None,
                 overridden: false,
                 error: Some(msg),
             }
         }
     }
+}
+
+fn normalize_optional_choice(value: Option<String>) -> Option<String> {
+    let value = value?.trim().to_lowercase();
+    (!value.is_empty() && value != "null" && value != "none" && value != "auto").then_some(value)
 }
 
 /// Attempts to find a matching candidate from the shortlist for the given model name.

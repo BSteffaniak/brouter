@@ -18,6 +18,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router as AxumRouter};
 use brouter_api_models::{
     ChatCompletionRequest, EmbeddingsRequest, ErrorResponse, ModelListResponse, ModelObject,
+    ReasoningEffort,
 };
 use brouter_catalog_models::ResolvedModelMetadata;
 use brouter_catalog_models::{MetadataProvenance, MetadataSource};
@@ -40,6 +41,7 @@ use brouter_router::{
 };
 use brouter_router_models::{
     JudgeConfig, JudgeSessionContext, RoutingDecision, RoutingObjective, RoutingOptions,
+    SelectedRequestControls,
 };
 use brouter_telemetry::{TelemetryError, TelemetryStore, now_millis};
 use brouter_telemetry_models::UsageEvent;
@@ -274,7 +276,7 @@ async fn refresh_introspection_snapshots(config: &BrouterConfig) -> Vec<Introspe
         let Some(provider) = config.providers.get(provider_id.as_str()) else {
             continue;
         };
-        if !provider.introspection.enabled {
+        if provider.introspection.disabled || !provider.introspection.enabled {
             continue;
         }
         let request = IntrospectionRequest {
@@ -564,10 +566,45 @@ async fn chat_completions(
         Err(error) => return error.into_response(),
     };
 
-    if request.is_streaming() {
-        forward_streaming_with_fallbacks(&state, &headers, &request, &decision).await
+    let effective_request = apply_request_controls(request, &decision);
+    if effective_request.is_streaming() {
+        forward_streaming_with_fallbacks(&state, &headers, &effective_request, &decision).await
     } else {
-        forward_with_fallbacks(&state, &headers, &request, &decision).await
+        forward_with_fallbacks(&state, &headers, &effective_request, &decision).await
+    }
+}
+
+fn apply_request_controls(
+    mut request: ChatCompletionRequest,
+    decision: &RoutingDecision,
+) -> ChatCompletionRequest {
+    if let Some(reasoning_effort) = decision
+        .request_controls
+        .reasoning_effort
+        .as_deref()
+        .and_then(reasoning_effort_from_name)
+        && request.reasoning_effort.is_none()
+    {
+        request.reasoning_effort = Some(reasoning_effort);
+    }
+    if let Some(service_tier) = &decision.request_controls.service_tier {
+        request.extra.insert(
+            "service_tier".to_string(),
+            serde_json::Value::String(service_tier.clone()),
+        );
+    }
+    request
+}
+
+fn reasoning_effort_from_name(value: &str) -> Option<ReasoningEffort> {
+    match value {
+        "none" | "off" => Some(ReasoningEffort::None),
+        "minimal" => Some(ReasoningEffort::Minimal),
+        "low" => Some(ReasoningEffort::Low),
+        "medium" => Some(ReasoningEffort::Medium),
+        "high" => Some(ReasoningEffort::High),
+        "max" | "xhigh" => Some(ReasoningEffort::Max),
+        _ => None,
     }
 }
 
@@ -990,6 +1027,7 @@ fn route_headers(
         fallback_used(attempted_model_id, decision),
     );
     insert_route_attribute_headers(&mut headers, model);
+    insert_request_control_headers(&mut headers, &decision.request_controls);
     if let Some(reasoning) = &decision.reasoning {
         insert_header(
             &mut headers,
@@ -1012,6 +1050,22 @@ fn route_headers(
         );
     }
     headers
+}
+
+fn insert_request_control_headers(headers: &mut HeaderMap, controls: &SelectedRequestControls) {
+    if let Some(service_tier) = &controls.service_tier {
+        insert_header(headers, "x-brouter-service-tier", service_tier);
+    }
+    if let Some(reasoning_effort) = &controls.reasoning_effort {
+        insert_header(headers, "x-brouter-reasoning-effort", reasoning_effort);
+    }
+    if !controls.resource_pools.is_empty() {
+        insert_header(
+            headers,
+            "x-brouter-resource-pools",
+            &controls.resource_pools.join(","),
+        );
+    }
 }
 
 fn insert_route_attribute_headers(headers: &mut HeaderMap, model: &RouteableModel) {
@@ -1108,11 +1162,218 @@ async fn route_request(
             decision.features.required_context_tokens,
         );
     }
-    let decision = invoke_llm_judge(state, &decision)
+    let mut decision = invoke_llm_judge(state, &decision)
         .await
         .map_err(&|e| router_error_response(&e))?
         .unwrap_or(decision);
+    apply_selected_request_controls(state, request, &mut decision);
     Ok(decision)
+}
+
+fn apply_selected_request_controls(
+    state: &AppState,
+    request: &ChatCompletionRequest,
+    decision: &mut RoutingDecision,
+) {
+    let mut controls = SelectedRequestControls::default();
+    if let Some(reasoning) = &decision.reasoning {
+        controls.service_tier.clone_from(&reasoning.service_tier);
+        controls
+            .reasoning_effort
+            .clone_from(&reasoning.reasoning_effort);
+    }
+
+    if controls.reasoning_effort.is_none() {
+        controls.reasoning_effort =
+            request
+                .reasoning_effort
+                .map(reasoning_effort_name)
+                .or_else(|| {
+                    Some(match decision.features.reasoning {
+                        brouter_router_models::ReasoningLevel::Low => "low".to_string(),
+                        brouter_router_models::ReasoningLevel::Medium => "medium".to_string(),
+                        brouter_router_models::ReasoningLevel::High => "high".to_string(),
+                    })
+                });
+    }
+
+    if controls.service_tier.is_none()
+        && let Some(model) = route_model(state, &decision.selected_model)
+    {
+        controls.service_tier = model.attributes.get("latency_class").cloned();
+    }
+
+    clamp_controls_to_dynamic_policy(state, decision, &mut controls);
+    if let Some(service_tier) = controls.service_tier.clone() {
+        align_selected_model_to_service_tier(state, decision, &service_tier);
+    }
+    promote_selected_candidate(decision);
+    controls.resource_pools = matching_resource_pool_ids(state, decision, &controls);
+    decision.request_controls = controls;
+}
+
+fn reasoning_effort_name(effort: ReasoningEffort) -> String {
+    match effort {
+        ReasoningEffort::None => "none",
+        ReasoningEffort::Minimal => "minimal",
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::Max => "max",
+    }
+    .to_string()
+}
+
+fn promote_selected_candidate(decision: &mut RoutingDecision) {
+    if let Some(index) = decision
+        .candidates
+        .iter()
+        .position(|candidate| candidate.model_id == decision.selected_model)
+    {
+        let candidate = decision.candidates.remove(index);
+        decision.candidates.insert(0, candidate);
+    }
+}
+
+fn align_selected_model_to_service_tier(
+    state: &AppState,
+    decision: &mut RoutingDecision,
+    service_tier: &str,
+) {
+    let Some(current) = route_model(state, &decision.selected_model).cloned() else {
+        return;
+    };
+    if current
+        .attributes
+        .get("latency_class")
+        .is_some_and(|value| value == service_tier)
+    {
+        return;
+    }
+    if let Some(replacement) = state.router.models().iter().find(|model| {
+        model.provider == current.provider
+            && model.upstream_model == current.upstream_model
+            && model
+                .attributes
+                .get("latency_class")
+                .is_some_and(|value| value == service_tier)
+    }) {
+        decision.selected_model = replacement.id.clone();
+        decision.reasons.push(format!(
+            "matched judge-selected service tier {service_tier}"
+        ));
+    }
+}
+
+fn clamp_controls_to_dynamic_policy(
+    state: &AppState,
+    decision: &RoutingDecision,
+    controls: &mut SelectedRequestControls,
+) {
+    let Some(model) = route_model(state, &decision.selected_model) else {
+        return;
+    };
+    for effect in &state.dynamic_policy_effects {
+        match effect {
+            DynamicPolicyEffect::Exclude { selector, .. }
+                if selector_matches_controls(selector, model, controls) =>
+            {
+                downgrade_expensive_controls(controls);
+            }
+            DynamicPolicyEffect::DisableAttribute {
+                selector,
+                key,
+                value,
+                ..
+            } if selector_matches_controls(selector, model, controls) => {
+                if key == "latency_class" && controls.service_tier.as_ref() == Some(value) {
+                    controls.service_tier = Some("standard".to_string());
+                }
+                if key == "reasoning_effort" && controls.reasoning_effort.as_ref() == Some(value) {
+                    controls.reasoning_effort = Some("medium".to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn downgrade_expensive_controls(controls: &mut SelectedRequestControls) {
+    if controls.service_tier.as_deref() == Some("priority") {
+        controls.service_tier = Some("standard".to_string());
+    }
+    if controls.reasoning_effort.as_deref() == Some("high") {
+        controls.reasoning_effort = Some("medium".to_string());
+    }
+}
+
+fn matching_resource_pool_ids(
+    state: &AppState,
+    decision: &RoutingDecision,
+    controls: &SelectedRequestControls,
+) -> Vec<String> {
+    let Some(model) = route_model(state, &decision.selected_model) else {
+        return Vec::new();
+    };
+    state
+        .introspection_snapshots
+        .iter()
+        .filter_map(|snapshot| snapshot.account.as_ref())
+        .flat_map(|account| &account.pools)
+        .filter(|pool| resource_selector_matches(pool, model, controls))
+        .map(|pool| pool.id.clone())
+        .collect()
+}
+
+fn route_model<'a>(state: &'a AppState, model_id: &ModelId) -> Option<&'a RouteableModel> {
+    state
+        .router
+        .models()
+        .iter()
+        .find(|model| &model.id == model_id)
+}
+
+fn resource_selector_matches(
+    pool: &ResourcePool,
+    model: &RouteableModel,
+    controls: &SelectedRequestControls,
+) -> bool {
+    selector_matches_controls(&pool.applies_to, model, controls)
+}
+
+fn selector_matches_controls(
+    selector: &ResourceSelector,
+    model: &RouteableModel,
+    controls: &SelectedRequestControls,
+) -> bool {
+    if !selector.providers.is_empty() && !selector.providers.contains(&model.provider) {
+        return false;
+    }
+    if !selector.upstream_models.is_empty()
+        && !selector.upstream_models.contains(&model.upstream_model)
+    {
+        return false;
+    }
+    if !selector.configured_models.is_empty() && !selector.configured_models.contains(&model.id) {
+        return false;
+    }
+    if selector
+        .capabilities
+        .iter()
+        .any(|capability| !model.has_capability(*capability))
+    {
+        return false;
+    }
+    selector.attributes.iter().all(|(key, value)| {
+        if key == "reasoning_effort" {
+            controls.reasoning_effort.as_ref() == Some(value)
+        } else if key == "latency_class" || key == "service_tier" {
+            model.attributes.get("latency_class") == Some(value)
+                || controls.service_tier.as_ref() == Some(value)
+        } else {
+            model.attributes.get(key) == Some(value)
+        }
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1203,36 +1464,28 @@ async fn invoke_llm_judge(
         debug!(model_id = %candidate_id, "trying judge model");
 
         // Look up the actual model config to get the correct provider.
-        let (upstream_model, provider_id) = state
+        let judge_model = state
             .router
             .models()
             .iter()
             .find(|m| &m.id == candidate_id)
-            .map_or_else(
-                || {
-                    (
-                        candidate_id.to_string(),
-                        judge_config
-                            .provider
-                            .clone()
-                            .unwrap_or_else(|| ProviderId::new("local")),
-                    )
-                },
-                |m| (m.upstream_model.clone(), m.provider.clone()),
-            );
-        let judge_model = RouteableModel {
-            id: candidate_id.clone(),
-            provider: provider_id,
-            upstream_model,
-            context_window: 128_000,
-            input_cost_per_million: 0.0,
-            output_cost_per_million: 0.0,
-            quality: 50,
-            capabilities: vec![],
-            attributes: BTreeMap::new(),
-            display_badges: vec![],
-            metadata: ResolvedModelMetadata::default(),
-        };
+            .cloned()
+            .unwrap_or_else(|| RouteableModel {
+                id: candidate_id.clone(),
+                provider: judge_config
+                    .provider
+                    .clone()
+                    .unwrap_or_else(|| ProviderId::new("local")),
+                upstream_model: candidate_id.to_string(),
+                context_window: 128_000,
+                input_cost_per_million: 0.0,
+                output_cost_per_million: 0.0,
+                quality: 50,
+                capabilities: vec![],
+                attributes: BTreeMap::new(),
+                display_badges: vec![],
+                metadata: ResolvedModelMetadata::default(),
+            });
 
         match state
             .provider_client
@@ -1267,8 +1520,71 @@ async fn invoke_llm_judge(
     Ok(Some(updated))
 }
 
-fn build_judge_session_context(_state: &AppState) -> JudgeSessionContext {
-    JudgeSessionContext::default()
+fn build_judge_session_context(state: &AppState) -> JudgeSessionContext {
+    JudgeSessionContext {
+        resource_summary: resource_summary_lines(state),
+        ..JudgeSessionContext::default()
+    }
+}
+
+fn resource_summary_lines(state: &AppState) -> Vec<String> {
+    state
+        .introspection_snapshots
+        .iter()
+        .flat_map(|snapshot| {
+            let provider = snapshot.provider.to_string();
+            snapshot
+                .account
+                .as_ref()
+                .into_iter()
+                .flat_map(move |account| {
+                    let provider = provider.clone();
+                    account.pools.iter().map(move |pool| {
+                        format!(
+                            "provider={provider} pool={} kind={:?} unit={:?} remaining={} total={} reset_at_ms={} applies_to={}",
+                            pool.id,
+                            pool.kind,
+                            pool.unit,
+                            optional_f64(pool.remaining),
+                            optional_f64(pool.total),
+                            optional_u64(pool.reset_at_ms.or(pool.refill_at_ms).or(pool.expires_at_ms)),
+                            selector_summary(&pool.applies_to),
+                        )
+                    })
+                })
+        })
+        .collect()
+}
+
+fn optional_f64(value: Option<f64>) -> String {
+    value.map_or_else(|| "unknown".to_string(), |value| format!("{value:.3}"))
+}
+
+fn optional_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "unknown".to_string(), |value| value.to_string())
+}
+
+fn selector_summary(selector: &ResourceSelector) -> String {
+    let mut parts = Vec::new();
+    if !selector.providers.is_empty() {
+        parts.push(format!(
+            "providers=[{}]",
+            selector
+                .providers
+                .iter()
+                .map(ProviderId::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    if !selector.attributes.is_empty() {
+        parts.push(format!("attributes={:?}", selector.attributes));
+    }
+    if parts.is_empty() {
+        "all".to_string()
+    } else {
+        parts.join(" ")
+    }
 }
 
 fn extract_prompt_text(features: &brouter_router_models::PromptFeatures) -> String {

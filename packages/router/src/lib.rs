@@ -252,6 +252,7 @@ impl Router {
             reasons,
             candidates,
             excluded_candidates,
+            request_controls: brouter_router_models::SelectedRequestControls::default(),
             reasoning: None,
         })
     }
@@ -709,6 +710,8 @@ fn score_model(
         capabilities: model.capabilities.clone(),
         provider: model.provider.to_string(),
         quality: model.quality,
+        attributes: model.attributes.clone(),
+        display_badges: model.display_badges.clone(),
         metadata: model.metadata.clone(),
     }
 }

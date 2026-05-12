@@ -239,6 +239,10 @@ pub struct ScoredCandidate {
     pub provider: String,
     pub quality: u8,
     #[serde(default)]
+    pub attributes: BTreeMap<String, String>,
+    #[serde(default)]
+    pub display_badges: Vec<String>,
+    #[serde(default)]
     pub metadata: ResolvedModelMetadata,
 }
 
@@ -252,9 +256,32 @@ pub struct RoutingDecision {
     pub candidates: Vec<ScoredCandidate>,
     #[serde(default)]
     pub excluded_candidates: Vec<ExcludedCandidate>,
+    #[serde(default, skip_serializing_if = "SelectedRequestControls::is_empty")]
+    pub request_controls: SelectedRequestControls,
     /// LLM-generated reasoning for why this model was selected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ModelReasoning>,
+}
+
+/// Concrete request controls selected by the router/judge.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectedRequestControls {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resource_pools: Vec<String>,
+}
+
+impl SelectedRequestControls {
+    /// Returns true when no request controls were selected.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.service_tier.is_none()
+            && self.reasoning_effort.is_none()
+            && self.resource_pools.is_empty()
+    }
 }
 
 /// LLM-generated reasoning attached to a routing decision.
@@ -266,6 +293,12 @@ pub struct ModelReasoning {
     pub rationale: String,
     /// The model chosen by the LLM judge.
     pub chosen_model: ModelId,
+    /// Service tier chosen by the LLM judge, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    /// Reasoning effort chosen by the LLM judge, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// True when the LLM judge overrode the deterministic top pick.
     pub overridden: bool,
     /// Error message if reasoning generation failed.
@@ -331,6 +364,8 @@ pub struct JudgeSessionContext {
     pub accumulated_cost: f64,
     /// Recent routing decisions (model IDs and intents).
     pub recent_decisions: Vec<RecentDecision>,
+    /// Human-readable live quota/resource state for judge context.
+    pub resource_summary: Vec<String>,
 }
 
 /// A lightweight recent routing decision for judge context.

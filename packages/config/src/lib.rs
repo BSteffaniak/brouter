@@ -142,6 +142,7 @@ pub fn apply_default_config(config: &mut BrouterConfig) {
     apply_provider_presets(config);
     apply_env_provider_autodetection(config);
     apply_default_dynamic_policy(config);
+    apply_default_openai_codex_introspection(config);
     // Apply auto-detected omit_request_fields after presets and manual configs
     apply_default_omit_request_fields(config);
 }
@@ -294,6 +295,16 @@ fn apply_default_omit_request_fields(config: &mut BrouterConfig) {
     }
 }
 
+fn apply_default_openai_codex_introspection(config: &mut BrouterConfig) {
+    for provider in config.providers.values_mut() {
+        if provider.kind == ProviderKind::OpenaiCodex && !provider.introspection.disabled {
+            provider.introspection.enabled = true;
+            provider.introspection.account = true;
+            provider.introspection.limits = true;
+        }
+    }
+}
+
 fn apply_default_dynamic_policy(config: &mut BrouterConfig) {
     config
         .router
@@ -301,6 +312,12 @@ fn apply_default_dynamic_policy(config: &mut BrouterConfig) {
         .disable_attributes_when_low
         .entry("latency_class".to_string())
         .or_insert_with(|| "priority".to_string());
+    config
+        .router
+        .dynamic_policy
+        .disable_attributes_when_low
+        .entry("reasoning_effort".to_string())
+        .or_insert_with(|| "high".to_string());
 }
 
 /// Validates a parsed brouter configuration.

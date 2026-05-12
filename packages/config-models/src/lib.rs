@@ -564,6 +564,8 @@ pub struct ResourceSelectorConfig {
 #[allow(clippy::struct_excessive_bools)]
 pub struct ProviderIntrospectionConfig {
     #[serde(default)]
+    pub disabled: bool,
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_introspection_catalog")]
     pub catalog: bool,
@@ -571,15 +573,19 @@ pub struct ProviderIntrospectionConfig {
     pub account: bool,
     #[serde(default)]
     pub limits: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usage_endpoints: Vec<String>,
 }
 
 impl Default for ProviderIntrospectionConfig {
     fn default() -> Self {
         Self {
+            disabled: false,
             enabled: false,
             catalog: default_introspection_catalog(),
             account: false,
             limits: false,
+            usage_endpoints: Vec::new(),
         }
     }
 }

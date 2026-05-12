@@ -138,6 +138,12 @@ timeout_ms = 60000
 # auth_profile = "openai-max"
 # auth_vault_path = "~/.local/state/brouter/auth/vault"
 # timeout_ms = 60000
+# # openai-codex account/usage introspection is auto-enabled by default.
+# # Set disabled = true to opt out, or provide usage_endpoints to override
+# # private ChatGPT/Codex usage endpoint probing when OpenAI changes it.
+# # [providers.openai_max.introspection]
+# # disabled = false
+# # usage_endpoints = ["https://chatgpt.com/backend-api/codex/usage"]
 #
 # Attribute mappings translate brouter's generic model attributes into
 # provider-specific request fields only when the selected model has that

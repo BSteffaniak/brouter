@@ -4,9 +4,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use brouter_api_models::{ChatCompletionRequest, ChatMessage, MessageContent};
+use brouter_api_models::{ChatCompletionRequest, ChatMessage, MessageContent, ReasoningEffort};
+use brouter_catalog_models::{MetadataProvenance, MetadataSource};
 use brouter_config_models::ProviderConfig;
-use brouter_provider_models::RouteableModel;
+use brouter_introspection_models::{
+    AccountSnapshot, AccountStatus, IntrospectionRequest, IntrospectionSnapshot,
+    IntrospectionWarning, ResourceKind, ResourcePool, ResourceScope, ResourceSelector,
+    ResourceUnit, SnapshotSource, SnapshotSourceKind,
+};
+use brouter_provider_models::{ModelCapability, ProviderId, RouteableModel};
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
@@ -144,6 +150,328 @@ pub async fn chat_completions_response(
         status,
         stream: Box::pin(stream),
     })
+}
+
+pub async fn introspect(
+    http: &reqwest::Client,
+    provider_id: &ProviderId,
+    provider: &ProviderConfig,
+    request: IntrospectionRequest,
+) -> Result<IntrospectionSnapshot, ProviderError> {
+    let model = introspection_model(provider_id);
+    let mut auth = codex_auth(provider, &model)?;
+    refresh_auth_if_needed(http, &mut auth, &model).await?;
+
+    let mut warnings = Vec::new();
+    let mut account = None;
+    if request.include_account || request.include_limits {
+        match fetch_usage_snapshot(http, provider_id, provider, &auth).await {
+            Some(snapshot) => account = Some(snapshot),
+            None => warnings.push(IntrospectionWarning::new(
+                "codex_usage_unavailable",
+                "OpenAI Codex usage endpoints did not return a recognized usage payload",
+            )),
+        }
+    }
+
+    Ok(IntrospectionSnapshot {
+        provider: provider_id.clone(),
+        fetched_at_ms: unix_millis(),
+        source: SnapshotSource {
+            kind: SnapshotSourceKind::ProviderApi,
+            endpoint: Some("chatgpt.com/backend-api".to_string()),
+            label: Some("openai_codex_usage".to_string()),
+        },
+        catalog: None,
+        account,
+        warnings,
+    })
+}
+
+fn introspection_model(provider_id: &ProviderId) -> RouteableModel {
+    RouteableModel {
+        id: brouter_provider_models::ModelId::new("openai_codex_introspection"),
+        provider: provider_id.clone(),
+        upstream_model: "gpt-5.5".to_string(),
+        context_window: 1_000_000,
+        input_cost_per_million: 0.0,
+        output_cost_per_million: 0.0,
+        quality: 0,
+        capabilities: vec![ModelCapability::Chat],
+        attributes: BTreeMap::new(),
+        display_badges: Vec::new(),
+        metadata: brouter_catalog_models::ResolvedModelMetadata::default(),
+    }
+}
+
+async fn fetch_usage_snapshot(
+    http: &reqwest::Client,
+    provider_id: &ProviderId,
+    provider: &ProviderConfig,
+    auth: &CodexAuth,
+) -> Option<AccountSnapshot> {
+    for endpoint in codex_usage_endpoints(provider) {
+        let Ok(response) = codex_usage_request(http, provider, auth, &endpoint).await else {
+            continue;
+        };
+        if !response.status().is_success() {
+            continue;
+        }
+        let Ok(value) = response.json::<Value>().await else {
+            continue;
+        };
+        let pools = usage_resource_pools(provider_id, &endpoint, &value);
+        if !pools.is_empty() {
+            return Some(AccountSnapshot {
+                account_id: auth.account_id.clone(),
+                status: AccountStatus::Available,
+                pools,
+            });
+        }
+    }
+    None
+}
+
+fn codex_usage_endpoints(provider: &ProviderConfig) -> Vec<String> {
+    if !provider.introspection.usage_endpoints.is_empty() {
+        return provider.introspection.usage_endpoints.clone();
+    }
+    vec![
+        "https://chatgpt.com/backend-api/codex/usage".to_string(),
+        "https://chatgpt.com/backend-api/codex/usage_limits".to_string(),
+        "https://chatgpt.com/backend-api/codex/limits".to_string(),
+        "https://chatgpt.com/backend-api/accounts/check/v4".to_string(),
+    ]
+}
+
+async fn codex_usage_request(
+    http: &reqwest::Client,
+    provider: &ProviderConfig,
+    auth: &CodexAuth,
+    endpoint: &str,
+) -> Result<reqwest::Response, ProviderError> {
+    let url = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else {
+        format!("https://chatgpt.com{endpoint}")
+    };
+    let mut builder = http
+        .get(url)
+        .bearer_auth(&auth.access_token)
+        .header("OpenAI-Beta", "responses=experimental")
+        .header("originator", "brouter")
+        .header("User-Agent", "brouter/0.1.0")
+        .header("accept", "application/json");
+    if let Some(account_id) = &auth.account_id {
+        builder = builder.header("ChatGPT-Account-Id", account_id);
+    }
+    send_provider_request(builder, provider, RequestTimeoutScope::FullResponse).await
+}
+
+fn usage_resource_pools(
+    provider_id: &ProviderId,
+    endpoint: &str,
+    value: &Value,
+) -> Vec<ResourcePool> {
+    let mut pools = Vec::new();
+    collect_usage_pools(provider_id, endpoint, value, "usage", &mut pools);
+    pools
+}
+
+fn collect_usage_pools(
+    provider_id: &ProviderId,
+    endpoint: &str,
+    value: &Value,
+    path: &str,
+    pools: &mut Vec<ResourcePool>,
+) {
+    match value {
+        Value::Object(object) => {
+            if let Some(pool) = resource_pool_from_object(provider_id, endpoint, path, object) {
+                pools.push(pool);
+            }
+            for (key, child) in object {
+                collect_usage_pools(
+                    provider_id,
+                    endpoint,
+                    child,
+                    &format!("{path}.{key}"),
+                    pools,
+                );
+            }
+        }
+        Value::Array(values) => {
+            for (index, child) in values.iter().enumerate() {
+                collect_usage_pools(
+                    provider_id,
+                    endpoint,
+                    child,
+                    &format!("{path}[{index}]"),
+                    pools,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn resource_pool_from_object(
+    provider_id: &ProviderId,
+    endpoint: &str,
+    path: &str,
+    object: &serde_json::Map<String, Value>,
+) -> Option<ResourcePool> {
+    let total = number_field(object, &["total", "limit", "quota", "max", "maximum"]);
+    let used = number_field(object, &["used", "consumed", "usage", "current"]);
+    let remaining = number_field(
+        object,
+        &["remaining", "available", "left", "remaining_count"],
+    )
+    .or_else(|| total.zip(used).map(|(total, used)| (total - used).max(0.0)));
+    if total.is_none() && used.is_none() && remaining.is_none() {
+        return None;
+    }
+
+    let label = string_field(object, &["id", "name", "type", "bucket", "window"])
+        .unwrap_or_else(|| path.to_string());
+    Some(ResourcePool {
+        id: sanitize_pool_id(&label),
+        scope: resource_scope_for_label(&label),
+        kind: resource_kind_for_label(&label),
+        unit: resource_unit_for_label(&label),
+        remaining,
+        total,
+        used,
+        refill_at_ms: timestamp_ms_field(object, &["refill_at", "refill_at_ms"]),
+        reset_at_ms: timestamp_ms_field(object, &["reset_at", "reset_at_ms", "resets_at"]),
+        expires_at_ms: timestamp_ms_field(object, &["expires_at", "expires_at_ms"]),
+        applies_to: usage_selector(provider_id, &label),
+        provenance: MetadataProvenance {
+            source: MetadataSource::ProviderApi,
+            source_label: Some("openai_codex_usage".to_string()),
+            source_url: Some(endpoint.to_string()),
+            reason: Some(path.to_string()),
+            verified_at_ms: Some(unix_millis()),
+        },
+    })
+}
+
+fn number_field(object: &serde_json::Map<String, Value>, names: &[&str]) -> Option<f64> {
+    names
+        .iter()
+        .find_map(|name| object.get(*name).and_then(value_as_f64))
+}
+
+fn string_field(object: &serde_json::Map<String, Value>, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        object
+            .get(*name)
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn timestamp_ms_field(object: &serde_json::Map<String, Value>, names: &[&str]) -> Option<u64> {
+    number_field(object, names).map(|value| {
+        if !value.is_finite() || value.is_sign_negative() {
+            return 0;
+        }
+        let seconds = if value < 10_000_000_000.0 {
+            value
+        } else {
+            value / 1_000.0
+        };
+        let millis = std::time::Duration::from_secs_f64(seconds).as_millis();
+        u64::try_from(millis).unwrap_or(u64::MAX)
+    })
+}
+
+fn value_as_f64(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+}
+
+fn sanitize_pool_id(label: &str) -> String {
+    let id = label
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    id.trim_matches('_').to_string()
+}
+
+fn resource_scope_for_label(label: &str) -> ResourceScope {
+    let label = label.to_lowercase();
+    if label.contains("priority") || label.contains("tier") || label.contains("thinking") {
+        ResourceScope::Attribute
+    } else if label.contains("model") || label.contains("gpt") || label.contains("codex") {
+        ResourceScope::Model
+    } else {
+        ResourceScope::Account
+    }
+}
+
+fn resource_kind_for_label(label: &str) -> ResourceKind {
+    let label = label.to_lowercase();
+    if label.contains("priority") {
+        ResourceKind::PriorityAllowance
+    } else if label.contains("token") {
+        ResourceKind::TokenBudget
+    } else if label.contains("rate") {
+        ResourceKind::RateLimit
+    } else if label.contains("request") || label.contains("message") || label.contains("5h") {
+        ResourceKind::RequestBudget
+    } else {
+        ResourceKind::SubscriptionAllowance
+    }
+}
+
+fn resource_unit_for_label(label: &str) -> ResourceUnit {
+    let label = label.to_lowercase();
+    if label.contains("token") {
+        ResourceUnit::Tokens
+    } else if label.contains("rpm") || label.contains("request_per_minute") {
+        ResourceUnit::RequestsPerMinute
+    } else if label.contains("percent") || label.contains("ratio") {
+        ResourceUnit::Percent
+    } else {
+        ResourceUnit::Requests
+    }
+}
+
+fn usage_selector(provider_id: &ProviderId, label: &str) -> ResourceSelector {
+    let mut attributes = BTreeMap::new();
+    let lower = label.to_lowercase();
+    if lower.contains("priority") {
+        attributes.insert("latency_class".to_string(), "priority".to_string());
+    }
+    if lower.contains("standard") {
+        attributes.insert("latency_class".to_string(), "standard".to_string());
+    }
+    if lower.contains("high") || lower.contains("reasoning") || lower.contains("thinking") {
+        attributes.insert("reasoning_effort".to_string(), "high".to_string());
+    }
+    ResourceSelector {
+        providers: vec![provider_id.clone()],
+        upstream_models: Vec::new(),
+        configured_models: Vec::new(),
+        attributes,
+        capabilities: Vec::new(),
+    }
+}
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 fn codex_auth(
@@ -396,6 +724,10 @@ struct CodexResponsesRequest {
     tool_choice: &'static str,
     parallel_tool_calls: bool,
     text: CodexTextOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<CodexReasoningOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<String>,
     include: Vec<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_key: Option<String>,
@@ -408,6 +740,11 @@ struct CodexResponsesRequest {
 #[derive(Debug, Serialize)]
 struct CodexTextOptions {
     verbosity: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexReasoningOptions {
+    effort: String,
 }
 
 fn codex_request_body(model: &RouteableModel, request: &ChatCompletionRequest) -> Value {
@@ -432,12 +769,30 @@ fn codex_request_body(model: &RouteableModel, request: &ChatCompletionRequest) -
         tool_choice: "auto",
         parallel_tool_calls: true,
         text: CodexTextOptions { verbosity: "low" },
+        reasoning: codex_reasoning(request),
+        service_tier: request
+            .extra
+            .get("service_tier")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
         include: vec!["reasoning.encrypted_content"],
         prompt_cache_key: codex_session_id(request),
         temperature: request.temperature,
         top_p: request.top_p,
     };
     serde_json::to_value(body).unwrap_or_else(|_| json!({}))
+}
+
+fn codex_reasoning(request: &ChatCompletionRequest) -> Option<CodexReasoningOptions> {
+    let effort = match request.reasoning_effort? {
+        ReasoningEffort::None => return None,
+        ReasoningEffort::Minimal | ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High | ReasoningEffort::Max => "high",
+    };
+    Some(CodexReasoningOptions {
+        effort: effort.to_string(),
+    })
 }
 
 fn codex_session_id(request: &ChatCompletionRequest) -> Option<String> {
@@ -900,6 +1255,46 @@ mod tests {
     }
 
     #[test]
+    fn codex_request_maps_reasoning_and_service_tier() {
+        let model = routeable_model();
+        let mut request = test_request();
+        request.reasoning_effort = Some(ReasoningEffort::High);
+        request.extra.insert(
+            "service_tier".to_string(),
+            Value::String("priority".to_string()),
+        );
+
+        let body = codex_request_body(&model, &request);
+
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["service_tier"], "priority");
+    }
+
+    #[test]
+    fn codex_usage_parser_builds_priority_pool() {
+        let provider_id = ProviderId::new("openai_max");
+        let value = json!({
+            "usage_limits": {
+                "priority": {
+                    "used": 8,
+                    "total": 10,
+                    "reset_at_ms": 12345
+                }
+            }
+        });
+
+        let pools = usage_resource_pools(&provider_id, "https://example.test/usage", &value);
+
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].kind, ResourceKind::PriorityAllowance);
+        assert_eq!(pools[0].remaining, Some(2.0));
+        assert_eq!(
+            pools[0].applies_to.attributes.get("latency_class"),
+            Some(&"priority".to_string())
+        );
+    }
+
+    #[test]
     fn codex_sse_converts_text_to_openai_completion() {
         let body = codex_sse_to_chat_completion(
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hel\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n\ndata: {\"type\":\"response.completed\"}\n\n",
@@ -907,6 +1302,30 @@ mod tests {
         );
 
         assert_eq!(body["choices"][0]["message"]["content"], "hello");
+    }
+
+    fn test_request() -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "auto".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: MessageContent::Text("hello".to_string()),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                extra: BTreeMap::new(),
+            }],
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            reasoning_effort: None,
+            stream: Some(true),
+            tools: None,
+            tool_choice: None,
+            response_format: None,
+            metadata: None,
+            extra: BTreeMap::new(),
+        }
     }
 
     fn routeable_model() -> RouteableModel {

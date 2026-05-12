@@ -121,10 +121,9 @@ impl ProviderClient {
                 self.anthropic_introspection(provider_id, provider, request)
                     .await
             }
-            ProviderKind::OpenaiCodex => Ok(unsupported_introspection_snapshot(
-                provider_id,
-                "openai-codex live introspection adapter is not implemented yet",
-            )),
+            ProviderKind::OpenaiCodex => {
+                openai_codex::introspect(&self.http, provider_id, provider, request).await
+            }
         }
     }
 
@@ -849,24 +848,6 @@ fn empty_introspection_snapshot(provider_id: &ProviderId, endpoint: &str) -> Int
         catalog: None,
         account: None,
         warnings: Vec::new(),
-    }
-}
-
-fn unsupported_introspection_snapshot(
-    provider_id: &ProviderId,
-    message: &str,
-) -> IntrospectionSnapshot {
-    IntrospectionSnapshot {
-        provider: provider_id.clone(),
-        fetched_at_ms: unix_millis(),
-        source: SnapshotSource {
-            kind: brouter_introspection_models::SnapshotSourceKind::Unknown,
-            endpoint: None,
-            label: None,
-        },
-        catalog: None,
-        account: None,
-        warnings: vec![IntrospectionWarning::new("unsupported", message)],
     }
 }
 

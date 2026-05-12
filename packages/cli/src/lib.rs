@@ -30,7 +30,10 @@ use brouter_router::{
     DEFAULT_JUDGE_SYSTEM_PROMPT, build_judge_prompt, judge_request, parse_judge_response,
     should_fire_trigger, top_2_score_gap,
 };
-use brouter_router_models::{JudgeConfig, RoutingDecision, RoutingObjective, ScoredCandidate};
+use brouter_router_models::{
+    JudgeConfig, ReasoningLevel, RoutingDecision, RoutingObjective, ScoredCandidate,
+    SelectedRequestControls,
+};
 use clap::{Parser, Subcommand};
 use rand::TryRng as _;
 use serde::Deserialize;
@@ -962,10 +965,40 @@ async fn explain_route(
         routing_rules(config),
     );
     let decision = router.route_chat(&prompt_request(prompt), first_message)?;
-    let decision =
+    let mut decision =
         maybe_invoke_judge(config, judge_config.as_ref(), &decision, force_judge).await?;
+    apply_explain_controls(&mut decision);
     println!("{}", serde_json::to_string_pretty(&decision)?);
     Ok(())
+}
+
+fn apply_explain_controls(decision: &mut RoutingDecision) {
+    let selected = decision
+        .candidates
+        .iter()
+        .find(|candidate| candidate.model_id == decision.selected_model);
+    let mut controls = SelectedRequestControls {
+        service_tier: selected
+            .and_then(|candidate| candidate.attributes.get("latency_class"))
+            .cloned(),
+        reasoning_effort: Some(match decision.features.reasoning {
+            ReasoningLevel::Low => "low".to_string(),
+            ReasoningLevel::Medium => "medium".to_string(),
+            ReasoningLevel::High => "high".to_string(),
+        }),
+        resource_pools: Vec::new(),
+    };
+    if let Some(reasoning) = &decision.reasoning {
+        if reasoning.service_tier.is_some() {
+            controls.service_tier.clone_from(&reasoning.service_tier);
+        }
+        if reasoning.reasoning_effort.is_some() {
+            controls
+                .reasoning_effort
+                .clone_from(&reasoning.reasoning_effort);
+        }
+    }
+    decision.request_controls = controls;
 }
 
 /// Optionally invokes the LLM judge and returns the updated decision.
@@ -1057,19 +1090,16 @@ async fn maybe_invoke_judge(
         );
 
         // Look up the actual model config to get the correct provider.
-        let (upstream_model, provider_id) =
-            models.iter().find(|m| &m.id == candidate_id).map_or_else(
-                || {
-                    (
-                        candidate_id.to_string(),
-                        judge_config
-                            .provider
-                            .clone()
-                            .unwrap_or_else(|| ProviderId::new("local")),
-                    )
-                },
-                |m| (m.upstream_model.clone(), m.provider.clone()),
-            );
+        let configured_judge_model = models.iter().find(|m| &m.id == candidate_id).cloned();
+        let provider_id = configured_judge_model.as_ref().map_or_else(
+            || {
+                judge_config
+                    .provider
+                    .clone()
+                    .unwrap_or_else(|| ProviderId::new("local"))
+            },
+            |model| model.provider.clone(),
+        );
 
         // Skip judge providers that have already failed (don't retry).
         if failed_judge_providers.contains(&provider_id) {
@@ -1112,10 +1142,10 @@ async fn maybe_invoke_judge(
 
         let judge_req = judge_request(judge_config, system_prompt, &judge_user_prompt);
 
-        let judge_model = RouteableModel {
+        let judge_model = configured_judge_model.unwrap_or_else(|| RouteableModel {
             id: candidate_id.clone(),
             provider: provider_id.clone(),
-            upstream_model,
+            upstream_model: candidate_id.to_string(),
             context_window: 128_000,
             input_cost_per_million: 0.0,
             output_cost_per_million: 0.0,
@@ -1124,7 +1154,7 @@ async fn maybe_invoke_judge(
             attributes: BTreeMap::new(),
             display_badges: vec![],
             metadata: ResolvedModelMetadata::default(),
-        };
+        });
 
         match client
             .chat_completions(&registry, &judge_model, &judge_req)
