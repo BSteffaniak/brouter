@@ -2931,10 +2931,17 @@ async fn record_model_attempt(
 }
 
 fn session_id(headers: &HeaderMap, request: &ChatCompletionRequest) -> Option<String> {
-    ["x-brouter-session", "x-session-id", "x-request-session-id"]
-        .iter()
-        .find_map(|name| header_value(headers, name).map(ToOwned::to_owned))
-        .or_else(|| metadata_session_id(request))
+    [
+        "x-brouter-session",
+        "session_id",
+        "x-session-id",
+        "x-request-session-id",
+        "x-client-request-id",
+        "x-session-affinity",
+    ]
+    .iter()
+    .find_map(|name| header_value(headers, name).map(ToOwned::to_owned))
+    .or_else(|| metadata_session_id(request))
 }
 
 fn metadata_session_id(request: &ChatCompletionRequest) -> Option<String> {
