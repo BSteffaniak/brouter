@@ -42,6 +42,14 @@ pub struct UsageEvent {
     pub provider_error: Option<String>,
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_source: Option<String>,
     pub success: bool,
 }
 

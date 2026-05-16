@@ -117,6 +117,10 @@ impl TelemetryStore {
                             optional_string_value(event.provider_error.as_deref()),
                             optional_u64_value(event.prompt_tokens),
                             optional_u64_value(event.completion_tokens),
+                            optional_u64_value(event.total_tokens),
+                            optional_u64_value(event.context_tokens),
+                            optional_u64_value(event.context_window),
+                            optional_string_value(event.context_source.as_deref()),
                             DatabaseValue::Bool(event.success),
                         ],
                     )
@@ -362,6 +366,10 @@ CREATE TABLE IF NOT EXISTS usage_events (\
     provider_error TEXT NULL,\
     prompt_tokens INTEGER NULL,\
     completion_tokens INTEGER NULL,\
+    total_tokens INTEGER NULL,\
+    context_tokens INTEGER NULL,\
+    context_window INTEGER NULL,\
+    context_source TEXT NULL,\
     success INTEGER NOT NULL\
 )";
 
@@ -389,6 +397,10 @@ const ADD_USAGE_EVENT_COLUMNS: &[&str] = &[
     "ALTER TABLE usage_events ADD COLUMN judge_rationale TEXT NULL",
     "ALTER TABLE usage_events ADD COLUMN routing_reasons TEXT NULL",
     "ALTER TABLE usage_events ADD COLUMN fallback_used INTEGER NULL",
+    "ALTER TABLE usage_events ADD COLUMN total_tokens INTEGER NULL",
+    "ALTER TABLE usage_events ADD COLUMN context_tokens INTEGER NULL",
+    "ALTER TABLE usage_events ADD COLUMN context_window INTEGER NULL",
+    "ALTER TABLE usage_events ADD COLUMN context_source TEXT NULL",
 ];
 
 const INSERT_USAGE_EVENT: &str = "\
@@ -396,8 +408,9 @@ INSERT INTO usage_events (\
     timestamp_ms, session_id, selected_model, provider, upstream_model, service_tier,\
     reasoning_effort, resource_pools, judge_model, judge_overridden, judge_error,\
     judge_rationale, routing_reasons, fallback_used, estimated_cost, latency_ms,\
-    status_code, provider_error, prompt_tokens, completion_tokens, success\
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    status_code, provider_error, prompt_tokens, completion_tokens, total_tokens, context_tokens,\
+    context_window, context_source, success\
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
 const INSERT_ROUTING_EVENT: &str = "\
 INSERT INTO routing_events (\
@@ -408,7 +421,8 @@ const SELECT_USAGE_EVENTS: &str = "\
 SELECT timestamp_ms, session_id, selected_model, provider, upstream_model, service_tier,\
     reasoning_effort, resource_pools, judge_model, judge_overridden, judge_error,\
     judge_rationale, routing_reasons, fallback_used, estimated_cost, latency_ms,\
-    status_code, provider_error, prompt_tokens, completion_tokens, success \
+    status_code, provider_error, prompt_tokens, completion_tokens, total_tokens, context_tokens,\
+    context_window, context_source, success \
 FROM usage_events ORDER BY id ASC";
 
 const SELECT_ROUTING_EVENTS: &str = "\
@@ -473,6 +487,10 @@ fn row_to_usage_event(row: &Row) -> UsageEvent {
         provider_error: optional_string_column(row, "provider_error"),
         prompt_tokens: optional_u64_column(row, "prompt_tokens"),
         completion_tokens: optional_u64_column(row, "completion_tokens"),
+        total_tokens: optional_u64_column(row, "total_tokens"),
+        context_tokens: optional_u64_column(row, "context_tokens"),
+        context_window: optional_u64_column(row, "context_window"),
+        context_source: optional_string_column(row, "context_source"),
         success: row
             .get("success")
             .is_some_and(|value| value.as_bool().unwrap_or_else(|| value.as_i64() == Some(1))),
@@ -585,6 +603,10 @@ mod tests {
             provider_error: None,
             prompt_tokens: Some(3),
             completion_tokens: Some(2),
+            total_tokens: Some(5),
+            context_tokens: Some(5),
+            context_window: Some(131_072),
+            context_source: Some("provider_usage".to_string()),
             success: true,
         };
         let routing_event = RoutingEvent {

@@ -145,6 +145,10 @@ struct AttemptTelemetry {
     provider_error: Option<String>,
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    context_tokens: Option<u64>,
+    context_window: Option<u64>,
+    context_source: Option<String>,
     success: bool,
 }
 
@@ -1123,6 +1127,10 @@ async fn forward_streaming_with_fallbacks(
                         provider_error: None,
                         prompt_tokens: None,
                         completion_tokens: None,
+                        total_tokens: None,
+                        context_tokens: Some(u64::from(decision.features.required_context_tokens)),
+                        context_window: Some(u64::from(model.context_window)),
+                        context_source: Some("brouter_estimate".to_string()),
                         success: status.is_success(),
                     },
                 )
@@ -1151,6 +1159,7 @@ async fn forward_streaming_with_fallbacks(
                         request_id,
                         &attempt_event_id,
                         session_id(headers, request).as_deref(),
+                        None,
                     );
                     response_headers.insert(
                         header::CONTENT_TYPE,
@@ -1178,6 +1187,10 @@ async fn forward_streaming_with_fallbacks(
                         provider_error: Some(error.clone()),
                         prompt_tokens: None,
                         completion_tokens: None,
+                        total_tokens: None,
+                        context_tokens: Some(u64::from(decision.features.required_context_tokens)),
+                        context_window: Some(u64::from(model.context_window)),
+                        context_source: Some("brouter_estimate".to_string()),
                         success: false,
                     },
                 )
@@ -1245,6 +1258,8 @@ async fn forward_with_fallbacks(
         {
             Ok(provider_response) => {
                 let status = provider_status(provider_response.status);
+                let usage = context_usage_from_body(&provider_response.body, decision);
+                update_session_context_from_usage(state, headers, request, &usage);
                 let attempt_event_id = match record_model_attempt(
                     state,
                     headers,
@@ -1257,8 +1272,12 @@ async fn forward_with_fallbacks(
                         latency_ms: Some(elapsed_millis(started_at)),
                         status_code: Some(status.as_u16()),
                         provider_error: None,
-                        prompt_tokens: prompt_tokens(&provider_response.body),
-                        completion_tokens: completion_tokens(&provider_response.body),
+                        prompt_tokens: usage.prompt_tokens,
+                        completion_tokens: usage.completion_tokens,
+                        total_tokens: usage.total_tokens,
+                        context_tokens: usage.context_tokens,
+                        context_window: Some(u64::from(model.context_window)),
+                        context_source: Some(usage.source.to_string()),
                         success: status.is_success(),
                     },
                 )
@@ -1287,6 +1306,7 @@ async fn forward_with_fallbacks(
                         request_id,
                         &attempt_event_id,
                         session_id(headers, request).as_deref(),
+                        Some(&usage),
                     );
                     return (status, response_headers, Json(provider_response.body))
                         .into_response();
@@ -1310,6 +1330,10 @@ async fn forward_with_fallbacks(
                         provider_error: Some(error.clone()),
                         prompt_tokens: None,
                         completion_tokens: None,
+                        total_tokens: None,
+                        context_tokens: Some(u64::from(decision.features.required_context_tokens)),
+                        context_window: Some(u64::from(model.context_window)),
+                        context_source: Some("brouter_estimate".to_string()),
                         success: false,
                     },
                 )
@@ -1469,6 +1493,7 @@ fn route_headers(
     request_id: &str,
     event_id: &str,
     session_id: Option<&str>,
+    context_usage: Option<&ContextUsage>,
 ) -> HeaderMap {
     let mut headers = HeaderMap::new();
     insert_header(&mut headers, "x-brouter-request-id", request_id);
@@ -1483,6 +1508,7 @@ fn route_headers(
         "x-brouter-upstream-model",
         &model.upstream_model,
     );
+    insert_context_headers(&mut headers, model, decision, context_usage);
     insert_header(
         &mut headers,
         "x-brouter-fallback-used",
@@ -1517,6 +1543,42 @@ fn route_headers(
         );
     }
     headers
+}
+
+fn insert_context_headers(
+    headers: &mut HeaderMap,
+    model: &RouteableModel,
+    decision: &RoutingDecision,
+    context_usage: Option<&ContextUsage>,
+) {
+    let context_window = model.context_window;
+    let context_tokens = context_usage
+        .and_then(|usage| usage.context_tokens)
+        .and_then(|tokens| u32::try_from(tokens).ok())
+        .unwrap_or(decision.features.required_context_tokens);
+    let source = context_usage.map_or_else(
+        || "brouter_estimate".to_string(),
+        |usage| usage.source.to_string(),
+    );
+    insert_header(
+        headers,
+        "x-brouter-context-window",
+        &context_window.to_string(),
+    );
+    insert_header(
+        headers,
+        "x-brouter-context-tokens",
+        &context_tokens.to_string(),
+    );
+    if context_window > 0 {
+        let percent = (f64::from(context_tokens) / f64::from(context_window)) * 100.0;
+        insert_header(
+            headers,
+            "x-brouter-context-percent",
+            &format!("{percent:.1}"),
+        );
+    }
+    insert_header(headers, "x-brouter-context-source", &source);
 }
 
 fn routing_summary_header(model: &RouteableModel, decision: &RoutingDecision) -> String {
@@ -2218,9 +2280,13 @@ async fn prepare_session_routing_state(
     }
 
     let has_session = state.telemetry.has_session(session_id).await?;
-    let mut context_tokens = None;
+    let persisted_context_tokens = persisted_session_context_tokens(state, session_id).await?;
+    let mut context_tokens = persisted_context_tokens;
     if let Ok(mut sessions) = state.session_state.lock() {
         let session = sessions.entry(session_id.to_string()).or_default();
+        if let Some(persisted_context_tokens) = persisted_context_tokens {
+            session.context_tokens = session.context_tokens.max(persisted_context_tokens);
+        }
         let is_first_message = !session.seen && !has_session;
         session.seen = true;
         context_tokens = nonzero_context_tokens(session.context_tokens);
@@ -2241,6 +2307,21 @@ fn update_session_context_tokens(state: &AppState, session_id: &str, required_co
         session.context_tokens = session.context_tokens.max(required_context_tokens);
         session.seen = true;
     }
+}
+
+async fn persisted_session_context_tokens(
+    state: &AppState,
+    session_id: &str,
+) -> Result<Option<u32>, TelemetryError> {
+    Ok(state
+        .telemetry
+        .events()
+        .await?
+        .into_iter()
+        .filter(|event| event.session_id.as_deref() == Some(session_id))
+        .filter_map(|event| event.context_tokens)
+        .filter_map(|tokens| u32::try_from(tokens).ok())
+        .max())
 }
 
 fn nonzero_context_tokens(context_tokens: u32) -> Option<u32> {
@@ -2316,16 +2397,78 @@ fn elapsed_millis(started_at: Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-fn prompt_tokens(body: &serde_json::Value) -> Option<u64> {
-    body.get("usage")
-        .and_then(|usage| usage.get("prompt_tokens"))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextUsageSource {
+    ProviderUsage,
+    BrouterEstimate,
+}
+
+impl std::fmt::Display for ContextUsageSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProviderUsage => formatter.write_str("provider_usage"),
+            Self::BrouterEstimate => formatter.write_str("brouter_estimate"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ContextUsage {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    context_tokens: Option<u64>,
+    source: ContextUsageSource,
+}
+
+fn context_usage_from_body(body: &serde_json::Value, decision: &RoutingDecision) -> ContextUsage {
+    let prompt_tokens = token_usage_field(body, &["usage", "prompt_tokens"])
+        .or_else(|| token_usage_field(body, &["usage", "input_tokens"]));
+    let completion_tokens = token_usage_field(body, &["usage", "completion_tokens"])
+        .or_else(|| token_usage_field(body, &["usage", "output_tokens"]));
+    let total_tokens = token_usage_field(body, &["usage", "total_tokens"]).or_else(|| {
+        prompt_tokens
+            .zip(completion_tokens)
+            .map(|(input, output)| input + output)
+    });
+    let context_tokens = total_tokens.or(prompt_tokens);
+    let source = if context_tokens.is_some() {
+        ContextUsageSource::ProviderUsage
+    } else {
+        ContextUsageSource::BrouterEstimate
+    };
+    ContextUsage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        context_tokens: context_tokens
+            .or_else(|| Some(u64::from(decision.features.required_context_tokens))),
+        source,
+    }
+}
+
+fn token_usage_field(body: &serde_json::Value, path: &[&str]) -> Option<u64> {
+    path.iter()
+        .try_fold(body, |value, key| value.get(*key))
         .and_then(serde_json::Value::as_u64)
 }
 
-fn completion_tokens(body: &serde_json::Value) -> Option<u64> {
-    body.get("usage")
-        .and_then(|usage| usage.get("completion_tokens"))
-        .and_then(serde_json::Value::as_u64)
+fn update_session_context_from_usage(
+    state: &AppState,
+    headers: &HeaderMap,
+    request: &ChatCompletionRequest,
+    usage: &ContextUsage,
+) {
+    let Some(session_id) = session_id(headers, request) else {
+        return;
+    };
+    let Some(context_tokens) = usage
+        .context_tokens
+        .and_then(|tokens| u32::try_from(tokens).ok())
+    else {
+        return;
+    };
+    update_session_context_tokens(state, &session_id, context_tokens);
 }
 
 async fn record_route_decision_event(
@@ -2577,6 +2720,10 @@ async fn record_model_attempt(
             provider_error: attempt.provider_error.clone(),
             prompt_tokens: attempt.prompt_tokens,
             completion_tokens: attempt.completion_tokens,
+            total_tokens: attempt.total_tokens,
+            context_tokens: attempt.context_tokens,
+            context_window: attempt.context_window,
+            context_source: attempt.context_source.clone(),
             success: attempt.success,
         })
         .await?;
@@ -2602,6 +2749,10 @@ async fn record_model_attempt(
                 "provider_error": attempt.provider_error,
                 "prompt_tokens": attempt.prompt_tokens,
                 "completion_tokens": attempt.completion_tokens,
+                "total_tokens": attempt.total_tokens,
+                "context_tokens": attempt.context_tokens,
+                "context_window": attempt.context_window,
+                "context_source": attempt.context_source,
                 "success": attempt.success,
                 "request_controls": decision.request_controls,
                 "routing_reasons": decision.reasons,
@@ -2613,10 +2764,9 @@ async fn record_model_attempt(
 }
 
 fn session_id(headers: &HeaderMap, request: &ChatCompletionRequest) -> Option<String> {
-    headers
-        .get("x-brouter-session")
-        .and_then(|value| value.to_str().ok())
-        .map(ToOwned::to_owned)
+    ["x-brouter-session", "x-session-id", "x-request-session-id"]
+        .iter()
+        .find_map(|name| header_value(headers, name).map(ToOwned::to_owned))
         .or_else(|| metadata_session_id(request))
 }
 
@@ -2624,8 +2774,11 @@ fn metadata_session_id(request: &ChatCompletionRequest) -> Option<String> {
     request
         .metadata
         .as_ref()
-        .and_then(|metadata| metadata.get("session_id"))
-        .and_then(|value| value.as_str())
+        .and_then(|metadata| {
+            ["session_id", "conversation_id", "thread_id"]
+                .iter()
+                .find_map(|key| metadata.get(*key).and_then(|value| value.as_str()))
+        })
         .map(ToOwned::to_owned)
 }
 
