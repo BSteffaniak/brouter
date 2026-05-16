@@ -7,11 +7,12 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Query, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -41,14 +42,16 @@ use brouter_router::{
 };
 use brouter_router_models::{
     JudgeConfig, JudgeSessionContext, RoutingDecision, RoutingObjective, RoutingOptions,
-    SelectedRequestControls,
+    RoutingPreference, SelectedRequestControls,
 };
 use brouter_telemetry::{TelemetryError, TelemetryStore, now_millis};
-use brouter_telemetry_models::UsageEvent;
+use brouter_telemetry_models::{RoutingEvent, RoutingEventKind, SessionSummary, UsageEvent};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, warn};
+
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// HTTP server startup error.
 #[derive(Debug, Error)]
@@ -224,6 +227,13 @@ fn build_app_with_api_key_and_introspection(
         .route("/v1/brouter/route/explain", post(route_explain))
         .route("/v1/brouter/usage", get(usage))
         .route("/v1/brouter/usage/summary", get(usage_summary))
+        .route("/v1/brouter/sessions", get(sessions))
+        .route("/v1/brouter/sessions/{session_id}", get(session))
+        .route(
+            "/v1/brouter/sessions/{session_id}/events",
+            get(session_events),
+        )
+        .route("/v1/brouter/events/{event_id}", get(routing_event))
         .route("/v1/brouter/introspection", get(introspection))
         .route(
             "/v1/brouter/introspection/refresh",
@@ -693,7 +703,8 @@ async fn route_explain(
     Json(request): Json<ChatCompletionRequest>,
 ) -> Result<Json<RoutingDecision>, (StatusCode, Json<ErrorResponse>)> {
     authorize(&state, &headers)?;
-    let decision = route_request(&state, &headers, &request).await?;
+    let request_id = next_request_id();
+    let decision = route_request(&state, &headers, &request, &request_id).await?;
     Ok(Json(decision))
 }
 
@@ -709,6 +720,69 @@ async fn usage(
         .await
         .map(|events| Json(filter_usage_events(events, &query)))
         .map_err(|error| telemetry_error_response(&error))
+}
+
+async fn sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<SessionSummary>>, (StatusCode, Json<ErrorResponse>)> {
+    authorize(&state, &headers)?;
+    state
+        .telemetry
+        .sessions()
+        .await
+        .map(Json)
+        .map_err(|error| telemetry_error_response(&error))
+}
+
+async fn session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(session_id): AxumPath<String>,
+) -> Result<Json<SessionSummary>, (StatusCode, Json<ErrorResponse>)> {
+    authorize(&state, &headers)?;
+    let sessions = state
+        .telemetry
+        .sessions()
+        .await
+        .map_err(|error| telemetry_error_response(&error))?;
+    sessions
+        .into_iter()
+        .find(|summary| summary.session_id == session_id)
+        .map(Json)
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "unknown session", "not_found"))
+}
+
+async fn session_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(session_id): AxumPath<String>,
+) -> Result<Json<Vec<RoutingEvent>>, (StatusCode, Json<ErrorResponse>)> {
+    authorize(&state, &headers)?;
+    state
+        .telemetry
+        .routing_events_for_session(&session_id)
+        .await
+        .map(Json)
+        .map_err(|error| telemetry_error_response(&error))
+}
+
+async fn routing_event(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(event_id): AxumPath<String>,
+) -> Result<Json<RoutingEvent>, (StatusCode, Json<ErrorResponse>)> {
+    authorize(&state, &headers)?;
+    let events = state
+        .telemetry
+        .routing_events()
+        .await
+        .map_err(|error| telemetry_error_response(&error))?;
+    events
+        .into_iter()
+        .find(|event| event.event_id == event_id)
+        .map(Json)
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "unknown routing event", "not_found"))
 }
 
 async fn introspection(
@@ -811,16 +885,24 @@ async fn chat_completions(
         return error.into_response();
     }
 
-    let decision = match route_request(&state, &headers, &request).await {
+    let request_id = next_request_id();
+    let decision = match route_request(&state, &headers, &request, &request_id).await {
         Ok(decision) => decision,
         Err(error) => return error.into_response(),
     };
 
     let effective_request = apply_request_controls(request, &decision);
     if effective_request.is_streaming() {
-        forward_streaming_with_fallbacks(&state, &headers, &effective_request, &decision).await
+        forward_streaming_with_fallbacks(
+            &state,
+            &headers,
+            &effective_request,
+            &decision,
+            &request_id,
+        )
+        .await
     } else {
-        forward_with_fallbacks(&state, &headers, &effective_request, &decision).await
+        forward_with_fallbacks(&state, &headers, &effective_request, &decision, &request_id).await
     }
 }
 
@@ -944,6 +1026,7 @@ async fn forward_streaming_with_fallbacks(
     headers: &HeaderMap,
     request: &ChatCompletionRequest,
     decision: &RoutingDecision,
+    request_id: &str,
 ) -> Response {
     let mut last_error = None;
     let mut last_status = None;
@@ -980,11 +1063,12 @@ async fn forward_streaming_with_fallbacks(
         {
             Ok(response) => {
                 let status = provider_status(response.status);
-                if let Err(error) = record_model_attempt(
+                let attempt_event_id = match record_model_attempt(
                     state,
                     headers,
                     request,
                     decision,
+                    request_id,
                     AttemptTelemetry {
                         model_id: candidate.model_id.clone(),
                         estimated_cost: candidate.estimated_cost,
@@ -998,8 +1082,9 @@ async fn forward_streaming_with_fallbacks(
                 )
                 .await
                 {
-                    return telemetry_error_response(&error).into_response();
-                }
+                    Ok(event_id) => event_id,
+                    Err(error) => return telemetry_error_response(&error).into_response(),
+                };
 
                 if status.is_success() {
                     mark_provider_success(state, &model.provider);
@@ -1009,7 +1094,14 @@ async fn forward_streaming_with_fallbacks(
                 }
 
                 if status.is_success() || !should_try_fallback(status) {
-                    let mut response_headers = route_headers(&model, &candidate.model_id, decision);
+                    let mut response_headers = route_headers(
+                        &model,
+                        &candidate.model_id,
+                        decision,
+                        request_id,
+                        &attempt_event_id,
+                        session_id(headers, request).as_deref(),
+                    );
                     response_headers.insert(
                         header::CONTENT_TYPE,
                         HeaderValue::from_static("text/event-stream"),
@@ -1027,6 +1119,7 @@ async fn forward_streaming_with_fallbacks(
                     headers,
                     request,
                     decision,
+                    request_id,
                     AttemptTelemetry {
                         model_id: candidate.model_id.clone(),
                         estimated_cost: candidate.estimated_cost,
@@ -1061,6 +1154,7 @@ async fn forward_with_fallbacks(
     headers: &HeaderMap,
     request: &ChatCompletionRequest,
     decision: &RoutingDecision,
+    request_id: &str,
 ) -> Response {
     let mut last_error = None;
     let mut last_response = None;
@@ -1095,11 +1189,12 @@ async fn forward_with_fallbacks(
         {
             Ok(provider_response) => {
                 let status = provider_status(provider_response.status);
-                if let Err(error) = record_model_attempt(
+                let attempt_event_id = match record_model_attempt(
                     state,
                     headers,
                     request,
                     decision,
+                    request_id,
                     AttemptTelemetry {
                         model_id: candidate.model_id.clone(),
                         estimated_cost: candidate.estimated_cost,
@@ -1113,8 +1208,9 @@ async fn forward_with_fallbacks(
                 )
                 .await
                 {
-                    return telemetry_error_response(&error).into_response();
-                }
+                    Ok(event_id) => event_id,
+                    Err(error) => return telemetry_error_response(&error).into_response(),
+                };
 
                 if status.is_success() {
                     mark_provider_success(state, &model.provider);
@@ -1124,7 +1220,14 @@ async fn forward_with_fallbacks(
                 }
 
                 if status.is_success() || !should_try_fallback(status) {
-                    let response_headers = route_headers(&model, &candidate.model_id, decision);
+                    let response_headers = route_headers(
+                        &model,
+                        &candidate.model_id,
+                        decision,
+                        request_id,
+                        &attempt_event_id,
+                        session_id(headers, request).as_deref(),
+                    );
                     return (status, response_headers, Json(provider_response.body))
                         .into_response();
                 }
@@ -1138,6 +1241,7 @@ async fn forward_with_fallbacks(
                     headers,
                     request,
                     decision,
+                    request_id,
                     AttemptTelemetry {
                         model_id: candidate.model_id.clone(),
                         estimated_cost: candidate.estimated_cost,
@@ -1276,8 +1380,16 @@ fn route_headers(
     model: &RouteableModel,
     attempted_model_id: &ModelId,
     decision: &RoutingDecision,
+    request_id: &str,
+    event_id: &str,
+    session_id: Option<&str>,
 ) -> HeaderMap {
     let mut headers = HeaderMap::new();
+    insert_header(&mut headers, "x-brouter-request-id", request_id);
+    insert_header(&mut headers, "x-brouter-event-id", event_id);
+    if let Some(session_id) = session_id {
+        insert_header(&mut headers, "x-brouter-session", session_id);
+    }
     insert_header(&mut headers, "x-brouter-selected-model", model.id.as_str());
     insert_header(&mut headers, "x-brouter-provider", model.provider.as_str());
     insert_header(
@@ -1292,6 +1404,11 @@ fn route_headers(
     );
     insert_route_attribute_headers(&mut headers, model);
     insert_request_control_headers(&mut headers, &decision.request_controls);
+    insert_header(
+        &mut headers,
+        "x-brouter-routing-summary",
+        &routing_summary_header(model, decision),
+    );
     if let Some(reasoning) = &decision.reasoning {
         insert_header(
             &mut headers,
@@ -1314,6 +1431,23 @@ fn route_headers(
         );
     }
     headers
+}
+
+fn routing_summary_header(model: &RouteableModel, decision: &RoutingDecision) -> String {
+    let tier = decision
+        .request_controls
+        .service_tier
+        .as_deref()
+        .unwrap_or("default");
+    let reasoning = decision
+        .request_controls
+        .reasoning_effort
+        .as_deref()
+        .unwrap_or("default");
+    format!(
+        "{} via {} tier={} reasoning={}",
+        model.upstream_model, model.provider, tier, reasoning
+    )
 }
 
 fn insert_request_control_headers(headers: &mut HeaderMap, controls: &SelectedRequestControls) {
@@ -1390,6 +1524,7 @@ async fn route_request(
     state: &AppState,
     headers: &HeaderMap,
     request: &ChatCompletionRequest,
+    request_id: &str,
 ) -> Result<RoutingDecision, (StatusCode, Json<ErrorResponse>)> {
     let session_id = session_id(headers, request);
     let has_session = match session_id.as_deref() {
@@ -1408,6 +1543,7 @@ async fn route_request(
         .as_deref()
         .and_then(|id| session_context_tokens(state, id));
     let profile = requested_profile(state, headers, request);
+    let preference = requested_preference(request);
     let decision = runtime
         .router
         .route_chat_with_options(
@@ -1416,6 +1552,7 @@ async fn route_request(
             RoutingOptions {
                 allowed_models,
                 profile,
+                preference,
                 session_context_tokens,
                 dynamic_policy_effects: runtime.dynamic_policy_effects.clone(),
             },
@@ -1433,6 +1570,9 @@ async fn route_request(
         .map_err(&|e| router_error_response(&e))?
         .unwrap_or(decision);
     apply_selected_request_controls(state, request, &mut decision);
+    record_route_decision_event(state, headers, request, &decision, request_id, preference)
+        .await
+        .map_err(|error| telemetry_error_response(&error))?;
     Ok(decision)
 }
 
@@ -1560,7 +1700,7 @@ fn model_matches_controls(model: &RouteableModel, controls: &SelectedRequestCont
 
 fn clamp_controls_to_dynamic_policy(
     state: &AppState,
-    decision: &RoutingDecision,
+    decision: &mut RoutingDecision,
     controls: &mut SelectedRequestControls,
 ) {
     let Some(model) = route_model(state, &decision.selected_model) else {
@@ -1572,7 +1712,13 @@ fn clamp_controls_to_dynamic_policy(
             DynamicPolicyEffect::Exclude { selector, .. }
                 if selector_matches_controls(selector, &model, controls) =>
             {
+                let before = controls.clone();
                 downgrade_expensive_controls(controls);
+                if &before != controls {
+                    decision
+                        .reasons
+                        .push("dynamic policy downgraded expensive request controls".to_string());
+                }
             }
             DynamicPolicyEffect::DisableAttribute {
                 selector,
@@ -1582,9 +1728,15 @@ fn clamp_controls_to_dynamic_policy(
             } if selector_matches_controls(selector, &model, controls) => {
                 if key == "latency_class" && controls.service_tier.as_ref() == Some(value) {
                     controls.service_tier = Some("standard".to_string());
+                    decision.reasons.push(format!(
+                        "dynamic policy disabled latency_class={value}; using standard"
+                    ));
                 }
                 if key == "reasoning_effort" && controls.reasoning_effort.as_ref() == Some(value) {
                     controls.reasoning_effort = Some("medium".to_string());
+                    decision.reasons.push(format!(
+                        "dynamic policy disabled reasoning_effort={value}; using medium"
+                    ));
                 }
             }
             _ => {}
@@ -1940,6 +2092,17 @@ fn requested_profile(
         .or_else(|| state.default_profile.clone())
 }
 
+fn requested_preference(request: &ChatCompletionRequest) -> Option<RoutingPreference> {
+    metadata_string(request, "brouter_preference")
+        .or_else(|| metadata_string(request, "brouter_routing_preference"))
+        .as_deref()
+        .and_then(RoutingPreference::from_name)
+}
+
+fn client_name(request: &ChatCompletionRequest) -> Option<String> {
+    metadata_string(request, "brouter_client")
+}
+
 fn metadata_string(request: &ChatCompletionRequest, key: &str) -> Option<String> {
     request
         .metadata
@@ -2019,6 +2182,16 @@ fn provider_status(status: u16) -> StatusCode {
     StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY)
 }
 
+fn next_request_id() -> String {
+    let count = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("brq-{timestamp:x}-{count:x}", timestamp = now_millis())
+}
+
+fn next_event_id() -> String {
+    let count = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("bre-{timestamp:x}-{count:x}", timestamp = now_millis())
+}
+
 fn elapsed_millis(started_at: Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -2035,13 +2208,185 @@ fn completion_tokens(body: &serde_json::Value) -> Option<u64> {
         .and_then(serde_json::Value::as_u64)
 }
 
+async fn record_route_decision_event(
+    state: &AppState,
+    headers: &HeaderMap,
+    request: &ChatCompletionRequest,
+    decision: &RoutingDecision,
+    request_id: &str,
+    preference: Option<RoutingPreference>,
+) -> Result<String, TelemetryError> {
+    let event_id = next_event_id();
+    let selected_model = route_model(state, &decision.selected_model);
+    let reasoning = decision.reasoning.as_ref();
+    let payload = serde_json::json!({
+        "selected_model": decision.selected_model.to_string(),
+        "provider": selected_model.as_ref().map(|model| model.provider.to_string()),
+        "upstream_model": selected_model.as_ref().map(|model| model.upstream_model.clone()),
+        "objective": decision.objective,
+        "profile": requested_profile(state, headers, request),
+        "preference": preference.map(RoutingPreference::as_str),
+        "features": {
+            "intent": decision.features.intent,
+            "reasoning": decision.features.reasoning,
+            "estimated_input_tokens": decision.features.estimated_input_tokens,
+            "estimated_output_tokens": decision.features.estimated_output_tokens,
+            "required_context_tokens": decision.features.required_context_tokens,
+            "required_capabilities": decision.features.required_capabilities,
+            "preferred_capabilities": decision.features.preferred_capabilities,
+            "required_attributes": decision.features.required_attributes,
+            "preferred_attributes": decision.features.preferred_attributes,
+            "matched_rules": decision.features.matched_rules,
+            "is_first_message": decision.features.is_first_message,
+            "prompt_chars": decision.features.original_prompt.chars().count(),
+        },
+        "request_controls": decision.request_controls,
+        "control_sources": control_sources(state, request, decision),
+        "reasons": decision.reasons,
+        "candidates": decision.candidates.iter().take(state.config.telemetry.events.candidate_limit).collect::<Vec<_>>(),
+        "excluded_candidates": if state.config.telemetry.events.include_excluded_candidates { serde_json::json!(decision.excluded_candidates) } else { serde_json::Value::Null },
+        "judge": reasoning.map(|reasoning| serde_json::json!({
+            "model": reasoning.model_id.to_string(),
+            "chosen_model": reasoning.chosen_model.to_string(),
+            "overridden": reasoning.overridden,
+            "rationale": reasoning.rationale,
+            "error": reasoning.error,
+            "service_tier": reasoning.service_tier,
+            "reasoning_effort": reasoning.reasoning_effort,
+        })),
+    });
+    record_routing_event(
+        state,
+        request,
+        RoutingEvent {
+            timestamp_ms: now_millis(),
+            event_id: event_id.clone(),
+            session_id: session_id(headers, request),
+            request_id: request_id.to_string(),
+            kind: RoutingEventKind::RouteDecision,
+            client: client_name(request),
+            payload,
+        },
+    )
+    .await?;
+    if let Some(preference) = preference {
+        record_routing_event(
+            state,
+            request,
+            RoutingEvent {
+                timestamp_ms: now_millis(),
+                event_id: next_event_id(),
+                session_id: session_id(headers, request),
+                request_id: request_id.to_string(),
+                kind: RoutingEventKind::UserPreferenceApplied,
+                client: client_name(request),
+                payload: serde_json::json!({
+                    "preference": preference.as_str(),
+                    "objective": decision.objective,
+                    "selected_model": decision.selected_model.to_string(),
+                }),
+            },
+        )
+        .await?;
+    }
+    Ok(event_id)
+}
+
+async fn record_routing_event(
+    state: &AppState,
+    request: &ChatCompletionRequest,
+    event: RoutingEvent,
+) -> Result<(), TelemetryError> {
+    if state.config.telemetry.events.disabled {
+        return Ok(());
+    }
+    let mut event = event;
+    if !state.config.telemetry.events.include_prompt {
+        scrub_prompt_fields(&mut event.payload);
+    } else if state.config.telemetry.events.prompt_preview_chars > 0 {
+        event.payload["prompt_preview"] = serde_json::Value::String(
+            request
+                .messages
+                .iter()
+                .map(|message| message.content.as_text())
+                .collect::<Vec<_>>()
+                .join("\n")
+                .chars()
+                .take(state.config.telemetry.events.prompt_preview_chars)
+                .collect(),
+        );
+    }
+    state.telemetry.record_routing_event(&event).await
+}
+
+fn scrub_prompt_fields(payload: &mut serde_json::Value) {
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("prompt_preview");
+        if let Some(features) = object
+            .get_mut("features")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            features.remove("original_prompt");
+        }
+    }
+}
+
+fn control_sources(
+    state: &AppState,
+    request: &ChatCompletionRequest,
+    decision: &RoutingDecision,
+) -> serde_json::Value {
+    let selected_model = route_model(state, &decision.selected_model);
+    let reasoning_source = if request.reasoning_effort.is_some() {
+        "request"
+    } else if decision
+        .reasoning
+        .as_ref()
+        .and_then(|reasoning| reasoning.reasoning_effort.as_ref())
+        .is_some()
+    {
+        "judge"
+    } else if selected_model
+        .as_ref()
+        .and_then(|model| model.attributes.get("reasoning_effort"))
+        .is_some()
+    {
+        "model_attribute"
+    } else {
+        "detected_reasoning"
+    };
+    let service_tier_source = if request.extra.contains_key("service_tier") {
+        "request"
+    } else if decision
+        .reasoning
+        .as_ref()
+        .and_then(|reasoning| reasoning.service_tier.as_ref())
+        .is_some()
+    {
+        "judge"
+    } else if selected_model.as_ref().is_some_and(|model| {
+        model.attributes.contains_key("service_tier")
+            || model.attributes.contains_key("latency_class")
+    }) {
+        "model_attribute"
+    } else {
+        "default"
+    };
+    serde_json::json!({
+        "reasoning_effort": reasoning_source,
+        "service_tier": service_tier_source,
+    })
+}
+
 async fn record_model_attempt(
     state: &AppState,
     headers: &HeaderMap,
     request: &ChatCompletionRequest,
     decision: &RoutingDecision,
+    request_id: &str,
     attempt: AttemptTelemetry,
-) -> Result<(), TelemetryError> {
+) -> Result<String, TelemetryError> {
+    let event_id = next_event_id();
     let model = route_model(state, &attempt.model_id);
     let reasoning = decision.reasoning.as_ref();
     state
@@ -2064,12 +2409,42 @@ async fn record_model_attempt(
             estimated_cost: attempt.estimated_cost,
             latency_ms: attempt.latency_ms,
             status_code: attempt.status_code,
-            provider_error: attempt.provider_error,
+            provider_error: attempt.provider_error.clone(),
             prompt_tokens: attempt.prompt_tokens,
             completion_tokens: attempt.completion_tokens,
             success: attempt.success,
         })
-        .await
+        .await?;
+    record_routing_event(
+        state,
+        request,
+        RoutingEvent {
+            timestamp_ms: now_millis(),
+            event_id: event_id.clone(),
+            session_id: session_id(headers, request),
+            request_id: request_id.to_string(),
+            kind: RoutingEventKind::ProviderAttempt,
+            client: client_name(request),
+            payload: serde_json::json!({
+                "model_id": attempt.model_id.to_string(),
+                "provider": model.as_ref().map(|model| model.provider.to_string()),
+                "upstream_model": model.as_ref().map(|model| model.upstream_model.clone()),
+                "selected_model": decision.selected_model.to_string(),
+                "fallback_used": attempt.model_id != decision.selected_model,
+                "estimated_cost": attempt.estimated_cost,
+                "latency_ms": attempt.latency_ms,
+                "status_code": attempt.status_code,
+                "provider_error": attempt.provider_error,
+                "prompt_tokens": attempt.prompt_tokens,
+                "completion_tokens": attempt.completion_tokens,
+                "success": attempt.success,
+                "request_controls": decision.request_controls,
+                "routing_reasons": decision.reasons,
+            }),
+        },
+    )
+    .await?;
+    Ok(event_id)
 }
 
 fn session_id(headers: &HeaderMap, request: &ChatCompletionRequest) -> Option<String> {

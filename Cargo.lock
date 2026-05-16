@@ -643,6 +643,8 @@ dependencies = [
  "brouter_router",
  "brouter_router_models",
  "brouter_server",
+ "brouter_telemetry",
+ "brouter_telemetry_models",
  "clap",
  "rand 0.10.1",
  "reqwest",
@@ -816,6 +818,7 @@ version = "0.1.0"
 dependencies = [
  "brouter_provider_models",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

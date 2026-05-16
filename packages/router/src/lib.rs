@@ -15,7 +15,7 @@ use brouter_provider_models::{ModelCapability, ModelId, RouteableModel};
 use brouter_router_models::{
     CandidateDenyRule, CandidateSelector, ContextPolicy, ExcludedCandidate, PromptFeatures,
     PromptIntent, ReasoningLevel, RoutingDecision, RoutingObjective, RoutingOptions,
-    RoutingProfile, RoutingRule, ScoredCandidate, ScoringWeights,
+    RoutingPreference, RoutingProfile, RoutingRule, ScoredCandidate, ScoringWeights,
 };
 use thiserror::Error;
 
@@ -157,6 +157,7 @@ impl Router {
             RoutingOptions {
                 allowed_models: allowed_models.map(<[ModelId]>::to_vec),
                 profile: None,
+                preference: None,
                 session_context_tokens: None,
                 dynamic_policy_effects: Vec::new(),
             },
@@ -188,9 +189,17 @@ impl Router {
             .as_deref()
             .and_then(|profile| self.profiles.get(profile));
         let rule_objective = self.apply_rules(&classification_text.to_lowercase(), &mut features);
-        let objective = profile
-            .and_then(|profile| profile.objective)
-            .unwrap_or(rule_objective);
+        let objective = options.preference.map_or_else(
+            || {
+                profile
+                    .and_then(|profile| profile.objective)
+                    .unwrap_or(rule_objective)
+            },
+            preference_objective,
+        );
+        if let Some(preference) = options.preference {
+            apply_routing_preference(preference, &mut features);
+        }
         apply_context_policy(
             &mut features,
             profile
@@ -336,6 +345,51 @@ pub fn analyze_chat_request(
         .filter(|text| !text.is_empty())
         .unwrap_or(prompt_text.as_str());
     analyze_prompt_texts(classification_text, &prompt_text, request, is_first_message)
+}
+
+const fn preference_objective(preference: RoutingPreference) -> RoutingObjective {
+    match preference {
+        RoutingPreference::Balanced => RoutingObjective::Balanced,
+        RoutingPreference::Stronger => RoutingObjective::Strongest,
+        RoutingPreference::Faster => RoutingObjective::Fastest,
+        RoutingPreference::Cheaper
+        | RoutingPreference::Slower
+        | RoutingPreference::ConserveQuota => RoutingObjective::Cheapest,
+        RoutingPreference::Local => RoutingObjective::LocalOnly,
+    }
+}
+
+fn apply_routing_preference(preference: RoutingPreference, features: &mut PromptFeatures) {
+    match preference {
+        RoutingPreference::Balanced => {}
+        RoutingPreference::Stronger => {
+            append_unique_capabilities(
+                &mut features.preferred_capabilities,
+                &[ModelCapability::Reasoning],
+            );
+            features
+                .preferred_attributes
+                .insert("reasoning_effort".to_string(), "high".to_string());
+        }
+        RoutingPreference::Faster => {
+            features
+                .preferred_attributes
+                .insert("latency_class".to_string(), "priority".to_string());
+        }
+        RoutingPreference::Cheaper
+        | RoutingPreference::Slower
+        | RoutingPreference::ConserveQuota => {
+            features
+                .preferred_attributes
+                .insert("latency_class".to_string(), "standard".to_string());
+        }
+        RoutingPreference::Local => {
+            append_unique_capabilities(
+                &mut features.required_capabilities,
+                &[ModelCapability::Local],
+            );
+        }
+    }
 }
 
 fn is_auto_model(model: &str) -> bool {

@@ -46,6 +46,50 @@ pub enum RoutingObjective {
     LocalOnly,
 }
 
+/// Relative user correction applied to one routing request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingPreference {
+    Balanced,
+    Stronger,
+    Faster,
+    Cheaper,
+    Slower,
+    Local,
+    ConserveQuota,
+}
+
+impl RoutingPreference {
+    /// Parses a routing preference name.
+    #[must_use]
+    pub fn from_name(value: &str) -> Option<Self> {
+        match value {
+            "balanced" => Some(Self::Balanced),
+            "stronger" | "strong" => Some(Self::Stronger),
+            "faster" | "fast" => Some(Self::Faster),
+            "cheaper" | "cheap" => Some(Self::Cheaper),
+            "slower" | "standard" => Some(Self::Slower),
+            "local" | "local_only" | "local-only" => Some(Self::Local),
+            "conserve_quota" | "conserve-quota" | "quota" => Some(Self::ConserveQuota),
+            _ => None,
+        }
+    }
+
+    /// Returns this preference as a stable `snake_case` name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Balanced => "balanced",
+            Self::Stronger => "stronger",
+            Self::Faster => "faster",
+            Self::Cheaper => "cheaper",
+            Self::Slower => "slower",
+            Self::Local => "local",
+            Self::ConserveQuota => "conserve_quota",
+        }
+    }
+}
+
 impl std::str::FromStr for PromptIntent {
     type Err = ParsePromptIntentError;
 
@@ -144,6 +188,7 @@ impl Default for ContextPolicy {
 pub struct RoutingOptions {
     pub allowed_models: Option<Vec<ModelId>>,
     pub profile: Option<String>,
+    pub preference: Option<RoutingPreference>,
     pub session_context_tokens: Option<u32>,
     pub dynamic_policy_effects: Vec<DynamicPolicyEffect>,
 }

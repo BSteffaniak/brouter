@@ -35,6 +35,8 @@ use brouter_router_models::{
     JudgeConfig, ReasoningLevel, RoutingDecision, RoutingObjective, ScoredCandidate,
     SelectedRequestControls,
 };
+use brouter_telemetry::TelemetryStore;
+use brouter_telemetry_models::{RoutingEvent, RoutingEventKind, SessionSummary};
 use clap::{Parser, Subcommand};
 use rand::TryRng as _;
 use serde::Deserialize;
@@ -67,6 +69,9 @@ pub async fn run_cli() -> Result<()> {
         Command::Auth { command } => auth(command).await,
         Command::Doctor { config, json } => {
             doctor(&resolve_and_load(config.as_deref())?, json).await
+        }
+        Command::Sessions { config, command } => {
+            sessions(&resolve_and_load(config.as_deref())?, command).await
         }
         Command::Route {
             config,
@@ -352,6 +357,200 @@ async fn check_provider(
         .filter(|model| model.provider == provider_id)
         .count();
     Ok(format!("reachable, {configured_models} configured models"))
+}
+
+async fn sessions(config: &BrouterConfig, command: SessionsCommand) -> Result<()> {
+    let store = telemetry_store_from_config(config).await?;
+    match command {
+        SessionsCommand::List { json } => {
+            let sessions = store.sessions().await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&sessions)?);
+            } else if sessions.is_empty() {
+                println!("no brouter sessions recorded");
+            } else {
+                for summary in sessions {
+                    print_session_summary(&summary);
+                }
+            }
+        }
+        SessionsCommand::Show { session_id, json } => {
+            let sessions = store.sessions().await?;
+            let Some(summary) = sessions
+                .into_iter()
+                .find(|summary| summary.session_id == session_id)
+            else {
+                bail!("unknown brouter session {session_id}");
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                print_session_summary(&summary);
+            }
+        }
+        SessionsCommand::Timeline {
+            session_id,
+            last,
+            json,
+        } => {
+            let mut events = store.routing_events_for_session(&session_id).await?;
+            if let Some(last) = last
+                && events.len() > last
+            {
+                events = events.split_off(events.len() - last);
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&events)?);
+            } else if events.is_empty() {
+                println!("no events recorded for session {session_id}");
+            } else {
+                for event in &events {
+                    print_routing_event(event);
+                }
+            }
+        }
+        SessionsCommand::Event { event_id, json } => {
+            let events = store.routing_events().await?;
+            let Some(event) = events.into_iter().find(|event| event.event_id == event_id) else {
+                bail!("unknown brouter routing event {event_id}");
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&event)?);
+            } else {
+                print_routing_event(&event);
+                println!("{}", serde_json::to_string_pretty(&event.payload)?);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn telemetry_store_from_config(config: &BrouterConfig) -> Result<TelemetryStore> {
+    if config.telemetry.disabled {
+        bail!("telemetry is disabled; no session event log is available");
+    }
+    let Some(path) = &config.telemetry.database_path else {
+        bail!("telemetry.database_path is not configured; no session event log is available");
+    };
+    Ok(TelemetryStore::sqlite(&expand_user_path(path)).await?)
+}
+
+fn print_session_summary(summary: &SessionSummary) {
+    println!(
+        "{}  events={} requests={} first={} last={}",
+        summary.session_id,
+        summary.event_count,
+        summary.request_count,
+        summary.first_timestamp_ms,
+        summary.last_timestamp_ms
+    );
+}
+
+fn print_routing_event(event: &RoutingEvent) {
+    match event.kind {
+        RoutingEventKind::RouteDecision => print_route_decision_event(event),
+        RoutingEventKind::ProviderAttempt => print_provider_attempt_event(event),
+        _ => println!(
+            "{}  {}  {}  {}",
+            event.timestamp_ms,
+            event.kind.as_str(),
+            event.request_id,
+            event.event_id
+        ),
+    }
+}
+
+fn print_route_decision_event(event: &RoutingEvent) {
+    let payload = &event.payload;
+    let selected = payload
+        .get("selected_model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<unknown>");
+    let provider = payload
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<unknown>");
+    let tier = payload
+        .get("request_controls")
+        .and_then(|controls| controls.get("service_tier"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("default");
+    let reasoning = payload
+        .get("request_controls")
+        .and_then(|controls| controls.get("reasoning_effort"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("default");
+    let intent = payload
+        .get("features")
+        .and_then(|features| features.get("intent"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let detected_reasoning = payload
+        .get("features")
+        .and_then(|features| features.get("reasoning"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    println!(
+        "{}  route  {} via {} tier={} reasoning={} intent={}/{} request={} event={}",
+        event.timestamp_ms,
+        selected,
+        provider,
+        tier,
+        reasoning,
+        intent,
+        detected_reasoning,
+        event.request_id,
+        event.event_id
+    );
+    if let Some(reasons) = payload.get("reasons").and_then(serde_json::Value::as_array)
+        && !reasons.is_empty()
+    {
+        let reasons = reasons
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>()
+            .join("; ");
+        println!("          why: {reasons}");
+    }
+    if let Some(judge) = payload.get("judge")
+        && !judge.is_null()
+    {
+        let overridden = judge
+            .get("overridden")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let rationale = judge
+            .get("rationale")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        println!("          judge: overridden={overridden} {rationale}");
+    }
+}
+
+fn print_provider_attempt_event(event: &RoutingEvent) {
+    let payload = &event.payload;
+    let model = payload
+        .get("model_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<unknown>");
+    let status = payload
+        .get("status_code")
+        .and_then(serde_json::Value::as_u64)
+        .map_or_else(|| "error".to_string(), |status| status.to_string());
+    let fallback = payload
+        .get("fallback_used")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    println!(
+        "{}  attempt  {} status={} fallback={} request={} event={}",
+        event.timestamp_ms, model, status, fallback, event.request_id, event.event_id
+    );
+    if let Some(error) = payload
+        .get("provider_error")
+        .and_then(serde_json::Value::as_str)
+    {
+        println!("          error: {error}");
+    }
 }
 
 fn print_example_config() {
@@ -1572,6 +1771,43 @@ enum OpenaicomAuthCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum SessionsCommand {
+    /// Lists sessions that have brouter routing events.
+    List {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Shows a single session summary.
+    Show {
+        /// Session identifier.
+        session_id: String,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Shows the routing timeline for a session.
+    Timeline {
+        /// Session identifier.
+        session_id: String,
+        /// Maximum number of events to show.
+        #[arg(long)]
+        last: Option<usize>,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Shows a single routing event.
+    Event {
+        /// Event identifier.
+        event_id: String,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum Command {
     /// Starts the local HTTP router service.
     Serve {
@@ -1609,6 +1845,14 @@ enum Command {
         /// Emit machine-readable JSON diagnostics.
         #[arg(long)]
         json: bool,
+    },
+    /// Inspects session-scoped routing event logs.
+    Sessions {
+        /// Path to the brouter TOML config.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        command: SessionsCommand,
     },
     /// Explains how a prompt would be routed.
     Route {

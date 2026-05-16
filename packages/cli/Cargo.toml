@@ -30,6 +30,8 @@ brouter_provider_models = { workspace = true }
 brouter_router = { workspace = true }
 brouter_router_models = { workspace = true }
 brouter_server = { workspace = true }
+brouter_telemetry = { workspace = true }
+brouter_telemetry_models = { workspace = true }
 clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
 rand = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls"] }
@@ -58,4 +60,6 @@ fail-on-warnings = [
     "brouter_router/fail-on-warnings",
     "brouter_router_models/fail-on-warnings",
     "brouter_server/fail-on-warnings",
+    "brouter_telemetry/fail-on-warnings",
+    "brouter_telemetry_models/fail-on-warnings",
 ]

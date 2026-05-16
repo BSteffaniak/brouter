@@ -516,6 +516,43 @@ pub struct TelemetryConfig {
     pub disabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database_path: Option<String>,
+    #[serde(default)]
+    pub events: TelemetryEventsConfig,
+}
+
+/// Session routing event log configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct TelemetryEventsConfig {
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default)]
+    pub include_prompt: bool,
+    #[serde(default)]
+    pub include_judge_prompt: bool,
+    #[serde(default)]
+    pub include_excluded_candidates: bool,
+    #[serde(default = "default_candidate_limit")]
+    pub candidate_limit: usize,
+    #[serde(default)]
+    pub prompt_preview_chars: usize,
+}
+
+impl Default for TelemetryEventsConfig {
+    fn default() -> Self {
+        Self {
+            disabled: false,
+            include_prompt: false,
+            include_judge_prompt: false,
+            include_excluded_candidates: true,
+            candidate_limit: default_candidate_limit(),
+            prompt_preview_chars: 0,
+        }
+    }
+}
+
+const fn default_candidate_limit() -> usize {
+    8
 }
 
 /// Provider configuration.

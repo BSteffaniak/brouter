@@ -121,6 +121,35 @@ All fields are optional floats:
 - `disabled` boolean, default `false`
 - `database_path` optional path; defaults to `~/.local/state/brouter/brouter.db` unless telemetry is disabled
 
+## `[telemetry.events]`
+
+Session routing events are enabled by default and stored in the telemetry DB.
+They power `brouter sessions timeline`, `/v1/brouter/sessions/*`, and client
+integrations.
+
+- `disabled` boolean, default `false`
+- `include_prompt` boolean, default `false`; full prompt text is omitted by default
+- `prompt_preview_chars` integer, default `0`; optional prompt preview length when prompt logging is enabled
+- `candidate_limit` integer, default `8`; number of scored candidates stored per route decision
+- `include_excluded_candidates` boolean, default `true`
+- `include_judge_prompt` boolean, default `false`; reserved for future judge prompt capture
+
+Clients can apply relative routing corrections without selecting a concrete
+model by sending request metadata:
+
+```json
+{
+  "metadata": {
+    "session_id": "pi-abc123",
+    "brouter_client": "pi",
+    "brouter_preference": "stronger"
+  }
+}
+```
+
+Supported preferences are `balanced`, `stronger`, `faster`, `cheaper`,
+`slower`, `local`, and `conserve_quota`.
+
 ## Provider presets and zero-config startup
 
 `brouter serve` can start without `brouter.toml`. It auto-detects providers from environment variables:

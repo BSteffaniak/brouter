@@ -113,6 +113,17 @@ prefer_attributes = { latency_class = "priority" }
 disabled = false
 database_path = "brouter.db"
 
+[telemetry.events]
+# Session routing event logs power `brouter sessions timeline` and integrations.
+# Prompt text is omitted by default; enable include_prompt or prompt previews only
+# when the telemetry DB is stored somewhere trusted.
+disabled = false
+include_prompt = false
+prompt_preview_chars = 0
+candidate_limit = 8
+include_excluded_candidates = true
+include_judge_prompt = false
+
 # Logs default to ~/.local/state/brouter/brouter.log. Override with
 # BROUTER_LOG_FILE=/path/to/log, BROUTER_LOG_FILE=off, RUST_LOG=debug, and/or
 # BROUTER_LOG_FORMAT=json.

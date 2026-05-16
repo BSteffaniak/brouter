@@ -26,6 +26,10 @@ patterns used by the sibling projects in this checkout.
 - `POST /v1/brouter/route/explain`
 - `GET /v1/brouter/usage`
 - `GET /v1/brouter/usage/summary`
+- `GET /v1/brouter/sessions`
+- `GET /v1/brouter/sessions/{session_id}`
+- `GET /v1/brouter/sessions/{session_id}/events`
+- `GET /v1/brouter/events/{event_id}`
 - `GET /v1/brouter/introspection`
 - `POST /v1/brouter/introspection/refresh`
 - `GET /v1/brouter/status`
@@ -35,11 +39,16 @@ upstreams, provider timeouts, fallback attempts for retryable failures,
 provider cooldowns after repeated failures, Anthropic non-streaming and streaming
 conversion, OpenAI-compatible embeddings forwarding, configurable scoring/routing rules, named routing profiles with allow/deny policy, context-window safety for session-aware model switching, cached live provider/account introspection with periodic and manual refresh, quota-aware dynamic policy, virtual service-tier/reasoning route variants for supported providers, a default opt-out LLM judge for close routing decisions, generic model/provider route attributes, and SQLite telemetry via
 `switchy_database`. Successful chat responses include brouter headers such as
-`x-brouter-selected-model`, `x-brouter-provider`, `x-brouter-service-tier`,
-`x-brouter-reasoning-effort`, `x-brouter-resource-pools`,
-`x-brouter-attributes`, and `x-brouter-display-badges`. `/v1/brouter/usage`
-supports `session_id`, `model`, `success`, `since_ms`, and `until_ms` query
-filters. `/v1/brouter/introspection` shows live/cache provider resource data and
+`x-brouter-request-id`, `x-brouter-event-id`, `x-brouter-selected-model`,
+`x-brouter-provider`, `x-brouter-service-tier`, `x-brouter-reasoning-effort`,
+`x-brouter-resource-pools`, `x-brouter-attributes`, and
+`x-brouter-display-badges`. `/v1/brouter/usage` supports `session_id`, `model`,
+`success`, `since_ms`, and `until_ms` query filters. Session event APIs and
+`brouter sessions timeline` expose route decisions, top candidates, judge
+rationales, selected request controls, and provider attempts. Clients can send
+`metadata.brouter_preference` (`stronger`, `faster`, `cheaper`, `slower`,
+`local`, `conserve_quota`, or `balanced`) to correct auto routing without naming
+a specific model. `/v1/brouter/introspection` shows live/cache provider resource data and
 `/v1/brouter/status` summarizes active defaults. `/metrics` exposes basic
 Prometheus text metrics from telemetry events.
 
@@ -98,6 +107,19 @@ intents/objectives, OpenAI-compatible providers without a `base_url`, and
 `local_only` rules without a local model. `--strict` turns those warnings into a
 non-zero exit. `doctor` also checks provider `/models` reachability. The full
 configuration schema is documented in `docs/config.md`.
+
+## Session routing timeline
+
+```sh
+brouter sessions list --config brouter.toml
+brouter sessions show <session-id> --config brouter.toml
+brouter sessions timeline <session-id> --last 20 --config brouter.toml
+brouter sessions event <event-id> --json --config brouter.toml
+```
+
+The timeline reads the configured telemetry SQLite database and shows why each
+request chose its model, service tier, reasoning effort, judge result, and
+provider attempts.
 
 ## Common setups
 
