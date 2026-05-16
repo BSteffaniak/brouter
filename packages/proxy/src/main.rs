@@ -156,6 +156,18 @@ async fn proxy_handler(State(state): State<ProxyState>, request: HttpRequest<Bod
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
+    let request_session_headers = diagnostic_headers(
+        request.headers(),
+        &[
+            "x-brouter-session",
+            "session_id",
+            "x-session-affinity",
+            "x-session-id",
+            "x-request-session-id",
+            "x-client-request-id",
+        ],
+    );
+
     info!(
         request_id = %request_id,
         method = %method,
@@ -163,6 +175,7 @@ async fn proxy_handler(State(state): State<ProxyState>, request: HttpRequest<Bod
         content_type = %content_type,
         content_length = ?content_length,
         backend_url = %backend_url,
+        session_headers = ?request_session_headers,
         "forwarding request to backend"
     );
 
@@ -236,10 +249,23 @@ async fn proxy_handler(State(state): State<ProxyState>, request: HttpRequest<Bod
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.contains("event-stream") || v.contains("stream"));
 
+            let response_context_headers = diagnostic_headers(
+                response.headers(),
+                &[
+                    "x-brouter-session",
+                    "x-brouter-session-source",
+                    "x-brouter-context-window",
+                    "x-brouter-context-tokens",
+                    "x-brouter-context-percent",
+                    "x-brouter-context-source",
+                ],
+            );
+
             info!(
                 request_id = %request_id,
                 status = %status,
                 streaming = %is_streaming,
+                context_headers = ?response_context_headers,
                 "forwarding response from backend"
             );
 
@@ -274,6 +300,18 @@ async fn proxy_handler(State(state): State<ProxyState>, request: HttpRequest<Bod
                 .unwrap()
         }
     }
+}
+
+fn diagnostic_headers(headers: &http::HeaderMap, names: &[&str]) -> Vec<String> {
+    names
+        .iter()
+        .filter_map(|name| {
+            headers
+                .get(*name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| format!("{name}={value}"))
+        })
+        .collect()
 }
 
 async fn run_proxy(

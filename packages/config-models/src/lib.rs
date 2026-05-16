@@ -84,6 +84,8 @@ pub struct RouterConfig {
     #[serde(default)]
     pub context: ContextConfig,
     #[serde(default)]
+    pub context_reporting: ContextReportingConfig,
+    #[serde(default)]
     pub streaming: StreamingConfig,
     #[serde(default)]
     pub metadata: MetadataConfig,
@@ -121,6 +123,7 @@ impl Default for RouterConfig {
             debug_headers: false,
             scoring: ScoringConfig::default(),
             context: ContextConfig::default(),
+            context_reporting: ContextReportingConfig::default(),
             streaming: StreamingConfig::default(),
             metadata: MetadataConfig::default(),
             dynamic_policy: DynamicPolicyConfig::default(),
@@ -153,6 +156,45 @@ const fn default_provider_failure_threshold() -> u32 {
 
 const fn default_provider_cooldown_ms() -> u64 {
     30_000
+}
+
+/// Context reporting behavior for client-visible responses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextReportingConfig {
+    #[serde(default)]
+    pub mode: ContextReportingMode,
+}
+
+impl Default for ContextReportingConfig {
+    fn default() -> Self {
+        Self {
+            mode: ContextReportingMode::Headers,
+        }
+    }
+}
+
+/// Client-visible context reporting mode.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextReportingMode {
+    /// Preserve provider-compatible bodies/streams and omit brouter context headers.
+    Compat,
+    /// Preserve provider-compatible bodies/streams and emit brouter context headers.
+    #[default]
+    Headers,
+    /// Preserve provider-compatible bodies/streams and emit brouter context headers.
+    /// Reserved for future protocol-safe metadata envelopes.
+    Envelope,
+    /// Emit brouter context headers. Reserved for future opt-in usage rewriting.
+    RewriteUsage,
+}
+
+impl ContextReportingMode {
+    /// Returns true when brouter context headers should be emitted.
+    #[must_use]
+    pub const fn emits_headers(self) -> bool {
+        matches!(self, Self::Headers | Self::Envelope | Self::RewriteUsage)
+    }
 }
 
 /// Streaming response behavior configuration.
