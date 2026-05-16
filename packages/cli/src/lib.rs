@@ -550,9 +550,8 @@ fn print_judge_summary(payload: &serde_json::Value) {
             .get("score_gap")
             .and_then(serde_json::Value::as_f64)
             .map_or_else(|| "unknown".to_string(), |gap| format!("{gap:.2}"));
-        println!(
-            "          judge trigger: configured={configured} fired={fired} gap={gap} ({reason})"
-        );
+        let state = if fired { "fired" } else { "skipped" };
+        println!("          judge: configured={configured} {state} gap={gap} ({reason})");
     }
     if let Some(judge) = payload.get("judge")
         && !judge.is_null()

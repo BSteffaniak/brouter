@@ -1841,7 +1841,9 @@ async fn invoke_llm_judge(
             .any(|r| &r.name == name && r.llm_judge)
     });
     let gap = top_2_score_gap(&decision.candidates);
-    let should_fire = should_fire_trigger(&judge_config.trigger, gap, rule_matched);
+    let suspicious_cost = has_suspicious_cost_metadata(decision);
+    let should_fire =
+        should_fire_trigger(&judge_config.trigger, gap, rule_matched) || suspicious_cost;
     if !should_fire {
         return Ok(None);
     }
@@ -1971,6 +1973,15 @@ async fn invoke_llm_judge(
         updated.selected_model = updated.reasoning.as_ref().unwrap().chosen_model.clone();
     }
     Ok(Some(updated))
+}
+
+fn has_suspicious_cost_metadata(decision: &RoutingDecision) -> bool {
+    decision.candidates.iter().take(3).any(|candidate| {
+        candidate
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("negative cost metadata"))
+    })
 }
 
 fn build_judge_session_context(state: &AppState) -> JudgeSessionContext {
@@ -2350,14 +2361,18 @@ fn judge_trigger_payload(state: &AppState, decision: &RoutingDecision) -> serde_
     });
     let score_gap = top_2_score_gap(&decision.candidates);
     let enough_candidates = decision.candidates.len() >= 2;
-    let triggered = should_fire_trigger(&judge_config.trigger, score_gap, rule_matched);
+    let suspicious_cost = has_suspicious_cost_metadata(decision);
+    let triggered =
+        should_fire_trigger(&judge_config.trigger, score_gap, rule_matched) || suspicious_cost;
     let fired = enough_candidates && triggered;
     let reason = if !enough_candidates {
         "fewer than two candidates available"
+    } else if suspicious_cost {
+        "suspicious cost metadata forced judge review"
     } else if fired {
         "score gap or judge-enabled rule triggered"
     } else {
-        "score gap above threshold and no judge-enabled rule matched"
+        "judge skipped: score gap above threshold and no judge-enabled rule matched"
     };
     serde_json::json!({
         "configured": true,
@@ -2367,6 +2382,7 @@ fn judge_trigger_payload(state: &AppState, decision: &RoutingDecision) -> serde_
         "score_gap_threshold": judge_config.trigger.score_gap_threshold,
         "rule_matched": rule_matched,
         "rule_triggered_enabled": judge_config.trigger.rule_triggered,
+        "suspicious_cost_metadata": suspicious_cost,
         "shortlist_size": judge_config.shortlist.size,
     })
 }

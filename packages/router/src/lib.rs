@@ -759,6 +759,9 @@ fn score_model(
     let estimated_cost = estimate_cost(model, features);
     let mut score = base_quality_score(model, features, weights);
     let mut reasons = vec![format!("quality score {}", model.quality)];
+    if has_negative_cost_metadata(model) {
+        reasons.push("ignored negative cost metadata".to_string());
+    }
 
     apply_objective(
         model,
@@ -915,11 +918,17 @@ fn apply_session_bias(
 }
 
 fn estimate_cost(model: &RouteableModel, features: &PromptFeatures) -> f64 {
+    let input_cost_per_million = model.input_cost_per_million.max(0.0);
+    let output_cost_per_million = model.output_cost_per_million.max(0.0);
     let input_cost =
-        f64::from(features.estimated_input_tokens) / 1_000_000.0 * model.input_cost_per_million;
+        f64::from(features.estimated_input_tokens) / 1_000_000.0 * input_cost_per_million;
     let output_cost =
-        f64::from(features.estimated_output_tokens) / 1_000_000.0 * model.output_cost_per_million;
-    input_cost + output_cost
+        f64::from(features.estimated_output_tokens) / 1_000_000.0 * output_cost_per_million;
+    (input_cost + output_cost).max(0.0)
+}
+
+fn has_negative_cost_metadata(model: &RouteableModel) -> bool {
+    model.input_cost_per_million < 0.0 || model.output_cost_per_million < 0.0
 }
 
 fn compare_candidate_scores(left: &ScoredCandidate, right: &ScoredCandidate) -> Ordering {

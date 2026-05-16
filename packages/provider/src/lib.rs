@@ -724,11 +724,13 @@ fn openai_compatible_catalog(value: &Value) -> ModelCatalogSnapshot {
             .get("pricing")
             .and_then(|pricing| pricing.get("prompt"))
             .and_then(value_as_f64)
+            .filter(|cost| *cost >= 0.0)
             .map(|cost| cost * 1_000_000.0);
         let completion_cost = model
             .get("pricing")
             .and_then(|pricing| pricing.get("completion"))
             .and_then(value_as_f64)
+            .filter(|cost| *cost >= 0.0)
             .map(|cost| cost * 1_000_000.0);
         catalog.models.insert(
             id.to_string(),

@@ -1435,8 +1435,12 @@ fn fallback_catalog_model_to_routeable(
         provider: provider_id.clone(),
         upstream_model: catalog_model.upstream_model.clone(),
         context_window,
-        input_cost_per_million: catalog_model.input_cost_per_million.unwrap_or_default(),
-        output_cost_per_million: catalog_model.output_cost_per_million.unwrap_or_default(),
+        input_cost_per_million: sanitized_cost(
+            catalog_model.input_cost_per_million.unwrap_or_default(),
+        ),
+        output_cost_per_million: sanitized_cost(
+            catalog_model.output_cost_per_million.unwrap_or_default(),
+        ),
         quality: discovered_quality(&capabilities, &catalog_model.upstream_model),
         capabilities,
         attributes: std::collections::BTreeMap::from([(
@@ -1498,16 +1502,20 @@ fn catalog_model_to_routeable(
         provider: snapshot.provider.clone(),
         upstream_model: catalog_model.upstream_model.clone(),
         context_window,
-        input_cost_per_million: catalog_model
-            .fields
-            .input_cost_per_million
-            .value
-            .unwrap_or_default(),
-        output_cost_per_million: catalog_model
-            .fields
-            .output_cost_per_million
-            .value
-            .unwrap_or_default(),
+        input_cost_per_million: sanitized_cost(
+            catalog_model
+                .fields
+                .input_cost_per_million
+                .value
+                .unwrap_or_default(),
+        ),
+        output_cost_per_million: sanitized_cost(
+            catalog_model
+                .fields
+                .output_cost_per_million
+                .value
+                .unwrap_or_default(),
+        ),
         quality: discovered_quality(&capabilities, &catalog_model.upstream_model),
         capabilities,
         attributes: discovered_attributes(config, snapshot, catalog_model),
@@ -1668,10 +1676,12 @@ fn resolve_cost(
             override_config.and_then(|overrides| overrides.input_cost_per_million)
     {
         return (
-            input_cost,
-            override_config
-                .and_then(|overrides| overrides.output_cost_per_million)
-                .unwrap_or(model.output_cost_per_million),
+            sanitized_cost(input_cost),
+            sanitized_cost(
+                override_config
+                    .and_then(|overrides| overrides.output_cost_per_million)
+                    .unwrap_or(model.output_cost_per_million),
+            ),
             override_provenance(override_config, MetadataSource::UserForcedOverride),
         );
     }
@@ -1679,19 +1689,21 @@ fn resolve_cost(
         && let Some(input_cost) = live_model.fields.input_cost_per_million.value
     {
         return (
-            input_cost,
-            live_model
-                .fields
-                .output_cost_per_million
-                .value
-                .unwrap_or_default(),
+            sanitized_cost(input_cost),
+            sanitized_cost(
+                live_model
+                    .fields
+                    .output_cost_per_million
+                    .value
+                    .unwrap_or_default(),
+            ),
             live_model.fields.input_cost_per_million.provenance.clone(),
         );
     }
     if model.input_cost_per_million > 0.0 || model.output_cost_per_million > 0.0 {
         return (
-            model.input_cost_per_million,
-            model.output_cost_per_million,
+            sanitized_cost(model.input_cost_per_million),
+            sanitized_cost(model.output_cost_per_million),
             MetadataProvenance::new(MetadataSource::UserConfig),
         );
     }
@@ -1700,10 +1712,12 @@ fn resolve_cost(
             override_config.and_then(|overrides| overrides.input_cost_per_million)
     {
         return (
-            input_cost,
-            override_config
-                .and_then(|overrides| overrides.output_cost_per_million)
-                .unwrap_or_default(),
+            sanitized_cost(input_cost),
+            sanitized_cost(
+                override_config
+                    .and_then(|overrides| overrides.output_cost_per_million)
+                    .unwrap_or_default(),
+            ),
             override_provenance(override_config, MetadataSource::UserVerifiedFallback),
         );
     }
@@ -1711,12 +1725,16 @@ fn resolve_cost(
         && let Some(input_cost) = catalog_model.input_cost_per_million
     {
         return (
-            input_cost,
-            catalog_model.output_cost_per_million.unwrap_or_default(),
+            sanitized_cost(input_cost),
+            sanitized_cost(catalog_model.output_cost_per_million.unwrap_or_default()),
             catalog_provenance(catalog_model),
         );
     }
     (0.0, 0.0, MetadataProvenance::new(MetadataSource::Unknown))
+}
+
+const fn sanitized_cost(cost: f64) -> f64 {
+    if cost < 0.0 { 0.0 } else { cost }
 }
 
 fn resolve_capabilities(
