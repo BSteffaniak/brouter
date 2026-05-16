@@ -84,6 +84,8 @@ pub struct RouterConfig {
     #[serde(default)]
     pub context: ContextConfig,
     #[serde(default)]
+    pub streaming: StreamingConfig,
+    #[serde(default)]
     pub metadata: MetadataConfig,
     #[serde(default)]
     pub dynamic_policy: DynamicPolicyConfig,
@@ -119,6 +121,7 @@ impl Default for RouterConfig {
             debug_headers: false,
             scoring: ScoringConfig::default(),
             context: ContextConfig::default(),
+            streaming: StreamingConfig::default(),
             metadata: MetadataConfig::default(),
             dynamic_policy: DynamicPolicyConfig::default(),
             rules: Vec::new(),
@@ -150,6 +153,39 @@ const fn default_provider_failure_threshold() -> u32 {
 
 const fn default_provider_cooldown_ms() -> u64 {
     30_000
+}
+
+/// Streaming response behavior configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StreamingConfig {
+    #[serde(default = "default_streaming_context_usage_observer")]
+    pub context_usage_observer: bool,
+    #[serde(default = "default_request_stream_usage")]
+    pub request_usage: bool,
+    #[serde(default = "default_stream_usage_buffer_limit_bytes")]
+    pub usage_buffer_limit_bytes: usize,
+}
+
+impl Default for StreamingConfig {
+    fn default() -> Self {
+        Self {
+            context_usage_observer: default_streaming_context_usage_observer(),
+            request_usage: default_request_stream_usage(),
+            usage_buffer_limit_bytes: default_stream_usage_buffer_limit_bytes(),
+        }
+    }
+}
+
+const fn default_streaming_context_usage_observer() -> bool {
+    true
+}
+
+const fn default_request_stream_usage() -> bool {
+    true
+}
+
+const fn default_stream_usage_buffer_limit_bytes() -> usize {
+    65_536
 }
 
 /// Router scoring overrides.

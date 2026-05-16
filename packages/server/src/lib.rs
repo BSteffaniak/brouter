@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
+use futures_util::{StreamExt, stream};
 use tokio::sync::Mutex as AsyncMutex;
 
 use axum::body::Body;
@@ -36,7 +37,7 @@ use brouter_introspection_models::{
     IntrospectionSnapshot, ResourceKind, ResourcePool, ResourceScope, ResourceSelector,
     ResourceUnit, SnapshotSource, SnapshotSourceKind,
 };
-use brouter_provider::{ProviderClient, ProviderRegistry};
+use brouter_provider::{ProviderClient, ProviderError, ProviderRegistry};
 use brouter_provider_models::{ModelCapability, ModelId, ProviderId, RouteableModel};
 use brouter_router::{
     DEFAULT_JUDGE_SYSTEM_PROMPT, Router, RouterError, build_judge_prompt, judge_request,
@@ -1165,8 +1166,20 @@ async fn forward_streaming_with_fallbacks(
                         header::CONTENT_TYPE,
                         HeaderValue::from_static("text/event-stream"),
                     );
-                    return (status, response_headers, Body::from_stream(response.stream))
-                        .into_response();
+                    let stream = if state.config.router.streaming.context_usage_observer {
+                        observe_usage_stream(
+                            state.clone(),
+                            headers.clone(),
+                            request.clone(),
+                            decision.clone(),
+                            model.context_window,
+                            response.stream,
+                            state.config.router.streaming.usage_buffer_limit_bytes,
+                        )
+                    } else {
+                        response.stream
+                    };
+                    return (status, response_headers, Body::from_stream(stream)).into_response();
                 }
                 last_status = Some(status);
             }
@@ -2462,13 +2475,167 @@ fn update_session_context_from_usage(
     let Some(session_id) = session_id(headers, request) else {
         return;
     };
+    update_session_context_for_session(state, &session_id, usage);
+}
+
+fn update_session_context_for_session(state: &AppState, session_id: &str, usage: &ContextUsage) {
     let Some(context_tokens) = usage
         .context_tokens
         .and_then(|tokens| u32::try_from(tokens).ok())
     else {
         return;
     };
-    update_session_context_tokens(state, &session_id, context_tokens);
+    update_session_context_tokens(state, session_id, context_tokens);
+}
+
+fn observe_usage_stream(
+    state: AppState,
+    headers: HeaderMap,
+    request: ChatCompletionRequest,
+    decision: RoutingDecision,
+    context_window: u32,
+    upstream: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<axum::body::Bytes, ProviderError>> + Send>,
+    >,
+    buffer_limit_bytes: usize,
+) -> std::pin::Pin<
+    Box<dyn futures_util::Stream<Item = Result<axum::body::Bytes, ProviderError>> + Send>,
+> {
+    let observer = Arc::new(std::sync::Mutex::new(StreamingUsageObserver::new(
+        buffer_limit_bytes,
+    )));
+    Box::pin(stream::unfold(upstream, move |mut upstream| {
+        let state = state.clone();
+        let headers = headers.clone();
+        let request = request.clone();
+        let decision = decision.clone();
+        let observer = Arc::clone(&observer);
+        async move {
+            match upstream.next().await {
+                Some(Ok(bytes)) => {
+                    observer
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .observe(&bytes, &decision);
+                    Some((Ok(bytes), upstream))
+                }
+                Some(Err(error)) => Some((Err(error), upstream)),
+                None => {
+                    let usage = observer
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .finish(&decision);
+                    if let Some(usage) = usage {
+                        update_session_context_from_usage(&state, &headers, &request, &usage);
+                        if let Err(error) = record_stream_context_usage(
+                            &state,
+                            &headers,
+                            &request,
+                            &decision,
+                            context_window,
+                            &usage,
+                        )
+                        .await
+                        {
+                            tracing::warn!(%error, "failed to record streaming context usage");
+                        }
+                    }
+                    None
+                }
+            }
+        }
+    }))
+}
+
+struct StreamingUsageObserver {
+    buffer: String,
+    buffer_limit_bytes: usize,
+    usage: Option<ContextUsage>,
+}
+
+impl StreamingUsageObserver {
+    const fn new(buffer_limit_bytes: usize) -> Self {
+        Self {
+            buffer: String::new(),
+            buffer_limit_bytes,
+            usage: None,
+        }
+    }
+
+    fn observe(&mut self, bytes: &[u8], decision: &RoutingDecision) {
+        let chunk = String::from_utf8_lossy(bytes);
+        self.buffer.push_str(&chunk);
+        if self.buffer.len() > self.buffer_limit_bytes {
+            self.buffer.clear();
+            return;
+        }
+        while let Some(index) = self.buffer.find("\n\n") {
+            let event = self.buffer[..index].to_string();
+            self.buffer.drain(..index + 2);
+            self.observe_event(&event, decision);
+        }
+    }
+
+    fn observe_event(&mut self, event: &str, decision: &RoutingDecision) {
+        for line in event.lines() {
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            let usage = context_usage_from_body(&value, decision);
+            if usage.source == ContextUsageSource::ProviderUsage {
+                self.usage = Some(usage);
+            }
+        }
+    }
+
+    fn finish(&mut self, decision: &RoutingDecision) -> Option<ContextUsage> {
+        if !self.buffer.is_empty() {
+            let event = std::mem::take(&mut self.buffer);
+            self.observe_event(&event, decision);
+        }
+        self.usage
+    }
+}
+
+async fn record_stream_context_usage(
+    state: &AppState,
+    headers: &HeaderMap,
+    request: &ChatCompletionRequest,
+    decision: &RoutingDecision,
+    context_window: u32,
+    usage: &ContextUsage,
+) -> Result<(), TelemetryError> {
+    let event_id = next_event_id();
+    record_routing_event(
+        state,
+        request,
+        RoutingEvent {
+            timestamp_ms: now_millis(),
+            event_id,
+            session_id: session_id(headers, request),
+            request_id: "stream-context-usage".to_string(),
+            kind: RoutingEventKind::ProviderAttempt,
+            client: client_name(request),
+            payload: serde_json::json!({
+                "selected_model": decision.selected_model.to_string(),
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "total_tokens": usage.total_tokens,
+                "context_tokens": usage.context_tokens,
+                "context_window": context_window,
+                "context_source": usage.source.to_string(),
+                "streaming": true,
+            }),
+        },
+    )
+    .await
 }
 
 async fn record_route_decision_event(

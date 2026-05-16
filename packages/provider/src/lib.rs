@@ -613,12 +613,28 @@ fn openai_compatible_request_body(
         )
         | None => {}
     }
+    if request.is_streaming()
+        && !request.extra.contains_key("stream_options")
+        && provider_stream_options_supported(provider)
+    {
+        object.insert(
+            "stream_options".to_string(),
+            json!({ "include_usage": true }),
+        );
+    }
     // Remove fields that this provider doesn't support.
     for field_name in provider.effective_omit_request_fields() {
         object.remove(&field_name);
     }
     apply_attribute_mappings(provider, model, &mut body);
     body
+}
+
+fn provider_stream_options_supported(provider: &ProviderConfig) -> bool {
+    !provider
+        .effective_omit_request_fields()
+        .iter()
+        .any(|field| field == "stream_options")
 }
 
 pub(crate) fn apply_attribute_mappings(
