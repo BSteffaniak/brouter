@@ -512,9 +512,59 @@ fn print_route_decision_event(event: &RoutingEvent) {
             .join("; ");
         println!("          why: {reasons}");
     }
+    if let Some(sources) = payload
+        .get("control_sources")
+        .and_then(serde_json::Value::as_object)
+    {
+        println!(
+            "          controls: service_tier from {}, reasoning_effort from {}",
+            sources
+                .get("service_tier")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown"),
+            sources
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+        );
+    }
+    print_judge_summary(payload);
+    print_candidate_summary(payload, selected);
+}
+
+fn print_judge_summary(payload: &serde_json::Value) {
+    if let Some(trigger) = payload.get("judge_trigger") {
+        let configured = trigger
+            .get("configured")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let fired = trigger
+            .get("fired")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let reason = trigger
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let gap = trigger
+            .get("score_gap")
+            .and_then(serde_json::Value::as_f64)
+            .map_or_else(|| "unknown".to_string(), |gap| format!("{gap:.2}"));
+        println!(
+            "          judge trigger: configured={configured} fired={fired} gap={gap} ({reason})"
+        );
+    }
     if let Some(judge) = payload.get("judge")
         && !judge.is_null()
     {
+        let model = judge
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let chosen = judge
+            .get("chosen_model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
         let overridden = judge
             .get("overridden")
             .and_then(serde_json::Value::as_bool)
@@ -523,7 +573,58 @@ fn print_route_decision_event(event: &RoutingEvent) {
             .get("rationale")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-        println!("          judge: overridden={overridden} {rationale}");
+        println!("          judge result: {model} chose {chosen} overridden={overridden}");
+        if !rationale.is_empty() {
+            println!("          judge why: {rationale}");
+        }
+    }
+}
+
+fn print_candidate_summary(payload: &serde_json::Value, selected: &str) {
+    let Some(candidates) = payload
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    println!("          top candidates:");
+    let top_score = candidates
+        .first()
+        .and_then(|candidate| candidate.get("score"))
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    for candidate in candidates.iter().take(3) {
+        let model = candidate
+            .get("model_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<unknown>");
+        let marker = if model == selected { "*" } else { " " };
+        let score = candidate
+            .get("score")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        let delta = score - top_score;
+        let cost = candidate
+            .get("estimated_cost")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        let reasons = candidate
+            .get("reasons")
+            .and_then(serde_json::Value::as_array)
+            .map(|reasons| {
+                reasons
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+            .unwrap_or_default();
+        println!(
+            "          {marker} {model}: score={score:.2} Δ={delta:.2} cost=${cost:.6} {reasons}"
+        );
     }
 }
 

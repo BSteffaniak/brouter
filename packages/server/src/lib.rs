@@ -2245,6 +2245,7 @@ async fn record_route_decision_event(
         "reasons": decision.reasons,
         "candidates": decision.candidates.iter().take(state.config.telemetry.events.candidate_limit).collect::<Vec<_>>(),
         "excluded_candidates": if state.config.telemetry.events.include_excluded_candidates { serde_json::json!(decision.excluded_candidates) } else { serde_json::Value::Null },
+        "judge_trigger": judge_trigger_payload(state, decision),
         "judge": reasoning.map(|reasoning| serde_json::json!({
             "model": reasoning.model_id.to_string(),
             "chosen_model": reasoning.chosen_model.to_string(),
@@ -2329,6 +2330,45 @@ fn scrub_prompt_fields(payload: &mut serde_json::Value) {
             features.remove("original_prompt");
         }
     }
+}
+
+fn judge_trigger_payload(state: &AppState, decision: &RoutingDecision) -> serde_json::Value {
+    let runtime = runtime_snapshot(state);
+    let Some(judge_config) = runtime.llm_judge.as_ref() else {
+        return serde_json::json!({
+            "configured": false,
+            "fired": false,
+            "reason": "judge not configured",
+        });
+    };
+    let rule_matched = decision.features.matched_rules.iter().any(|name| {
+        runtime
+            .router
+            .rules()
+            .iter()
+            .any(|rule| &rule.name == name && rule.llm_judge)
+    });
+    let score_gap = top_2_score_gap(&decision.candidates);
+    let enough_candidates = decision.candidates.len() >= 2;
+    let triggered = should_fire_trigger(&judge_config.trigger, score_gap, rule_matched);
+    let fired = enough_candidates && triggered;
+    let reason = if !enough_candidates {
+        "fewer than two candidates available"
+    } else if fired {
+        "score gap or judge-enabled rule triggered"
+    } else {
+        "score gap above threshold and no judge-enabled rule matched"
+    };
+    serde_json::json!({
+        "configured": true,
+        "fired": fired,
+        "reason": reason,
+        "score_gap": score_gap,
+        "score_gap_threshold": judge_config.trigger.score_gap_threshold,
+        "rule_matched": rule_matched,
+        "rule_triggered_enabled": judge_config.trigger.rule_triggered,
+        "shortlist_size": judge_config.shortlist.size,
+    })
 }
 
 fn control_sources(
