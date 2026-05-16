@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
+use tokio::sync::Mutex as AsyncMutex;
+
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
@@ -103,15 +105,35 @@ struct AppState {
     provider_budgets: BTreeMap<ProviderId, f64>,
     groups: BTreeMap<String, Vec<ModelId>>,
     default_profile: Option<String>,
-    session_context_tokens: Arc<Mutex<BTreeMap<String, u32>>>,
+    session_state: Arc<Mutex<BTreeMap<String, SessionState>>>,
     telemetry_database_path: Option<String>,
     introspection_cache_path: Option<String>,
+    runtime_refresh_lock: Arc<AsyncMutex<()>>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct ProviderHealth {
     consecutive_failures: u32,
     cooldown_until: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SessionState {
+    seen: bool,
+    context_tokens: u32,
+    reserved_estimated_cost: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BudgetReservation {
+    session_id: Option<String>,
+    estimated_cost: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SessionRoutingState {
+    is_first_message: bool,
+    context_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -212,9 +234,10 @@ fn build_app_with_api_key_and_introspection(
             })
             .collect(),
         default_profile: config.router.default_profile.clone(),
-        session_context_tokens: Arc::new(Mutex::new(BTreeMap::new())),
+        session_state: Arc::new(Mutex::new(BTreeMap::new())),
         telemetry_database_path: config.telemetry.database_path.clone(),
         introspection_cache_path: config.router.metadata.cache_path.clone(),
+        runtime_refresh_lock: Arc::new(AsyncMutex::new(())),
     };
     spawn_periodic_refresh(&state);
 
@@ -300,7 +323,7 @@ fn spawn_periodic_refresh(state: &AppState) {
         interval.tick().await;
         loop {
             interval.tick().await;
-            if let Err(error) = refresh_runtime_state(&state, true).await {
+            if let Err(error) = refresh_runtime_state_singleflight(&state, true).await {
                 tracing::warn!(%error, "background introspection refresh failed");
             }
         }
@@ -372,6 +395,27 @@ async fn refresh_runtime_state(
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = runtime.clone();
     Ok(runtime)
+}
+
+async fn refresh_runtime_state_singleflight(
+    state: &AppState,
+    force_live: bool,
+) -> Result<RuntimeRoutingState, String> {
+    let _guard = state.runtime_refresh_lock.lock().await;
+    refresh_runtime_state(state, force_live).await
+}
+
+async fn refresh_runtime_state_if_stale(
+    state: &AppState,
+    force_live: bool,
+    max_age_ms: u64,
+) -> Result<Option<RuntimeRoutingState>, String> {
+    let _guard = state.runtime_refresh_lock.lock().await;
+    let age = now_millis().saturating_sub(runtime_snapshot(state).last_refresh_ms);
+    if age <= max_age_ms {
+        return Ok(None);
+    }
+    refresh_runtime_state(state, force_live).await.map(Some)
 }
 
 async fn refresh_introspection_snapshots(
@@ -798,7 +842,7 @@ async fn refresh_introspection(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     authorize(&state, &headers)?;
-    let runtime = refresh_runtime_state(&state, true)
+    let runtime = refresh_runtime_state_singleflight(&state, true)
         .await
         .map_err(|error| error_response(StatusCode::BAD_GATEWAY, error, "introspection_error"))?;
     Ok(Json(serde_json::json!({
@@ -1037,23 +1081,25 @@ async fn forward_streaming_with_fallbacks(
             Err(error) => return error.into_response(),
         };
 
-        match within_budget(state, headers, request, &model, candidate.estimated_cost).await {
-            Ok(true) => {}
-            Ok(false) => {
-                last_status = Some(StatusCode::PAYMENT_REQUIRED);
-                last_error = Some(format!(
-                    "model {} exceeds configured max estimated cost",
-                    candidate.model_id
-                ));
-                continue;
-            }
-            Err(error) => return telemetry_error_response(&error).into_response(),
-        }
         if provider_in_cooldown(state, &model.provider) {
             last_status = Some(StatusCode::SERVICE_UNAVAILABLE);
             last_error = Some(format!("provider {} is cooling down", model.provider));
             continue;
         }
+
+        let reservation =
+            match reserve_budget(state, headers, request, &model, candidate.estimated_cost).await {
+                Ok(Some(reservation)) => reservation,
+                Ok(None) => {
+                    last_status = Some(StatusCode::TOO_MANY_REQUESTS);
+                    last_error = Some(format!(
+                        "model {} exceeds configured max estimated cost",
+                        candidate.model_id
+                    ));
+                    continue;
+                }
+                Err(error) => return telemetry_error_response(&error).into_response(),
+            };
 
         let started_at = Instant::now();
         match state
@@ -1083,8 +1129,12 @@ async fn forward_streaming_with_fallbacks(
                 .await
                 {
                     Ok(event_id) => event_id,
-                    Err(error) => return telemetry_error_response(&error).into_response(),
+                    Err(error) => {
+                        release_budget_reservation(state, reservation);
+                        return telemetry_error_response(&error).into_response();
+                    }
                 };
+                release_budget_reservation(state, reservation);
 
                 if status.is_success() {
                     mark_provider_success(state, &model.provider);
@@ -1133,8 +1183,10 @@ async fn forward_streaming_with_fallbacks(
                 )
                 .await
                 {
+                    release_budget_reservation(state, reservation);
                     return telemetry_error_response(&telemetry_error).into_response();
                 }
+                release_budget_reservation(state, reservation);
                 last_error = Some(error);
             }
         }
@@ -1158,6 +1210,7 @@ async fn forward_with_fallbacks(
 ) -> Response {
     let mut last_error = None;
     let mut last_response = None;
+    let mut last_status = StatusCode::BAD_GATEWAY;
 
     for candidate in &decision.candidates {
         let model = match model_by_id(state, &candidate.model_id) {
@@ -1165,21 +1218,24 @@ async fn forward_with_fallbacks(
             Err(error) => return error.into_response(),
         };
 
-        match within_budget(state, headers, request, &model, candidate.estimated_cost).await {
-            Ok(true) => {}
-            Ok(false) => {
-                last_error = Some(format!(
-                    "model {} exceeds configured max estimated cost",
-                    candidate.model_id
-                ));
-                continue;
-            }
-            Err(error) => return telemetry_error_response(&error).into_response(),
-        }
         if provider_in_cooldown(state, &model.provider) {
             last_error = Some(format!("provider {} is cooling down", model.provider));
             continue;
         }
+
+        let reservation =
+            match reserve_budget(state, headers, request, &model, candidate.estimated_cost).await {
+                Ok(Some(reservation)) => reservation,
+                Ok(None) => {
+                    last_status = StatusCode::TOO_MANY_REQUESTS;
+                    last_error = Some(format!(
+                        "model {} exceeds configured max estimated cost",
+                        candidate.model_id
+                    ));
+                    continue;
+                }
+                Err(error) => return telemetry_error_response(&error).into_response(),
+            };
 
         let started_at = Instant::now();
         match state
@@ -1209,8 +1265,12 @@ async fn forward_with_fallbacks(
                 .await
                 {
                     Ok(event_id) => event_id,
-                    Err(error) => return telemetry_error_response(&error).into_response(),
+                    Err(error) => {
+                        release_budget_reservation(state, reservation);
+                        return telemetry_error_response(&error).into_response();
+                    }
                 };
+                release_budget_reservation(state, reservation);
 
                 if status.is_success() {
                     mark_provider_success(state, &model.provider);
@@ -1255,8 +1315,10 @@ async fn forward_with_fallbacks(
                 )
                 .await
                 {
+                    release_budget_reservation(state, reservation);
                     return telemetry_error_response(&telemetry_error).into_response();
                 }
+                release_budget_reservation(state, reservation);
                 last_error = Some(error);
             }
         }
@@ -1266,7 +1328,7 @@ async fn forward_with_fallbacks(
         return (status, Json(body)).into_response();
     }
     error_response(
-        StatusCode::BAD_GATEWAY,
+        last_status,
         last_error.unwrap_or_else(|| "all provider attempts failed".to_string()),
         "provider_error",
     )
@@ -1296,19 +1358,19 @@ fn refresh_after_quota_error(state: &AppState, status: StatusCode) {
     }
     let state = state.clone();
     tokio::spawn(async move {
-        if let Err(error) = refresh_runtime_state(&state, true).await {
+        if let Err(error) = refresh_runtime_state_singleflight(&state, true).await {
             tracing::warn!(%error, "quota-triggered introspection refresh failed");
         }
     });
 }
 
-async fn within_budget(
+async fn reserve_budget(
     state: &AppState,
     headers: &HeaderMap,
     request: &ChatCompletionRequest,
     model: &RouteableModel,
     estimated_cost: f64,
-) -> Result<bool, TelemetryError> {
+) -> Result<Option<BudgetReservation>, TelemetryError> {
     let request_budget_allows = state
         .max_estimated_cost
         .is_none_or(|max_estimated_cost| estimated_cost <= max_estimated_cost)
@@ -1321,13 +1383,13 @@ async fn within_budget(
             .get(&model.id)
             .is_none_or(|max_estimated_cost| estimated_cost <= *max_estimated_cost);
     if !request_budget_allows {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(max_session_cost) = state.max_session_estimated_cost else {
-        return Ok(true);
+        return Ok(Some(BudgetReservation::default()));
     };
     let Some(session_id) = session_id(headers, request) else {
-        return Ok(true);
+        return Ok(Some(BudgetReservation::default()));
     };
     let session_cost = state
         .telemetry
@@ -1337,7 +1399,31 @@ async fn within_budget(
         .filter(|event| event.session_id.as_ref() == Some(&session_id))
         .map(|event| event.estimated_cost)
         .sum::<f64>();
-    Ok(session_cost + estimated_cost <= max_session_cost)
+    let Ok(mut sessions) = state.session_state.lock() else {
+        return Ok(Some(BudgetReservation::default()));
+    };
+    let session = sessions.entry(session_id.clone()).or_default();
+    if session_cost + session.reserved_estimated_cost + estimated_cost > max_session_cost {
+        return Ok(None);
+    }
+    session.reserved_estimated_cost += estimated_cost;
+    Ok(Some(BudgetReservation {
+        session_id: Some(session_id),
+        estimated_cost,
+    }))
+}
+
+fn release_budget_reservation(state: &AppState, reservation: BudgetReservation) {
+    let Some(session_id) = reservation.session_id else {
+        return;
+    };
+    let Ok(mut sessions) = state.session_state.lock() else {
+        return;
+    };
+    if let Some(session) = sessions.get_mut(&session_id) {
+        session.reserved_estimated_cost =
+            (session.reserved_estimated_cost - reservation.estimated_cost).max(0.0);
+    }
 }
 
 fn provider_in_cooldown(state: &AppState, provider_id: &ProviderId) -> bool {
@@ -1527,43 +1613,30 @@ async fn route_request(
     request_id: &str,
 ) -> Result<RoutingDecision, (StatusCode, Json<ErrorResponse>)> {
     let session_id = session_id(headers, request);
-    let has_session = match session_id.as_deref() {
-        Some(id) => state
-            .telemetry
-            .has_session(id)
-            .await
-            .map_err(&|e| telemetry_error_response(&e))?,
-        None => false,
-    };
-    let is_first_message = !has_session;
+    let session_routing_state = prepare_session_routing_state(state, session_id.as_deref())
+        .await
+        .map_err(|error| telemetry_error_response(&error))?;
     maybe_refresh_stale_runtime(state).await;
     let runtime = runtime_snapshot(state);
     let allowed_models = group_models(state, &request.model);
-    let session_context_tokens = session_id
-        .as_deref()
-        .and_then(|id| session_context_tokens(state, id));
     let profile = requested_profile(state, headers, request);
     let preference = requested_preference(request);
     let decision = runtime
         .router
         .route_chat_with_options(
             request,
-            is_first_message,
+            session_routing_state.is_first_message,
             RoutingOptions {
                 allowed_models,
                 profile,
                 preference,
-                session_context_tokens,
+                session_context_tokens: session_routing_state.context_tokens,
                 dynamic_policy_effects: runtime.dynamic_policy_effects.clone(),
             },
         )
         .map_err(|error| router_error_response(&error))?;
-    if let Some(session_id) = session_id {
-        update_session_context_tokens(
-            state,
-            &session_id,
-            decision.features.required_context_tokens,
-        );
+    if let Some(session_id) = session_id.as_deref() {
+        update_session_context_tokens(state, session_id, decision.features.required_context_tokens);
     }
     let mut decision = invoke_llm_judge(state, &decision)
         .await
@@ -1585,7 +1658,7 @@ async fn maybe_refresh_stale_runtime(state: &AppState) {
     if age <= max_age {
         return;
     }
-    if let Err(error) = refresh_runtime_state(state, true).await {
+    if let Err(error) = refresh_runtime_state_if_stale(state, true, max_age).await {
         tracing::warn!(%error, "on-demand introspection refresh failed");
     }
 }
@@ -2123,19 +2196,55 @@ fn metadata_string(request: &ChatCompletionRequest, key: &str) -> Option<String>
         .map(ToOwned::to_owned)
 }
 
-fn session_context_tokens(state: &AppState, session_id: &str) -> Option<u32> {
-    state
-        .session_context_tokens
-        .lock()
-        .ok()
-        .and_then(|context| context.get(session_id).copied())
+async fn prepare_session_routing_state(
+    state: &AppState,
+    session_id: Option<&str>,
+) -> Result<SessionRoutingState, TelemetryError> {
+    let Some(session_id) = session_id else {
+        return Ok(SessionRoutingState {
+            is_first_message: true,
+            context_tokens: None,
+        });
+    };
+    if let Ok(mut sessions) = state.session_state.lock()
+        && let Some(session) = sessions.get_mut(session_id)
+    {
+        let is_first_message = !session.seen;
+        session.seen = true;
+        return Ok(SessionRoutingState {
+            is_first_message,
+            context_tokens: nonzero_context_tokens(session.context_tokens),
+        });
+    }
+
+    let has_session = state.telemetry.has_session(session_id).await?;
+    let mut context_tokens = None;
+    if let Ok(mut sessions) = state.session_state.lock() {
+        let session = sessions.entry(session_id.to_string()).or_default();
+        let is_first_message = !session.seen && !has_session;
+        session.seen = true;
+        context_tokens = nonzero_context_tokens(session.context_tokens);
+        return Ok(SessionRoutingState {
+            is_first_message,
+            context_tokens,
+        });
+    }
+    Ok(SessionRoutingState {
+        is_first_message: !has_session,
+        context_tokens,
+    })
 }
 
 fn update_session_context_tokens(state: &AppState, session_id: &str, required_context_tokens: u32) {
-    if let Ok(mut context) = state.session_context_tokens.lock() {
-        let entry = context.entry(session_id.to_string()).or_default();
-        *entry = (*entry).max(required_context_tokens);
+    if let Ok(mut sessions) = state.session_state.lock() {
+        let session = sessions.entry(session_id.to_string()).or_default();
+        session.context_tokens = session.context_tokens.max(required_context_tokens);
+        session.seen = true;
     }
+}
+
+fn nonzero_context_tokens(context_tokens: u32) -> Option<u32> {
+    (context_tokens > 0).then_some(context_tokens)
 }
 
 fn authorize(
@@ -2803,6 +2912,67 @@ mod tests {
         assert!(body.contains("[DONE]"));
     }
 
+    #[tokio::test]
+    async fn concurrent_same_session_routes_only_one_first_message() {
+        let upstream = spawn_echo_upstream().await;
+        let config = single_provider_config(upstream);
+        let telemetry = TelemetryStore::memory();
+        let app = build_app(&config, telemetry.clone());
+
+        let (first, second) = tokio::join!(
+            app.clone().oneshot(chat_request("first", false)),
+            app.oneshot(chat_request("second", false))
+        );
+        assert_eq!(
+            first.expect("first request should complete").status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            second.expect("second request should complete").status(),
+            StatusCode::OK
+        );
+
+        let first_message_count = telemetry
+            .routing_events()
+            .await
+            .expect("routing events should load")
+            .into_iter()
+            .filter(|event| event.kind == RoutingEventKind::RouteDecision)
+            .filter(|event| event.payload["features"]["is_first_message"] == true)
+            .count();
+        assert_eq!(first_message_count, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_session_budget_uses_reservations() {
+        let upstream = spawn_slow_echo_upstream().await;
+        let config = costly_config(upstream);
+        let app = build_app(&config, TelemetryStore::memory());
+
+        let (first, second) = tokio::join!(
+            app.clone().oneshot(chat_request("first", false)),
+            app.oneshot(chat_request("second", false))
+        );
+        let statuses = [
+            first.expect("first request should complete").status(),
+            second.expect("second request should complete").status(),
+        ];
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == StatusCode::OK)
+                .count(),
+            1
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == StatusCode::TOO_MANY_REQUESTS)
+                .count(),
+            1
+        );
+    }
+
     async fn spawn_echo_upstream() -> String {
         async fn echo(Json(body): Json<Value>) -> Json<Value> {
             Json(json!({
@@ -2824,6 +2994,19 @@ mod tests {
             }))
         }
         spawn_upstream(AxumRouter::new().route("/v1/embeddings", post(embeddings))).await
+    }
+
+    async fn spawn_slow_echo_upstream() -> String {
+        async fn echo(Json(body): Json<Value>) -> Json<Value> {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Json(json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "model": body["model"].clone(),
+                "choices": []
+            }))
+        }
+        spawn_upstream(AxumRouter::new().route("/v1/chat/completions", post(echo))).await
     }
 
     async fn spawn_streaming_upstream() -> String {
@@ -2985,6 +3168,18 @@ mod tests {
                 metadata_overrides: None,
             },
         );
+        config
+    }
+
+    fn costly_config(base_url: String) -> BrouterConfig {
+        let mut config = single_provider_config(base_url);
+        config.router.max_session_estimated_cost = Some(0.015);
+        let model = config
+            .models
+            .get_mut("cheap_cloud")
+            .expect("cheap model should exist");
+        model.input_cost_per_million = 0.0;
+        model.output_cost_per_million = 10.0;
         config
     }
 
