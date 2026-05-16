@@ -99,6 +99,8 @@ pub struct RouterConfig {
     pub classifier: Option<ClassifierConfig>,
     #[serde(default)]
     pub llm_judge: Option<LlmJudgeConfig>,
+    #[serde(default = "default_default_judge")]
+    pub default_judge: bool,
     #[serde(default = "default_provider_failure_threshold")]
     pub provider_failure_threshold: u32,
     #[serde(default = "default_provider_cooldown_ms")]
@@ -125,6 +127,7 @@ impl Default for RouterConfig {
             profiles: BTreeMap::new(),
             classifier: None,
             llm_judge: None,
+            default_judge: default_default_judge(),
             provider_failure_threshold: default_provider_failure_threshold(),
             provider_cooldown_ms: default_provider_cooldown_ms(),
             max_estimated_cost: None,
@@ -135,6 +138,10 @@ impl Default for RouterConfig {
 
 fn default_objective() -> String {
     "balanced".to_string()
+}
+
+const fn default_default_judge() -> bool {
+    true
 }
 
 const fn default_provider_failure_threshold() -> u32 {
@@ -176,9 +183,9 @@ pub struct MetadataConfig {
     pub strict: bool,
     #[serde(default = "default_metadata_max_age_ms")]
     pub max_age_ms: u64,
-    #[serde(default)]
+    #[serde(default = "default_metadata_refresh_on_startup")]
     pub refresh_on_startup: bool,
-    #[serde(default)]
+    #[serde(default = "default_allow_stale_on_provider_error")]
     pub allow_stale_on_provider_error: bool,
     #[serde(default = "default_allow_fallback_catalog")]
     pub allow_fallback_catalog: bool,
@@ -191,8 +198,8 @@ impl Default for MetadataConfig {
         Self {
             strict: false,
             max_age_ms: default_metadata_max_age_ms(),
-            refresh_on_startup: false,
-            allow_stale_on_provider_error: false,
+            refresh_on_startup: default_metadata_refresh_on_startup(),
+            allow_stale_on_provider_error: default_allow_stale_on_provider_error(),
             allow_fallback_catalog: default_allow_fallback_catalog(),
             cache_path: None,
         }
@@ -201,6 +208,14 @@ impl Default for MetadataConfig {
 
 const fn default_metadata_max_age_ms() -> u64 {
     86_400_000
+}
+
+const fn default_metadata_refresh_on_startup() -> bool {
+    true
+}
+
+const fn default_allow_stale_on_provider_error() -> bool {
+    true
 }
 
 const fn default_allow_fallback_catalog() -> bool {
@@ -483,6 +498,8 @@ pub struct ClassifierConfig {
 /// Telemetry storage configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TelemetryConfig {
+    #[serde(default)]
+    pub disabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database_path: Option<String>,
 }

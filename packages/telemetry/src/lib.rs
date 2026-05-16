@@ -50,8 +50,16 @@ impl TelemetryStore {
     /// Returns an error when the `SQLite` database cannot be opened or the
     /// telemetry schema cannot be initialized.
     pub async fn sqlite(path: &Path) -> Result<Self, TelemetryError> {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let database = switchy_database_connection::init_sqlite_rusqlite(Some(path))?;
         database.exec_raw(CREATE_USAGE_EVENTS_TABLE).await?;
+        for statement in ADD_USAGE_EVENT_COLUMNS {
+            if let Err(error) = database.exec_raw(statement).await {
+                drop(error);
+            }
+        }
         Ok(Self {
             backend: TelemetryBackend::Database(Arc::new(database)),
         })
@@ -82,6 +90,23 @@ impl TelemetryStore {
                             ),
                             optional_string_value(event.session_id.as_deref()),
                             DatabaseValue::String(event.selected_model.to_string()),
+                            optional_string_value(event.provider.as_deref()),
+                            optional_string_value(event.upstream_model.as_deref()),
+                            optional_string_value(event.service_tier.as_deref()),
+                            optional_string_value(event.reasoning_effort.as_deref()),
+                            json_vec_value(&event.resource_pools),
+                            optional_string_value(
+                                event
+                                    .judge_model
+                                    .as_ref()
+                                    .map(ToString::to_string)
+                                    .as_deref(),
+                            ),
+                            optional_bool_value(event.judge_overridden),
+                            optional_string_value(event.judge_error.as_deref()),
+                            optional_string_value(event.judge_rationale.as_deref()),
+                            json_vec_value(&event.routing_reasons),
+                            optional_bool_value(event.fallback_used),
                             DatabaseValue::Real64(event.estimated_cost),
                             optional_u64_value(event.latency_ms),
                             optional_u16_value(event.status_code),
@@ -140,6 +165,15 @@ impl TelemetryStore {
             }
         }
     }
+
+    /// Returns the backing store kind for status/diagnostics.
+    #[must_use]
+    pub const fn backend_kind(&self) -> &'static str {
+        match &self.backend {
+            TelemetryBackend::Memory(_) => "memory",
+            TelemetryBackend::Database(_) => "sqlite",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +198,17 @@ CREATE TABLE IF NOT EXISTS usage_events (\
     timestamp_ms INTEGER NOT NULL,\
     session_id TEXT NULL,\
     selected_model TEXT NOT NULL,\
+    provider TEXT NULL,\
+    upstream_model TEXT NULL,\
+    service_tier TEXT NULL,\
+    reasoning_effort TEXT NULL,\
+    resource_pools TEXT NULL,\
+    judge_model TEXT NULL,\
+    judge_overridden INTEGER NULL,\
+    judge_error TEXT NULL,\
+    judge_rationale TEXT NULL,\
+    routing_reasons TEXT NULL,\
+    fallback_used INTEGER NULL,\
     estimated_cost REAL NOT NULL,\
     latency_ms INTEGER NULL,\
     status_code INTEGER NULL,\
@@ -173,14 +218,32 @@ CREATE TABLE IF NOT EXISTS usage_events (\
     success INTEGER NOT NULL\
 )";
 
+const ADD_USAGE_EVENT_COLUMNS: &[&str] = &[
+    "ALTER TABLE usage_events ADD COLUMN provider TEXT NULL",
+    "ALTER TABLE usage_events ADD COLUMN upstream_model TEXT NULL",
+    "ALTER TABLE usage_events ADD COLUMN service_tier TEXT NULL",
+    "ALTER TABLE usage_events ADD COLUMN reasoning_effort TEXT NULL",
+    "ALTER TABLE usage_events ADD COLUMN resource_pools TEXT NULL",
+    "ALTER TABLE usage_events ADD COLUMN judge_model TEXT NULL",
+    "ALTER TABLE usage_events ADD COLUMN judge_overridden INTEGER NULL",
+    "ALTER TABLE usage_events ADD COLUMN judge_error TEXT NULL",
+    "ALTER TABLE usage_events ADD COLUMN judge_rationale TEXT NULL",
+    "ALTER TABLE usage_events ADD COLUMN routing_reasons TEXT NULL",
+    "ALTER TABLE usage_events ADD COLUMN fallback_used INTEGER NULL",
+];
+
 const INSERT_USAGE_EVENT: &str = "\
 INSERT INTO usage_events (\
-    timestamp_ms, session_id, selected_model, estimated_cost, latency_ms,\
+    timestamp_ms, session_id, selected_model, provider, upstream_model, service_tier,\
+    reasoning_effort, resource_pools, judge_model, judge_overridden, judge_error,\
+    judge_rationale, routing_reasons, fallback_used, estimated_cost, latency_ms,\
     status_code, provider_error, prompt_tokens, completion_tokens, success\
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
 const SELECT_USAGE_EVENTS: &str = "\
-SELECT timestamp_ms, session_id, selected_model, estimated_cost, latency_ms, \
+SELECT timestamp_ms, session_id, selected_model, provider, upstream_model, service_tier,\
+    reasoning_effort, resource_pools, judge_model, judge_overridden, judge_error,\
+    judge_rationale, routing_reasons, fallback_used, estimated_cost, latency_ms,\
     status_code, provider_error, prompt_tokens, completion_tokens, success \
 FROM usage_events ORDER BY id ASC";
 
@@ -199,13 +262,34 @@ fn optional_u16_value(value: Option<u16>) -> DatabaseValue {
     DatabaseValue::Int64Opt(value.map(i64::from))
 }
 
+fn optional_bool_value(value: Option<bool>) -> DatabaseValue {
+    DatabaseValue::Int64Opt(value.map(i64::from))
+}
+
+fn json_vec_value(values: &[String]) -> DatabaseValue {
+    if values.is_empty() {
+        DatabaseValue::StringOpt(None)
+    } else {
+        DatabaseValue::String(serde_json::to_string(values).unwrap_or_else(|_| "[]".to_string()))
+    }
+}
+
 fn row_to_usage_event(row: &Row) -> UsageEvent {
     UsageEvent {
         timestamp_ms: get_u64(row, "timestamp_ms"),
-        session_id: row
-            .get("session_id")
-            .and_then(|value| value.as_str().map(ToOwned::to_owned)),
+        session_id: optional_string_column(row, "session_id"),
         selected_model: ModelId::new(get_string(row, "selected_model")),
+        provider: optional_string_column(row, "provider"),
+        upstream_model: optional_string_column(row, "upstream_model"),
+        service_tier: optional_string_column(row, "service_tier"),
+        reasoning_effort: optional_string_column(row, "reasoning_effort"),
+        resource_pools: vec_column(row, "resource_pools"),
+        judge_model: optional_string_column(row, "judge_model").map(ModelId::new),
+        judge_overridden: optional_bool_column(row, "judge_overridden"),
+        judge_error: optional_string_column(row, "judge_error"),
+        judge_rationale: optional_string_column(row, "judge_rationale"),
+        routing_reasons: vec_column(row, "routing_reasons"),
+        fallback_used: optional_bool_column(row, "fallback_used"),
         estimated_cost: row
             .get("estimated_cost")
             .and_then(|value| value.as_f64())
@@ -215,15 +299,36 @@ fn row_to_usage_event(row: &Row) -> UsageEvent {
             .get("status_code")
             .and_then(|value| value.as_i64())
             .and_then(|value| u16::try_from(value).ok()),
-        provider_error: row
-            .get("provider_error")
-            .and_then(|value| value.as_str().map(ToOwned::to_owned)),
+        provider_error: optional_string_column(row, "provider_error"),
         prompt_tokens: optional_u64_column(row, "prompt_tokens"),
         completion_tokens: optional_u64_column(row, "completion_tokens"),
         success: row
             .get("success")
             .is_some_and(|value| value.as_bool().unwrap_or_else(|| value.as_i64() == Some(1))),
     }
+}
+
+fn optional_string_column(row: &Row, column: &str) -> Option<String> {
+    row.get(column)
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+}
+
+fn optional_bool_column(row: &Row, column: &str) -> Option<bool> {
+    row.get(column).and_then(|value| {
+        value
+            .as_bool()
+            .or_else(|| value.as_i64().map(|value| value != 0))
+    })
+}
+
+fn vec_column(row: &Row, column: &str) -> Vec<String> {
+    row.get(column)
+        .and_then(|value| {
+            value
+                .as_str()
+                .and_then(|value| serde_json::from_str(value).ok())
+        })
+        .unwrap_or_default()
 }
 
 fn optional_u64_column(row: &Row, column: &str) -> Option<u64> {
@@ -259,6 +364,17 @@ mod tests {
             timestamp_ms: now_millis(),
             session_id: Some("session-a".to_string()),
             selected_model: ModelId::new("model-a"),
+            provider: Some("provider-a".to_string()),
+            upstream_model: Some("upstream-a".to_string()),
+            service_tier: Some("priority".to_string()),
+            reasoning_effort: Some("high".to_string()),
+            resource_pools: vec!["priority_pool".to_string()],
+            judge_model: Some(ModelId::new("judge-a")),
+            judge_overridden: Some(true),
+            judge_error: None,
+            judge_rationale: Some("best fit".to_string()),
+            routing_reasons: vec!["reason-a".to_string()],
+            fallback_used: Some(false),
             estimated_cost: 0.25,
             latency_ms: Some(42),
             status_code: Some(200),

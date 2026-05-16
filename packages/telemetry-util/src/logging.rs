@@ -59,7 +59,7 @@ impl Timer {
 
     #[must_use]
     pub fn elapsed_ms(&self) -> u64 {
-        self.start.elapsed().as_millis() as u64
+        u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 }
 
@@ -100,7 +100,7 @@ impl ProviderRequestMeta {
             provider_kind: provider_kind.to_string(),
             model_id: model_id.to_string(),
             upstream_model: upstream_model.to_string(),
-            base_url: base_url.map(|s| s.to_string()),
+            base_url: base_url.map(ToString::to_string),
             elapsed_ms: None,
             status: None,
             error: None,
@@ -108,18 +108,21 @@ impl ProviderRequestMeta {
     }
 
     /// Adds timing information
-    pub fn with_timing(mut self, elapsed_ms: u64) -> Self {
+    #[must_use]
+    pub const fn with_timing(mut self, elapsed_ms: u64) -> Self {
         self.elapsed_ms = Some(elapsed_ms);
         self
     }
 
     /// Adds response status
-    pub fn with_status(mut self, status: u16) -> Self {
+    #[must_use]
+    pub const fn with_status(mut self, status: u16) -> Self {
         self.status = Some(status);
         self
     }
 
     /// Adds error information
+    #[must_use]
     pub fn with_error(mut self, error: &str) -> Self {
         self.error = Some(error.to_string());
         self
@@ -171,12 +174,14 @@ impl RoutingDecisionMeta {
     }
 
     /// Adds rule that triggered the decision
+    #[must_use]
     pub fn with_rule(mut self, rule: Option<&str>) -> Self {
-        self.rule_triggered = rule.map(|s| s.to_string());
+        self.rule_triggered = rule.map(ToString::to_string);
         self
     }
 
     /// Adds judge override information
+    #[must_use]
     pub fn with_judge(
         mut self,
         judge_overridden: bool,
@@ -184,8 +189,8 @@ impl RoutingDecisionMeta {
         judge_error: Option<&str>,
     ) -> Self {
         self.judge_overridden = Some(judge_overridden);
-        self.judge_model = judge_model.map(|s| s.to_string());
-        self.judge_error = judge_error.map(|s| s.to_string());
+        self.judge_model = judge_model.map(ToString::to_string);
+        self.judge_error = judge_error.map(ToString::to_string);
         self
     }
 }
@@ -239,6 +244,7 @@ impl JudgeInvocationMeta {
     }
 
     /// Records the judge succeeded
+    #[must_use]
     pub fn with_success(mut self, response_length: usize, chosen_model: &str) -> Self {
         self.response_length = Some(response_length);
         self.parse_success = true;
@@ -247,13 +253,15 @@ impl JudgeInvocationMeta {
     }
 
     /// Records the judge failed
+    #[must_use]
     pub fn with_failure(mut self, error: &str) -> Self {
         self.error = Some(error.to_string());
         self
     }
 
     /// Adds timing
-    pub fn with_timing(mut self, elapsed_ms: u64) -> Self {
+    #[must_use]
+    pub const fn with_timing(mut self, elapsed_ms: u64) -> Self {
         self.elapsed_ms = Some(elapsed_ms);
         self
     }

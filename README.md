@@ -26,15 +26,20 @@ patterns used by the sibling projects in this checkout.
 - `POST /v1/brouter/route/explain`
 - `GET /v1/brouter/usage`
 - `GET /v1/brouter/usage/summary`
+- `GET /v1/brouter/introspection`
+- `GET /v1/brouter/status`
 
 `/v1/chat/completions` supports non-streaming and streaming OpenAI-compatible
 upstreams, provider timeouts, fallback attempts for retryable failures,
 provider cooldowns after repeated failures, Anthropic non-streaming and streaming
-conversion, OpenAI-compatible embeddings forwarding, configurable scoring/routing rules, named routing profiles with allow/deny policy, context-window safety for session-aware model switching, metadata provenance with user overrides and an isolated fallback catalog, generic model/provider route attributes, and optional SQLite telemetry via
+conversion, OpenAI-compatible embeddings forwarding, configurable scoring/routing rules, named routing profiles with allow/deny policy, context-window safety for session-aware model switching, cached live provider/account introspection, quota-aware dynamic policy, a default opt-out LLM judge for close routing decisions, generic model/provider route attributes, and SQLite telemetry via
 `switchy_database`. Successful chat responses include brouter headers such as
-`x-brouter-selected-model`, `x-brouter-provider`, `x-brouter-attributes`, and
-`x-brouter-display-badges`. `/v1/brouter/usage` supports `session_id`, `model`,
-`success`, `since_ms`, and `until_ms` query filters. `/metrics` exposes basic
+`x-brouter-selected-model`, `x-brouter-provider`, `x-brouter-service-tier`,
+`x-brouter-reasoning-effort`, `x-brouter-resource-pools`,
+`x-brouter-attributes`, and `x-brouter-display-badges`. `/v1/brouter/usage`
+supports `session_id`, `model`, `success`, `since_ms`, and `until_ms` query
+filters. `/v1/brouter/introspection` shows live/cache provider resource data and
+`/v1/brouter/status` summarizes active defaults. `/metrics` exposes basic
 Prometheus text metrics from telemetry events.
 
 ## Development

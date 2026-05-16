@@ -13,6 +13,7 @@ version     = { workspace = true }
 [dependencies]
 brouter_provider_models = { workspace = true }
 brouter_telemetry_models = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
 switchy_database = { workspace = true, features = ["sqlite-rusqlite"] }
 switchy_database_connection = { workspace = true, features = [
     "sqlite-rusqlite",

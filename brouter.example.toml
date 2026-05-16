@@ -12,6 +12,9 @@ default_objective = "balanced"
 # x-brouter-profile, or metadata.brouter_profile.
 # default_profile = "conserve_openai"
 debug_headers = true
+# When router.llm_judge is omitted, brouter picks a safe low-cost judge from
+# configured chat models and uses it when deterministic scores are close.
+default_judge = true
 provider_failure_threshold = 3
 provider_cooldown_ms = 30000
 # Optional budget guards based on router cost estimates.
@@ -26,10 +29,13 @@ strong = "strong_cloud"
 cloud = ["cheap_cloud", "strong_cloud"]
 
 [router.metadata]
-# Live provider metadata is preferred over fallback catalog data when enabled.
-refresh_on_startup = false
+# Live provider metadata/account usage is refreshed by default for providers
+# with known introspection support, cached here, and reused if live refresh fails.
+refresh_on_startup = true
 max_age_ms = 86400000
+allow_stale_on_provider_error = true
 allow_fallback_catalog = true
+# cache_path defaults to ~/.local/state/brouter/introspection.json
 
 [router.dynamic_policy]
 # Generic account/resource policy for introspected quota pools.
@@ -100,7 +106,14 @@ when_contains = ["priority", "urgent", "asap", "low latency", "quick response"]
 prefer_attributes = { latency_class = "priority" }
 
 [telemetry]
+# Persistent telemetry is enabled by default at ~/.local/state/brouter/brouter.db.
+# Set disabled = true to keep telemetry in memory only.
+disabled = false
 database_path = "brouter.db"
+
+# Logs default to ~/.local/state/brouter/brouter.log. Override with
+# BROUTER_LOG_FILE=/path/to/log, BROUTER_LOG_FILE=off, RUST_LOG=debug, and/or
+# BROUTER_LOG_FORMAT=json.
 
 [providers.ollama]
 kind = "open-ai-compatible"

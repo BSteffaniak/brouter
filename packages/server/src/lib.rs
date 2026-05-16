@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -23,11 +23,11 @@ use brouter_api_models::{
 use brouter_catalog_models::ResolvedModelMetadata;
 use brouter_catalog_models::{MetadataProvenance, MetadataSource};
 use brouter_config::{
-    ConfigError, context_policy, llm_judge_config, routeable_models_with_introspection,
+    ConfigError, context_policy, llm_judge_config_or_default, routeable_models_with_introspection,
     routing_profiles, routing_rules, scoring_weights,
 };
 use brouter_config_models::BrouterConfig;
-use brouter_introspection::{DynamicPolicyConfig, dynamic_policy_effects};
+use brouter_introspection::{DynamicPolicyConfig, IntrospectionCache, dynamic_policy_effects};
 use brouter_introspection_models::{
     AccountSnapshot, AccountStatus, DynamicPolicyEffect, IntrospectionRequest,
     IntrospectionSnapshot, ResourceKind, ResourcePool, ResourceScope, ResourceSelector,
@@ -93,6 +93,8 @@ struct AppState {
     introspection_snapshots: Vec<IntrospectionSnapshot>,
     dynamic_policy_effects: Vec<DynamicPolicyEffect>,
     llm_judge: Option<JudgeConfig>,
+    telemetry_database_path: Option<String>,
+    introspection_cache_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -167,8 +169,10 @@ fn build_app_with_api_key_and_introspection(
         },
         &config.router.dynamic_policy.disable_attributes_when_low,
     );
+    let routeable_models = routeable_models_with_introspection(config, &introspection_snapshots);
+    let llm_judge = llm_judge_config_or_default(config, &routeable_models);
     let router = Router::new_with_policy(
-        routeable_models_with_introspection(config, &introspection_snapshots),
+        routeable_models,
         objective,
         scoring_weights(config),
         routing_rules(config),
@@ -219,7 +223,9 @@ fn build_app_with_api_key_and_introspection(
         session_context_tokens: Arc::new(Mutex::new(BTreeMap::new())),
         introspection_snapshots,
         dynamic_policy_effects,
-        llm_judge: llm_judge_config(config),
+        llm_judge,
+        telemetry_database_path: config.telemetry.database_path.clone(),
+        introspection_cache_path: config.router.metadata.cache_path.clone(),
     };
 
     let app = AxumRouter::new()
@@ -232,6 +238,7 @@ fn build_app_with_api_key_and_introspection(
         .route("/v1/brouter/usage", get(usage))
         .route("/v1/brouter/usage/summary", get(usage_summary))
         .route("/v1/brouter/introspection", get(introspection))
+        .route("/v1/brouter/status", get(status))
         .layer(DefaultBodyLimit::max(config.server.max_request_body_bytes))
         .with_state(state);
     apply_cors(app, &config.server.cors_allowed_origins)
@@ -261,14 +268,33 @@ fn apply_cors(app: AxumRouter, allowed_origins: &[String]) -> AxumRouter {
 }
 
 async fn introspection_snapshots(config: &BrouterConfig) -> Vec<IntrospectionSnapshot> {
-    let live = refresh_introspection_snapshots(config).await;
-    merge_configured_resource_pools(config, live)
+    let cache_path = metadata_cache_path(config);
+    let cache = cache_path.as_deref().and_then(load_introspection_cache);
+    let snapshots = refresh_introspection_snapshots(config, cache.as_ref()).await;
+    if let (Some(path), Some(mut updated_cache)) =
+        (cache_path.as_deref(), cache_from_snapshots(&snapshots))
+    {
+        if let Some(existing_cache) = &cache {
+            for (provider, snapshot) in &existing_cache.providers {
+                updated_cache
+                    .providers
+                    .entry(provider.clone())
+                    .or_insert_with(|| snapshot.clone());
+            }
+        }
+        if let Err(error) = updated_cache.save(path) {
+            tracing::warn!(path = %path.display(), %error, "failed to save introspection cache");
+        } else {
+            tracing::info!(path = %path.display(), "saved introspection cache");
+        }
+    }
+    merge_configured_resource_pools(config, snapshots)
 }
 
-async fn refresh_introspection_snapshots(config: &BrouterConfig) -> Vec<IntrospectionSnapshot> {
-    if !config.router.metadata.refresh_on_startup {
-        return Vec::new();
-    }
+async fn refresh_introspection_snapshots(
+    config: &BrouterConfig,
+    cache: Option<&IntrospectionCache>,
+) -> Vec<IntrospectionSnapshot> {
     let registry = ProviderRegistry::from_config(config);
     let client = ProviderClient::new();
     let mut snapshots = Vec::new();
@@ -279,17 +305,111 @@ async fn refresh_introspection_snapshots(config: &BrouterConfig) -> Vec<Introspe
         if provider.introspection.disabled || !provider.introspection.enabled {
             continue;
         }
+        if !config.router.metadata.refresh_on_startup {
+            if let Some(snapshot) = fresh_cached_snapshot(cache, &provider_id, config) {
+                snapshots.push(snapshot);
+            }
+            continue;
+        }
         let request = IntrospectionRequest {
             include_catalog: provider.introspection.catalog,
             include_account: provider.introspection.account,
             include_limits: provider.introspection.limits,
         };
         match client.introspect(&registry, &provider_id, request).await {
-            Ok(snapshot) => snapshots.push(snapshot),
-            Err(error) => tracing::warn!(%provider_id, %error, "provider introspection failed"),
+            Ok(snapshot) => {
+                tracing::info!(%provider_id, "provider introspection refreshed");
+                snapshots.push(snapshot);
+            }
+            Err(error) => {
+                tracing::warn!(%provider_id, %error, "provider introspection failed");
+                if let Some(snapshot) = fallback_cached_snapshot(cache, &provider_id, config) {
+                    snapshots.push(snapshot);
+                }
+            }
         }
     }
     snapshots
+}
+
+fn metadata_cache_path(config: &BrouterConfig) -> Option<PathBuf> {
+    config
+        .router
+        .metadata
+        .cache_path
+        .as_deref()
+        .map(expand_user_path)
+}
+
+fn expand_user_path(path: &str) -> PathBuf {
+    if let Some(stripped) = path.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return PathBuf::from(home).join(stripped);
+    }
+    PathBuf::from(path)
+}
+
+fn load_introspection_cache(path: &Path) -> Option<IntrospectionCache> {
+    if !path.exists() {
+        return None;
+    }
+    match IntrospectionCache::load(path) {
+        Ok(cache) => {
+            tracing::info!(path = %path.display(), "loaded introspection cache");
+            Some(cache)
+        }
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "failed to load introspection cache");
+            None
+        }
+    }
+}
+
+fn fresh_cached_snapshot(
+    cache: Option<&IntrospectionCache>,
+    provider_id: &ProviderId,
+    config: &BrouterConfig,
+) -> Option<IntrospectionSnapshot> {
+    cache
+        .and_then(|cache| cache.fresh_snapshot(provider_id, config.router.metadata.max_age_ms))
+        .cloned()
+        .map(mark_cached_snapshot)
+}
+
+fn fallback_cached_snapshot(
+    cache: Option<&IntrospectionCache>,
+    provider_id: &ProviderId,
+    config: &BrouterConfig,
+) -> Option<IntrospectionSnapshot> {
+    if !config.router.metadata.allow_stale_on_provider_error {
+        return fresh_cached_snapshot(cache, provider_id, config);
+    }
+    cache
+        .and_then(|cache| cache.providers.get(provider_id))
+        .cloned()
+        .map(mark_cached_snapshot)
+}
+
+fn mark_cached_snapshot(mut snapshot: IntrospectionSnapshot) -> IntrospectionSnapshot {
+    snapshot.source.kind = SnapshotSourceKind::Cache;
+    snapshot
+        .warnings
+        .push(brouter_introspection_models::IntrospectionWarning::new(
+            "cache_fallback",
+            "using cached introspection data",
+        ));
+    snapshot
+}
+
+fn cache_from_snapshots(snapshots: &[IntrospectionSnapshot]) -> Option<IntrospectionCache> {
+    let providers = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.source.kind != SnapshotSourceKind::Cache)
+        .cloned()
+        .map(|snapshot| (snapshot.provider.clone(), snapshot))
+        .collect::<BTreeMap<_, _>>();
+    (!providers.is_empty()).then_some(IntrospectionCache { providers })
 }
 
 fn merge_configured_resource_pools(
@@ -442,6 +562,9 @@ fn resource_unit(value: &str) -> ResourceUnit {
 }
 
 async fn telemetry_store(config: &BrouterConfig) -> Result<TelemetryStore, TelemetryError> {
+    if config.telemetry.disabled {
+        return Ok(TelemetryStore::memory());
+    }
     if let Some(path) = &config.telemetry.database_path {
         TelemetryStore::sqlite(Path::new(path)).await
     } else {
@@ -519,6 +642,39 @@ async fn introspection(
 ) -> Result<Json<Vec<IntrospectionSnapshot>>, (StatusCode, Json<ErrorResponse>)> {
     authorize(&state, &headers)?;
     Ok(Json(state.introspection_snapshots))
+}
+
+async fn status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    authorize(&state, &headers)?;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "providers": state.providers.provider_ids().iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "models": state.router.models().len(),
+        "introspection": {
+            "snapshot_count": state.introspection_snapshots.len(),
+            "cache_path": state.introspection_cache_path,
+            "providers": state.introspection_snapshots.iter().map(|snapshot| serde_json::json!({
+                "provider": snapshot.provider.to_string(),
+                "source": &snapshot.source,
+                "account_pools": snapshot.account.as_ref().map_or(0, |account| account.pools.len()),
+                "catalog_models": snapshot.catalog.as_ref().map_or(0, |catalog| catalog.models.len()),
+                "warnings": &snapshot.warnings,
+            })).collect::<Vec<_>>(),
+        },
+        "telemetry": {
+            "backend": state.telemetry.backend_kind(),
+            "database_path": state.telemetry_database_path,
+        },
+        "judge": state.llm_judge.as_ref().map(|judge| serde_json::json!({
+            "model": judge.model.to_string(),
+            "provider": judge.provider.as_ref().map(ToString::to_string),
+            "score_gap_threshold": judge.trigger.score_gap_threshold,
+            "rule_triggered": judge.trigger.rule_triggered,
+        })),
+    })))
 }
 
 async fn usage_summary(
@@ -733,6 +889,7 @@ async fn forward_streaming_with_fallbacks(
                     state,
                     headers,
                     request,
+                    decision,
                     AttemptTelemetry {
                         model_id: candidate.model_id.clone(),
                         estimated_cost: candidate.estimated_cost,
@@ -773,6 +930,7 @@ async fn forward_streaming_with_fallbacks(
                     state,
                     headers,
                     request,
+                    decision,
                     AttemptTelemetry {
                         model_id: candidate.model_id.clone(),
                         estimated_cost: candidate.estimated_cost,
@@ -844,6 +1002,7 @@ async fn forward_with_fallbacks(
                     state,
                     headers,
                     request,
+                    decision,
                     AttemptTelemetry {
                         model_id: candidate.model_id.clone(),
                         estimated_cost: candidate.estimated_cost,
@@ -880,6 +1039,7 @@ async fn forward_with_fallbacks(
                     state,
                     headers,
                     request,
+                    decision,
                     AttemptTelemetry {
                         model_id: candidate.model_id.clone(),
                         estimated_cost: candidate.estimated_cost,
@@ -1396,6 +1556,10 @@ async fn invoke_llm_judge(
     if !should_fire {
         return Ok(None);
     }
+    if decision.candidates.len() < 2 {
+        debug!("skipping judge because fewer than two candidates are available");
+        return Ok(None);
+    }
     let judge_model_id = judge_config.model.clone();
     let system_prompt = judge_config
         .system_prompt
@@ -1737,14 +1901,28 @@ async fn record_model_attempt(
     state: &AppState,
     headers: &HeaderMap,
     request: &ChatCompletionRequest,
+    decision: &RoutingDecision,
     attempt: AttemptTelemetry,
 ) -> Result<(), TelemetryError> {
+    let model = route_model(state, &attempt.model_id);
+    let reasoning = decision.reasoning.as_ref();
     state
         .telemetry
         .record(&UsageEvent {
             timestamp_ms: now_millis(),
             session_id: session_id(headers, request),
             selected_model: ModelId::new(attempt.model_id.as_str()),
+            provider: model.map(|model| model.provider.to_string()),
+            upstream_model: model.map(|model| model.upstream_model.clone()),
+            service_tier: decision.request_controls.service_tier.clone(),
+            reasoning_effort: decision.request_controls.reasoning_effort.clone(),
+            resource_pools: decision.request_controls.resource_pools.clone(),
+            judge_model: reasoning.map(|reasoning| reasoning.model_id.clone()),
+            judge_overridden: reasoning.map(|reasoning| reasoning.overridden),
+            judge_error: reasoning.and_then(|reasoning| reasoning.error.clone()),
+            judge_rationale: reasoning.map(|reasoning| reasoning.rationale.clone()),
+            routing_reasons: decision.reasons.clone(),
+            fallback_used: Some(attempt.model_id != decision.selected_model),
             estimated_cost: attempt.estimated_cost,
             latency_ms: attempt.latency_ms,
             status_code: attempt.status_code,

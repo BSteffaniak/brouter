@@ -142,7 +142,9 @@ pub fn apply_default_config(config: &mut BrouterConfig) {
     apply_provider_presets(config);
     apply_env_provider_autodetection(config);
     apply_default_dynamic_policy(config);
-    apply_default_openai_codex_introspection(config);
+    apply_default_provider_introspection(config);
+    apply_default_metadata_policy(config);
+    apply_default_telemetry(config);
     // Apply auto-detected omit_request_fields after presets and manual configs
     apply_default_omit_request_fields(config);
 }
@@ -295,14 +297,87 @@ fn apply_default_omit_request_fields(config: &mut BrouterConfig) {
     }
 }
 
-fn apply_default_openai_codex_introspection(config: &mut BrouterConfig) {
-    for provider in config.providers.values_mut() {
-        if provider.kind == ProviderKind::OpenaiCodex && !provider.introspection.disabled {
-            provider.introspection.enabled = true;
-            provider.introspection.account = true;
-            provider.introspection.limits = true;
+fn apply_default_provider_introspection(config: &mut BrouterConfig) {
+    for (provider_id, provider) in &mut config.providers {
+        if provider.introspection.disabled {
+            continue;
+        }
+        match provider.kind {
+            ProviderKind::OpenaiCodex => {
+                provider.introspection.enabled = true;
+                provider.introspection.account = true;
+                provider.introspection.limits = true;
+            }
+            ProviderKind::OpenAiCompatible => {
+                if provider.base_url.is_some() {
+                    provider.introspection.enabled = true;
+                    provider.introspection.catalog = true;
+                }
+                if is_openrouter_like(provider_id, provider) {
+                    provider.introspection.account = true;
+                }
+            }
+            ProviderKind::Anthropic => {
+                if provider.base_url.is_some() || provider.api_key_env.is_some() {
+                    provider.introspection.enabled = true;
+                    provider.introspection.catalog = true;
+                }
+            }
         }
     }
+}
+
+fn is_openrouter_like(provider_id: &str, provider: &ProviderConfig) -> bool {
+    provider_id.contains("openrouter")
+        || provider
+            .base_url
+            .as_deref()
+            .is_some_and(|url| url.contains("openrouter.ai"))
+}
+
+fn apply_default_metadata_policy(config: &mut BrouterConfig) {
+    if !config
+        .providers
+        .values()
+        .any(|provider| provider.introspection.enabled && !provider.introspection.disabled)
+    {
+        return;
+    }
+    if config.router.metadata.cache_path.is_none() {
+        config.router.metadata.cache_path = Some(default_state_file("introspection.json"));
+    }
+}
+
+fn apply_default_telemetry(config: &mut BrouterConfig) {
+    if config.telemetry.disabled {
+        return;
+    }
+    if config.telemetry.database_path.is_none() {
+        config.telemetry.database_path = Some(default_state_file("brouter.db"));
+    }
+}
+
+fn default_state_file(file_name: &str) -> String {
+    if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
+        return PathBuf::from(state_home)
+            .join("brouter")
+            .join(file_name)
+            .display()
+            .to_string();
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("brouter")
+            .join(file_name)
+            .display()
+            .to_string();
+    }
+    PathBuf::from(".brouter-state")
+        .join(file_name)
+        .display()
+        .to_string()
 }
 
 fn apply_default_dynamic_policy(config: &mut BrouterConfig) {
@@ -891,6 +966,61 @@ pub fn llm_judge_config(config: &BrouterConfig) -> Option<JudgeConfig> {
     })
 }
 
+/// Returns the explicit LLM judge config or a batteries-included default judge.
+#[must_use]
+pub fn llm_judge_config_or_default(
+    config: &BrouterConfig,
+    models: &[RouteableModel],
+) -> Option<JudgeConfig> {
+    if let Some(config) = llm_judge_config(config) {
+        return Some(config);
+    }
+    if !config.router.default_judge {
+        return None;
+    }
+    let mut chat_models = models
+        .iter()
+        .filter(|model| model.capabilities.contains(&ModelCapability::Chat))
+        .collect::<Vec<_>>();
+    if chat_models.len() < 2 {
+        return None;
+    }
+    chat_models.sort_by(|left, right| {
+        left.input_cost_per_million
+            .total_cmp(&right.input_cost_per_million)
+            .then_with(|| {
+                left.output_cost_per_million
+                    .total_cmp(&right.output_cost_per_million)
+            })
+            .then_with(|| left.quality.cmp(&right.quality))
+            .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+    });
+    let model = chat_models.first()?;
+    let trigger = brouter_config_models::LlmJudgeTriggerConfig::default();
+    let shortlist = brouter_config_models::LlmJudgeShortlistConfig::default();
+    let output = brouter_config_models::LlmJudgeOutputConfig::default();
+    Some(JudgeConfig {
+        model: model.id.clone(),
+        provider: Some(model.provider.clone()),
+        system_prompt: None,
+        trigger: JudgeTrigger {
+            score_gap_threshold: trigger.score_gap_threshold,
+            rule_triggered: trigger.rule_triggered,
+        },
+        shortlist: JudgeShortlistConfig {
+            size: shortlist.size,
+            min_score: shortlist.min_score,
+            deny: Vec::new(),
+        },
+        output: JudgeOutput {
+            structured: output.structured,
+            max_tokens: output.max_tokens,
+            temperature: output.temperature,
+        },
+        max_estimated_cost: 0.0,
+    })
+}
+
 /// Converts context configuration into a runtime context policy.
 #[must_use]
 pub const fn context_policy(config: &BrouterConfig) -> ContextPolicy {
@@ -1100,7 +1230,9 @@ pub fn routeable_models_with_introspection(
         }
     }
     append_discovered_models(config, snapshots, &mut models);
-    append_fallback_catalog_models(config, &catalog, &mut models);
+    if config.router.metadata.allow_fallback_catalog {
+        append_fallback_catalog_models(config, &catalog, &mut models);
+    }
     models
 }
 

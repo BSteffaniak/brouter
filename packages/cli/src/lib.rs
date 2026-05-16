@@ -10,6 +10,7 @@ use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::OnceLock;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -19,8 +20,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use brouter_api_models::{ChatCompletionRequest, ChatMessage, MessageContent};
 use brouter_catalog_models::ResolvedModelMetadata;
 use brouter_config::{
-    apply_default_config, llm_judge_config, load_config, resolve_config_path, routeable_models,
-    routing_rules, scoring_weights, validate_config_warnings,
+    apply_default_config, llm_judge_config_or_default, load_config, resolve_config_path,
+    routeable_models, routing_rules, scoring_weights, validate_config_warnings,
 };
 use brouter_config_models::{BrouterConfig, ProviderConfig, ProviderKind};
 use brouter_provider::{ProviderClient, ProviderRegistry};
@@ -40,6 +41,8 @@ use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use tracing::{debug, info, warn as tracing_warn};
 use zeroize::Zeroizing;
+
+static LOG_GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
 
 /// Runs the brouter command-line interface.
 ///
@@ -62,7 +65,9 @@ pub async fn run_cli() -> Result<()> {
             Ok(())
         }
         Command::Auth { command } => auth(command).await,
-        Command::Doctor { config } => doctor(&resolve_and_load(config.as_deref())?).await,
+        Command::Doctor { config, json } => {
+            doctor(&resolve_and_load(config.as_deref())?, json).await
+        }
         Command::Route {
             config,
             prompt,
@@ -85,7 +90,34 @@ pub async fn run_cli() -> Result<()> {
 fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    if std::env::var("BROUTER_LOG_FORMAT").is_ok_and(|value| value == "json") {
+    let json = std::env::var("BROUTER_LOG_FORMAT").is_ok_and(|value| value == "json");
+    if let Some(path) = log_file_path() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let (writer, guard) = tracing_appender::non_blocking(file);
+            let _ = LOG_GUARD.set(guard);
+            if json {
+                let _ = tracing_subscriber::fmt()
+                    .json()
+                    .with_writer(writer)
+                    .with_env_filter(filter)
+                    .try_init();
+            } else {
+                let _ = tracing_subscriber::fmt()
+                    .with_writer(writer)
+                    .with_env_filter(filter)
+                    .try_init();
+            }
+            return;
+        }
+    }
+    if json {
         let _ = tracing_subscriber::fmt()
             .json()
             .with_env_filter(filter)
@@ -93,6 +125,37 @@ fn init_tracing() {
     } else {
         let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
     }
+}
+
+fn log_file_path() -> Option<PathBuf> {
+    match std::env::var("BROUTER_LOG_FILE") {
+        Ok(value) if value == "off" || value == "false" || value.is_empty() => None,
+        Ok(value) => Some(expand_user_path(&value)),
+        Err(_) => Some(default_state_file("brouter.log")),
+    }
+}
+
+fn default_state_file(file_name: &str) -> PathBuf {
+    if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
+        return PathBuf::from(state_home).join("brouter").join(file_name);
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("brouter")
+            .join(file_name);
+    }
+    PathBuf::from(".brouter-state").join(file_name)
+}
+
+fn expand_user_path(path: &str) -> PathBuf {
+    if let Some(stripped) = path.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return PathBuf::from(home).join(stripped);
+    }
+    PathBuf::from(path)
 }
 
 fn resolve_and_load(config: Option<&Path>) -> Result<BrouterConfig> {
@@ -151,14 +214,76 @@ fn check_config(config: &BrouterConfig, strict: bool, json_output: bool) -> Resu
     Ok(())
 }
 
-async fn doctor(config: &BrouterConfig) -> Result<()> {
+async fn doctor(config: &BrouterConfig, json_output: bool) -> Result<()> {
     let warnings = validate_config_warnings(config);
+    let models = routeable_models(config);
+    let judge = llm_judge_config_or_default(config, &models);
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": warnings.is_empty(),
+                "providers": config.providers.len(),
+                "models": config.models.len(),
+                "warnings": warnings.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "introspection": {
+                    "refresh_on_startup": config.router.metadata.refresh_on_startup,
+                    "allow_stale_on_provider_error": config.router.metadata.allow_stale_on_provider_error,
+                    "cache_path": &config.router.metadata.cache_path,
+                    "enabled_providers": config.providers.iter().filter(|(_, provider)| provider.introspection.enabled && !provider.introspection.disabled).map(|(id, _)| id).collect::<Vec<_>>(),
+                },
+                "telemetry": {
+                    "disabled": config.telemetry.disabled,
+                    "database_path": &config.telemetry.database_path,
+                },
+                "logs": {
+                    "file": log_file_path().map(|path| path.display().to_string()),
+                },
+                "judge": judge.as_ref().map(|judge| serde_json::json!({
+                    "model": judge.model.to_string(),
+                    "provider": judge.provider.as_ref().map(ToString::to_string),
+                })),
+            }))?
+        );
+        return Ok(());
+    }
     println!(
         "config ok: {} providers, {} models, {} warnings",
         config.providers.len(),
         config.models.len(),
         warnings.len()
     );
+    println!(
+        "introspection: refresh_on_startup={}, cache_path={}",
+        config.router.metadata.refresh_on_startup,
+        config
+            .router
+            .metadata
+            .cache_path
+            .as_deref()
+            .unwrap_or("<disabled>")
+    );
+    println!(
+        "telemetry: backend={}, database_path={}",
+        if config.telemetry.disabled {
+            "memory"
+        } else {
+            "sqlite"
+        },
+        config
+            .telemetry
+            .database_path
+            .as_deref()
+            .unwrap_or("<memory>")
+    );
+    if let Some(judge) = &judge {
+        println!("judge: default/explicit model {}", judge.model);
+    } else {
+        println!("judge: disabled or unavailable");
+    }
+    if let Some(path) = log_file_path() {
+        println!("logs: {}", path.display());
+    }
     for warning in &warnings {
         eprintln!("warning: {warning}");
     }
@@ -953,13 +1078,14 @@ async fn explain_route(
     objective: Option<&str>,
     force_judge: bool,
 ) -> Result<()> {
-    let judge_config = llm_judge_config(config);
+    let models = routeable_models(config);
+    let judge_config = llm_judge_config_or_default(config, &models);
     let objective = objective.map_or_else(
         || RoutingObjective::from_name(&config.router.default_objective),
         RoutingObjective::from_name,
     );
     let router = Router::new_with_rules(
-        routeable_models(config),
+        models,
         objective,
         scoring_weights(config),
         routing_rules(config),
@@ -1480,6 +1606,9 @@ enum Command {
         /// Path to the brouter TOML config.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Emit machine-readable JSON diagnostics.
+        #[arg(long)]
+        json: bool,
     },
     /// Explains how a prompt would be routed.
     Route {
