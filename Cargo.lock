@@ -739,7 +739,9 @@ dependencies = [
 name = "brouter_proxy"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
+ "clap",
  "http 1.4.0",
  "reqwest",
  "tokio",

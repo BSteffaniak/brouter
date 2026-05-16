@@ -4,8 +4,8 @@
 //! LLM backend (brouter, `OpenAI`, etc.) while adding trace IDs and structured logging.
 //!
 //! Configuration via environment variables:
-//! - `PROXY_PORT` - Port to listen on (default: 8081)
-//! - `PROXY_BACKEND` - Backend URL to forward to (e.g., `http://127.0.0.1:8080`)
+//! - `PROXY_PORT` - Port to listen on (default: 8581)
+//! - `PROXY_BACKEND` - Backend URL to forward to (e.g., `http://127.0.0.1:8582`)
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
@@ -15,16 +15,90 @@ use axum::{
     Router, body::Body, extract::State, http::Request as HttpRequest, response::Response,
     routing::any,
 };
+use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::process::Stdio;
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::process::{Child, Command};
+use tokio::sync::oneshot;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use uuid::Uuid;
 
 /// Default port if not specified via `PROXY_PORT`
-const DEFAULT_PORT: u16 = 8081;
+const DEFAULT_PORT: u16 = 8581;
 
 /// Default backend if not specified via `PROXY_BACKEND`
-const DEFAULT_BACKEND: &str = "http://127.0.0.1:8080";
+const DEFAULT_BACKEND: &str = "http://127.0.0.1:8582";
+
+/// Default brouter backend port used by `up`.
+const DEFAULT_BACKEND_PORT: u16 = 8582;
+
+#[derive(Debug, Parser)]
+#[command(name = "brouter-proxy", version)]
+#[command(about = "Local forwarding proxy for brouter-compatible LLM APIs")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<ProxyCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProxyCommand {
+    /// Starts only the forwarding proxy.
+    Serve {
+        /// Port for the proxy to listen on.
+        #[arg(long, short = 'p')]
+        port: Option<u16>,
+        /// Backend URL to forward requests to.
+        #[arg(long)]
+        backend: Option<String>,
+    },
+    /// Builds and starts brouter plus the proxy in one multiplexed process.
+    Up {
+        /// Path to the brouter TOML config passed to the backend.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Port for the brouter backend to listen on.
+        #[arg(long, default_value_t = DEFAULT_BACKEND_PORT)]
+        backend_port: u16,
+        /// Port for the proxy to listen on.
+        #[arg(long, default_value_t = DEFAULT_PORT)]
+        proxy_port: u16,
+        /// Skip the initial backend binary build step.
+        #[arg(long)]
+        no_build: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct ProxyOptions {
+    port: u16,
+    backend_url: String,
+}
+
+impl ProxyOptions {
+    fn from_env() -> Self {
+        let port = std::env::var("PROXY_PORT")
+            .unwrap_or_else(|_| DEFAULT_PORT.to_string())
+            .parse()
+            .unwrap_or(DEFAULT_PORT);
+        let backend_url =
+            std::env::var("PROXY_BACKEND").unwrap_or_else(|_| DEFAULT_BACKEND.to_string());
+        Self { port, backend_url }
+    }
+
+    fn with_overrides(port: Option<u16>, backend_url: Option<String>) -> Self {
+        let mut options = Self::from_env();
+        if let Some(port) = port {
+            options.port = port;
+        }
+        if let Some(backend_url) = backend_url {
+            options.backend_url = backend_url;
+        }
+        options
+    }
+}
 
 #[derive(Clone)]
 struct ProxyState {
@@ -33,10 +107,7 @@ struct ProxyState {
 }
 
 impl ProxyState {
-    fn new() -> Self {
-        let backend_url =
-            std::env::var("PROXY_BACKEND").unwrap_or_else(|_| DEFAULT_BACKEND.to_string());
-
+    fn new(backend_url: String) -> Self {
         info!(backend_url = %backend_url, "proxy configuration");
 
         Self {
@@ -205,25 +276,14 @@ async fn proxy_handler(State(state): State<ProxyState>, request: HttpRequest<Bod
     }
 }
 
-#[tokio::main]
-async fn main() {
-    // Initialize tracing
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-
-    tracing_subscriber::registry()
-        .with(fmt::layer().with_target(true).with_thread_ids(true))
-        .with(filter)
-        .init();
-
-    let state = ProxyState::new();
-
-    let port: u16 = std::env::var("PROXY_PORT")
-        .unwrap_or_else(|_| DEFAULT_PORT.to_string())
-        .parse()
-        .unwrap_or(DEFAULT_PORT);
+async fn run_proxy(
+    options: ProxyOptions,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    let state = ProxyState::new(options.backend_url);
 
     info!(
-        port = port,
+        port = options.port,
         backend = %state.backend_url,
         "starting brouter-proxy"
     );
@@ -232,10 +292,166 @@ async fn main() {
         .route("/v1/{*path}", any(proxy_handler))
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], options.port));
 
     info!(addr = %addr, "brouter-proxy listening");
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
+    Ok(())
+}
+
+async fn run_up(
+    config: Option<PathBuf>,
+    backend_port: u16,
+    proxy_port: u16,
+    no_build: bool,
+) -> anyhow::Result<()> {
+    if !no_build {
+        build_backend().await?;
+    }
+
+    let mut backend = spawn_backend(config, backend_port, no_build)?;
+    if let Some(stdout) = backend.stdout.take() {
+        spawn_output_task(stdout, "backend stdout");
+    }
+    if let Some(stderr) = backend.stderr.take() {
+        spawn_output_task(stderr, "backend stderr");
+    }
+
+    let backend_task = tokio::spawn(async move { backend.wait().await });
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let proxy_options = ProxyOptions {
+        port: proxy_port,
+        backend_url: format!("http://127.0.0.1:{backend_port}"),
+    };
+
+    info!(
+        backend_port = backend_port,
+        proxy_port = proxy_port,
+        "brouter backend and proxy are starting"
+    );
+
+    tokio::select! {
+        status = backend_task => {
+            let _ = shutdown_tx.send(());
+            let status = status??;
+            if status.success() {
+                info!(%status, "brouter backend exited");
+                Ok(())
+            } else {
+                anyhow::bail!("brouter backend exited with {status}");
+            }
+        }
+        result = run_proxy(proxy_options, async move {
+            let _ = shutdown_rx.await;
+        }) => result,
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            info!("received shutdown signal; stopping brouter backend and proxy");
+            let _ = shutdown_tx.send(());
+            Ok(())
+        }
+    }
+}
+
+async fn build_backend() -> anyhow::Result<()> {
+    info!("building brouter backend");
+    let status = Command::new("cargo")
+        .args(["build", "--package", "brouter_cli", "--bin", "brouter"])
+        .status()
+        .await?;
+    if !status.success() {
+        anyhow::bail!("backend build failed with {status}");
+    }
+    Ok(())
+}
+
+fn spawn_backend(
+    config: Option<PathBuf>,
+    backend_port: u16,
+    use_cargo_run: bool,
+) -> anyhow::Result<Child> {
+    let mut command = if use_cargo_run {
+        let mut command = Command::new("cargo");
+        command.args(["run", "--package", "brouter_cli", "--bin", "brouter", "--"]);
+        command
+    } else {
+        Command::new(resolve_backend_binary())
+    };
+
+    command.args(["serve", "--port", &backend_port.to_string()]);
+    if let Some(config) = config {
+        command.arg("--config").arg(config);
+    }
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(Into::into)
+}
+
+fn resolve_backend_binary() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join("brouter")))
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| PathBuf::from("brouter"))
+}
+
+fn spawn_output_task<R>(reader: R, label: &'static str)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => info!(target: "brouter_proxy::child", %label, "{line}"),
+                Ok(None) => break,
+                Err(error) => {
+                    warn!(%label, %error, "failed to read child process output");
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    tracing_subscriber::registry()
+        .with(fmt::layer().with_target(true).with_thread_ids(true))
+        .with(filter)
+        .init();
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    init_tracing();
+    let cli = Cli::parse();
+    match cli.command.unwrap_or(ProxyCommand::Serve {
+        port: None,
+        backend: None,
+    }) {
+        ProxyCommand::Serve { port, backend } => {
+            let options = ProxyOptions::with_overrides(port, backend);
+            run_proxy(options, async {
+                if let Err(error) = tokio::signal::ctrl_c().await {
+                    warn!(%error, "failed to wait for shutdown signal");
+                }
+            })
+            .await
+        }
+        ProxyCommand::Up {
+            config,
+            backend_port,
+            proxy_port,
+            no_build,
+        } => run_up(config, backend_port, proxy_port, no_build).await,
+    }
 }
