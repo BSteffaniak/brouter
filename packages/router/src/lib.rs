@@ -311,6 +311,14 @@ impl Router {
                 objective = rule_objective;
             }
         }
+        features
+            .preferred_attributes
+            .entry("latency_class".to_string())
+            .or_insert_with(|| "standard".to_string());
+        features
+            .preferred_attributes
+            .entry("reasoning_effort".to_string())
+            .or_insert_with(|| reasoning_attribute(features.reasoning).to_string());
         objective
     }
 }
@@ -422,6 +430,14 @@ fn detect_intent(prompt: &str) -> PromptIntent {
         PromptIntent::Agentic
     } else {
         PromptIntent::General
+    }
+}
+
+const fn reasoning_attribute(reasoning: ReasoningLevel) -> &'static str {
+    match reasoning {
+        ReasoningLevel::Low => "low",
+        ReasoningLevel::Medium => "medium",
+        ReasoningLevel::High => "high",
     }
 }
 

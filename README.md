@@ -27,12 +27,13 @@ patterns used by the sibling projects in this checkout.
 - `GET /v1/brouter/usage`
 - `GET /v1/brouter/usage/summary`
 - `GET /v1/brouter/introspection`
+- `POST /v1/brouter/introspection/refresh`
 - `GET /v1/brouter/status`
 
 `/v1/chat/completions` supports non-streaming and streaming OpenAI-compatible
 upstreams, provider timeouts, fallback attempts for retryable failures,
 provider cooldowns after repeated failures, Anthropic non-streaming and streaming
-conversion, OpenAI-compatible embeddings forwarding, configurable scoring/routing rules, named routing profiles with allow/deny policy, context-window safety for session-aware model switching, cached live provider/account introspection, quota-aware dynamic policy, a default opt-out LLM judge for close routing decisions, generic model/provider route attributes, and SQLite telemetry via
+conversion, OpenAI-compatible embeddings forwarding, configurable scoring/routing rules, named routing profiles with allow/deny policy, context-window safety for session-aware model switching, cached live provider/account introspection with periodic and manual refresh, quota-aware dynamic policy, virtual service-tier/reasoning route variants for supported providers, a default opt-out LLM judge for close routing decisions, generic model/provider route attributes, and SQLite telemetry via
 `switchy_database`. Successful chat responses include brouter headers such as
 `x-brouter-selected-model`, `x-brouter-provider`, `x-brouter-service-tier`,
 `x-brouter-reasoning-effort`, `x-brouter-resource-pools`,

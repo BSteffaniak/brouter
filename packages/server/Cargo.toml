@@ -28,7 +28,7 @@ futures-util                 = { workspace = true }
 serde                        = { workspace = true, features = ["derive", "std"] }
 serde_json                   = { workspace = true, features = ["std"] }
 thiserror                    = { workspace = true }
-tokio                        = { workspace = true, features = ["net"] }
+tokio                        = { workspace = true, features = ["net", "rt", "time"] }
 tower-http                   = { workspace = true, features = ["cors"] }
 tracing                      = { workspace = true }
 

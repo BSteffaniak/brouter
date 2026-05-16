@@ -1301,6 +1301,7 @@ mod tests {
             auth_vault_path: None,
             introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
             resource_pools: Vec::new(),
+            virtual_variants: brouter_config_models::VirtualVariantsConfig::default(),
             attribute_mappings: BTreeMap::new(),
             omit_request_fields: Vec::new(),
         };
@@ -1342,6 +1343,7 @@ mod tests {
             auth_vault_path: None,
             introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
             resource_pools: Vec::new(),
+            virtual_variants: brouter_config_models::VirtualVariantsConfig::default(),
             attribute_mappings: BTreeMap::new(),
             omit_request_fields: Vec::new(),
         };
@@ -1669,6 +1671,7 @@ mod tests {
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
+                virtual_variants: brouter_config_models::VirtualVariantsConfig::default(),
                 attribute_mappings: BTreeMap::new(),
                 omit_request_fields: Vec::new(),
             },
@@ -1713,6 +1716,7 @@ mod tests {
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
+                virtual_variants: brouter_config_models::VirtualVariantsConfig::default(),
                 attribute_mappings: BTreeMap::new(),
                 omit_request_fields: Vec::new(),
             },

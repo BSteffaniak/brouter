@@ -260,6 +260,7 @@ fn insert_auto_provider(config: &mut BrouterConfig, provider_id: &str, preset: &
         auth_vault_path: None,
         introspection: ProviderIntrospectionConfig::default(),
         resource_pools: Vec::new(),
+        virtual_variants: brouter_config_models::VirtualVariantsConfig::default(),
         attribute_mappings: std::collections::BTreeMap::new(),
         omit_request_fields: Vec::new(),
     };
@@ -307,6 +308,14 @@ fn apply_default_provider_introspection(config: &mut BrouterConfig) {
                 provider.introspection.enabled = true;
                 provider.introspection.account = true;
                 provider.introspection.limits = true;
+                if provider.virtual_variants.service_tiers.is_empty() {
+                    provider.virtual_variants.service_tiers =
+                        vec!["standard".to_string(), "priority".to_string()];
+                }
+                if provider.virtual_variants.reasoning_efforts.is_empty() {
+                    provider.virtual_variants.reasoning_efforts =
+                        vec!["low".to_string(), "medium".to_string(), "high".to_string()];
+                }
             }
             ProviderKind::OpenAiCompatible => {
                 if provider.base_url.is_some() {
@@ -1233,7 +1242,90 @@ pub fn routeable_models_with_introspection(
     if config.router.metadata.allow_fallback_catalog {
         append_fallback_catalog_models(config, &catalog, &mut models);
     }
+    append_virtual_variants(config, &mut models);
     models
+}
+
+fn append_virtual_variants(config: &BrouterConfig, models: &mut Vec<RouteableModel>) {
+    let base_models = models.clone();
+    for model in base_models {
+        let Some(provider) = config.providers.get(model.provider.as_str()) else {
+            continue;
+        };
+        let mut service_tiers = provider.virtual_variants.service_tiers.clone();
+        if model.attributes.contains_key("latency_class")
+            || model.attributes.contains_key("service_tier")
+        {
+            service_tiers.clear();
+        }
+        let reasoning_efforts = provider.virtual_variants.reasoning_efforts.clone();
+        if service_tiers.is_empty() && reasoning_efforts.is_empty() {
+            continue;
+        }
+        let service_values = if service_tiers.is_empty() {
+            vec![None]
+        } else {
+            service_tiers.into_iter().map(Some).collect()
+        };
+        let reasoning_values = if reasoning_efforts.is_empty() {
+            vec![None]
+        } else {
+            reasoning_efforts.into_iter().map(Some).collect()
+        };
+        for service_tier in &service_values {
+            for reasoning_effort in &reasoning_values {
+                if service_tier.is_none() && reasoning_effort.is_none() {
+                    continue;
+                }
+                let mut variant = model.clone();
+                let mut suffix = String::new();
+                if let Some(service_tier) = service_tier {
+                    variant
+                        .attributes
+                        .insert("service_tier".to_string(), service_tier.clone());
+                    variant
+                        .attributes
+                        .insert("latency_class".to_string(), service_tier.clone());
+                    append_badge(&mut variant.display_badges, service_tier);
+                    suffix.push_str("__service_tier_");
+                    suffix.push_str(&sanitize_variant_value(service_tier));
+                }
+                if let Some(reasoning_effort) = reasoning_effort {
+                    variant
+                        .attributes
+                        .insert("reasoning_effort".to_string(), reasoning_effort.clone());
+                    append_badge(&mut variant.display_badges, reasoning_effort);
+                    suffix.push_str("__reasoning_effort_");
+                    suffix.push_str(&sanitize_variant_value(reasoning_effort));
+                }
+                variant.id = ModelId::new(format!("{}{suffix}", model.id));
+                if !models.iter().any(|existing| existing.id == variant.id) {
+                    models.push(variant);
+                }
+            }
+        }
+    }
+}
+
+fn append_badge(badges: &mut Vec<String>, badge: &str) {
+    if !badges.iter().any(|existing| existing == badge) {
+        badges.push(badge.to_string());
+    }
+}
+
+fn sanitize_variant_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
 }
 
 fn append_fallback_catalog_models(
@@ -1794,6 +1886,7 @@ mod tests {
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
+                virtual_variants: brouter_config_models::VirtualVariantsConfig::default(),
                 attribute_mappings: std::collections::BTreeMap::new(),
                 omit_request_fields: Vec::new(),
             },
@@ -1819,6 +1912,70 @@ mod tests {
     }
 
     #[test]
+    fn virtual_variants_expand_provider_controls() {
+        let mut config = BrouterConfig::default();
+        config.providers.insert(
+            "codex".to_string(),
+            ProviderConfig {
+                kind: ProviderKind::OpenaiCodex,
+                preset: None,
+                base_url: None,
+                api_key_env: None,
+                timeout_ms: None,
+                max_estimated_cost: None,
+                auth_backend: None,
+                auth_profile: None,
+                auth_vault_path: None,
+                introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
+                resource_pools: Vec::new(),
+                virtual_variants: brouter_config_models::VirtualVariantsConfig {
+                    service_tiers: vec!["priority".to_string()],
+                    reasoning_efforts: vec!["high".to_string()],
+                },
+                attribute_mappings: std::collections::BTreeMap::new(),
+                omit_request_fields: Vec::new(),
+            },
+        );
+        config.models.insert(
+            "strong".to_string(),
+            ModelConfig {
+                provider: "codex".to_string(),
+                model: "gpt-5.5".to_string(),
+                context_window: Some(1_000_000),
+                input_cost_per_million: 0.0,
+                output_cost_per_million: 0.0,
+                quality: Some(98),
+                capabilities: vec!["chat".to_string(), "reasoning".to_string()],
+                attributes: std::collections::BTreeMap::new(),
+                display_badges: Vec::new(),
+                max_estimated_cost: None,
+                metadata_overrides: None,
+            },
+        );
+
+        let models = routeable_models(&config);
+        let variant = models
+            .iter()
+            .find(|model| {
+                model.id.as_str() == "strong__service_tier_priority__reasoning_effort_high"
+            })
+            .expect("virtual variant should be generated");
+
+        assert_eq!(variant.upstream_model, "gpt-5.5");
+        assert_eq!(
+            variant.attributes.get("latency_class").map(String::as_str),
+            Some("priority")
+        );
+        assert_eq!(
+            variant
+                .attributes
+                .get("reasoning_effort")
+                .map(String::as_str),
+            Some("high")
+        );
+    }
+
+    #[test]
     fn fallback_catalog_fills_missing_model_metadata() {
         let mut config = BrouterConfig::default();
         config.providers.insert(
@@ -1835,6 +1992,7 @@ mod tests {
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
+                virtual_variants: brouter_config_models::VirtualVariantsConfig::default(),
                 attribute_mappings: std::collections::BTreeMap::new(),
                 omit_request_fields: Vec::new(),
             },
@@ -1883,6 +2041,7 @@ mod tests {
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
+                virtual_variants: brouter_config_models::VirtualVariantsConfig::default(),
                 attribute_mappings: std::collections::BTreeMap::new(),
                 omit_request_fields: Vec::new(),
             },
@@ -1940,6 +2099,7 @@ mod tests {
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
+                virtual_variants: brouter_config_models::VirtualVariantsConfig::default(),
                 attribute_mappings: std::collections::BTreeMap::new(),
                 omit_request_fields: Vec::new(),
             },

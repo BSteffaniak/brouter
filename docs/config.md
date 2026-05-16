@@ -30,10 +30,12 @@ Profiles can be selected with `model = "profile:<name>"`, `x-brouter-profile`, o
 
 - `strict` boolean, default `false`; when enabled, models with missing required metadata can be excluded by future strict checks
 - `max_age_ms` integer, default `86400000`
-- `refresh_on_startup` boolean, default `false`; fetch enabled provider introspection before building routeable models
-- `allow_stale_on_provider_error` boolean, default `false`
+- `refresh_on_startup` boolean, default `true`; fetch enabled provider introspection before building routeable models
+- `refresh_interval_ms` integer, default `300000`; periodically refresh live/cache introspection while the server is running. Set `0` to disable background refresh.
+- `refresh_before_expensive_route` boolean, default `true`; refresh stale runtime metadata before routing when data is older than `max_age_ms`.
+- `allow_stale_on_provider_error` boolean, default `true`; reuse cached snapshots when a live refresh fails
 - `allow_fallback_catalog` boolean, default `true`
-- `cache_path` optional path reserved for persisted snapshots
+- `cache_path` optional path; defaults to `~/.local/state/brouter/introspection.json` when introspection is enabled
 
 ## `[router.dynamic_policy]`
 
@@ -116,7 +118,8 @@ All fields are optional floats:
 
 ## `[telemetry]`
 
-- `database_path` optional path; omitted uses in-memory telemetry
+- `disabled` boolean, default `false`
+- `database_path` optional path; defaults to `~/.local/state/brouter/brouter.db` unless telemetry is disabled
 
 ## Provider presets and zero-config startup
 
@@ -148,6 +151,7 @@ Built-in profiles available without config: `balanced`, `cheap`, `fast`, `strong
 - `auth_profile` optional string; sshenv profile containing ChatGPT/Codex tokens
 - `auth_vault_path` optional string; sshenv vault path. If omitted, brouter uses `$BROUTER_AUTH_VAULT` or `~/.local/state/brouter/auth/vault`.
 - `introspection` optional live introspection settings
+- `virtual_variants` optional provider-level request-control variants. `service_tiers` and `reasoning_efforts` generate virtual routeable models that share the same upstream model but carry different `latency_class`/`service_tier`/`reasoning_effort` attributes. OpenAI Codex providers default to `service_tiers = ["standard", "priority"]` and `reasoning_efforts = ["low", "medium", "high"]`.
 - `attribute_mappings` optional nested map from attribute name/value to provider request edits. Each mapping can add top-level `request_fields` or remove top-level `omit_request_fields`.
 
 Provider introspection is generic: adapters translate provider API responses into provider-neutral catalog/account snapshots. Current adapters fetch OpenAI-compatible `/models` metadata, including OpenRouter-style `context_length`, `pricing`, and `supported_parameters` when present, OpenRouter-compatible `/auth/key` credit/account data, and Anthropic `/models` as a partial catalog. Discovered catalog models become routeable automatically. Missing fields continue through the generic resolver to user overrides and the fallback catalog.
@@ -159,7 +163,7 @@ catalog = true
 account = false
 ```
 
-Snapshots can be inspected with `GET /v1/brouter/introspection`.
+Snapshots can be inspected with `GET /v1/brouter/introspection` and refreshed without restarting with `POST /v1/brouter/introspection/refresh`.
 
 Configured resource pools can provide totals/refill timestamps when a live API only exposes usage, or can define entirely user-managed budgets:
 

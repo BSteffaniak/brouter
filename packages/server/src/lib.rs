@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use axum::body::Body;
@@ -74,8 +74,19 @@ pub enum ServerError {
 }
 
 #[derive(Debug, Clone)]
-struct AppState {
+struct RuntimeRoutingState {
     router: Router,
+    introspection_snapshots: Vec<IntrospectionSnapshot>,
+    dynamic_policy_effects: Vec<DynamicPolicyEffect>,
+    llm_judge: Option<JudgeConfig>,
+    last_refresh_ms: u64,
+    last_refresh_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AppState {
+    config: Arc<BrouterConfig>,
+    runtime: Arc<RwLock<RuntimeRoutingState>>,
     providers: ProviderRegistry,
     provider_client: ProviderClient,
     telemetry: TelemetryStore,
@@ -90,9 +101,6 @@ struct AppState {
     groups: BTreeMap<String, Vec<ModelId>>,
     default_profile: Option<String>,
     session_context_tokens: Arc<Mutex<BTreeMap<String, u32>>>,
-    introspection_snapshots: Vec<IntrospectionSnapshot>,
-    dynamic_policy_effects: Vec<DynamicPolicyEffect>,
-    llm_judge: Option<JudgeConfig>,
     telemetry_database_path: Option<String>,
     introspection_cache_path: Option<String>,
 }
@@ -158,29 +166,10 @@ fn build_app_with_api_key_and_introspection(
     api_key: Option<String>,
     introspection_snapshots: Vec<IntrospectionSnapshot>,
 ) -> AxumRouter {
-    let objective = RoutingObjective::from_name(&config.router.default_objective);
-    let dynamic_policy_effects = dynamic_policy_effects(
-        introspection_snapshots.clone(),
-        DynamicPolicyConfig {
-            low_remaining_ratio: config.router.dynamic_policy.low_remaining_ratio,
-            critical_remaining_ratio: config.router.dynamic_policy.critical_remaining_ratio,
-            low_remaining_penalty: config.router.dynamic_policy.low_remaining_penalty,
-            exclude_when_exhausted: config.router.dynamic_policy.exclude_when_exhausted,
-        },
-        &config.router.dynamic_policy.disable_attributes_when_low,
-    );
-    let routeable_models = routeable_models_with_introspection(config, &introspection_snapshots);
-    let llm_judge = llm_judge_config_or_default(config, &routeable_models);
-    let router = Router::new_with_policy(
-        routeable_models,
-        objective,
-        scoring_weights(config),
-        routing_rules(config),
-        routing_profiles(config),
-        context_policy(config),
-    );
+    let runtime = build_runtime_routing_state(config, introspection_snapshots, None);
     let state = AppState {
-        router,
+        config: Arc::new(config.clone()),
+        runtime: Arc::new(RwLock::new(runtime)),
         providers: ProviderRegistry::from_config(config),
         provider_client: ProviderClient::new(),
         telemetry,
@@ -221,12 +210,10 @@ fn build_app_with_api_key_and_introspection(
             .collect(),
         default_profile: config.router.default_profile.clone(),
         session_context_tokens: Arc::new(Mutex::new(BTreeMap::new())),
-        introspection_snapshots,
-        dynamic_policy_effects,
-        llm_judge,
         telemetry_database_path: config.telemetry.database_path.clone(),
         introspection_cache_path: config.router.metadata.cache_path.clone(),
     };
+    spawn_periodic_refresh(&state);
 
     let app = AxumRouter::new()
         .route("/health", get(health))
@@ -238,10 +225,76 @@ fn build_app_with_api_key_and_introspection(
         .route("/v1/brouter/usage", get(usage))
         .route("/v1/brouter/usage/summary", get(usage_summary))
         .route("/v1/brouter/introspection", get(introspection))
+        .route(
+            "/v1/brouter/introspection/refresh",
+            post(refresh_introspection),
+        )
         .route("/v1/brouter/status", get(status))
         .layer(DefaultBodyLimit::max(config.server.max_request_body_bytes))
         .with_state(state);
     apply_cors(app, &config.server.cors_allowed_origins)
+}
+
+fn build_runtime_routing_state(
+    config: &BrouterConfig,
+    introspection_snapshots: Vec<IntrospectionSnapshot>,
+    last_refresh_error: Option<String>,
+) -> RuntimeRoutingState {
+    let objective = RoutingObjective::from_name(&config.router.default_objective);
+    let dynamic_policy_effects = dynamic_policy_effects(
+        introspection_snapshots.clone(),
+        DynamicPolicyConfig {
+            low_remaining_ratio: config.router.dynamic_policy.low_remaining_ratio,
+            critical_remaining_ratio: config.router.dynamic_policy.critical_remaining_ratio,
+            low_remaining_penalty: config.router.dynamic_policy.low_remaining_penalty,
+            exclude_when_exhausted: config.router.dynamic_policy.exclude_when_exhausted,
+        },
+        &config.router.dynamic_policy.disable_attributes_when_low,
+    );
+    let routeable_models = routeable_models_with_introspection(config, &introspection_snapshots);
+    let llm_judge = llm_judge_config_or_default(config, &routeable_models);
+    let router = Router::new_with_policy(
+        routeable_models,
+        objective,
+        scoring_weights(config),
+        routing_rules(config),
+        routing_profiles(config),
+        context_policy(config),
+    );
+    RuntimeRoutingState {
+        router,
+        introspection_snapshots,
+        dynamic_policy_effects,
+        llm_judge,
+        last_refresh_ms: now_millis(),
+        last_refresh_error,
+    }
+}
+
+fn runtime_snapshot(state: &AppState) -> RuntimeRoutingState {
+    state
+        .runtime
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+fn spawn_periodic_refresh(state: &AppState) {
+    let interval_ms = state.config.router.metadata.refresh_interval_ms;
+    if interval_ms == 0 {
+        return;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if let Err(error) = refresh_runtime_state(&state, true).await {
+                tracing::warn!(%error, "background introspection refresh failed");
+            }
+        }
+    });
 }
 
 fn apply_cors(app: AxumRouter, allowed_origins: &[String]) -> AxumRouter {
@@ -268,9 +321,16 @@ fn apply_cors(app: AxumRouter, allowed_origins: &[String]) -> AxumRouter {
 }
 
 async fn introspection_snapshots(config: &BrouterConfig) -> Vec<IntrospectionSnapshot> {
+    introspection_snapshots_with_mode(config, false).await
+}
+
+async fn introspection_snapshots_with_mode(
+    config: &BrouterConfig,
+    force_live: bool,
+) -> Vec<IntrospectionSnapshot> {
     let cache_path = metadata_cache_path(config);
     let cache = cache_path.as_deref().and_then(load_introspection_cache);
-    let snapshots = refresh_introspection_snapshots(config, cache.as_ref()).await;
+    let snapshots = refresh_introspection_snapshots(config, cache.as_ref(), force_live).await;
     if let (Some(path), Some(mut updated_cache)) =
         (cache_path.as_deref(), cache_from_snapshots(&snapshots))
     {
@@ -291,9 +351,23 @@ async fn introspection_snapshots(config: &BrouterConfig) -> Vec<IntrospectionSna
     merge_configured_resource_pools(config, snapshots)
 }
 
+async fn refresh_runtime_state(
+    state: &AppState,
+    force_live: bool,
+) -> Result<RuntimeRoutingState, String> {
+    let snapshots = introspection_snapshots_with_mode(&state.config, force_live).await;
+    let runtime = build_runtime_routing_state(&state.config, snapshots, None);
+    *state
+        .runtime
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = runtime.clone();
+    Ok(runtime)
+}
+
 async fn refresh_introspection_snapshots(
     config: &BrouterConfig,
     cache: Option<&IntrospectionCache>,
+    force_live: bool,
 ) -> Vec<IntrospectionSnapshot> {
     let registry = ProviderRegistry::from_config(config);
     let client = ProviderClient::new();
@@ -305,7 +379,7 @@ async fn refresh_introspection_snapshots(
         if provider.introspection.disabled || !provider.introspection.enabled {
             continue;
         }
-        if !config.router.metadata.refresh_on_startup {
+        if !force_live && !config.router.metadata.refresh_on_startup {
             if let Some(snapshot) = fresh_cached_snapshot(cache, &provider_id, config) {
                 snapshots.push(snapshot);
             }
@@ -602,8 +676,9 @@ async fn models(
 ) -> Result<Json<ModelListResponse>, (StatusCode, Json<ErrorResponse>)> {
     authorize(&state, &headers)?;
     let mut models = vec![ModelObject::new("brouter/auto", "brouter")];
+    let runtime = runtime_snapshot(&state);
     models.extend(
-        state
+        runtime
             .router
             .models()
             .iter()
@@ -641,7 +716,23 @@ async fn introspection(
     headers: HeaderMap,
 ) -> Result<Json<Vec<IntrospectionSnapshot>>, (StatusCode, Json<ErrorResponse>)> {
     authorize(&state, &headers)?;
-    Ok(Json(state.introspection_snapshots))
+    Ok(Json(runtime_snapshot(&state).introspection_snapshots))
+}
+
+async fn refresh_introspection(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    authorize(&state, &headers)?;
+    let runtime = refresh_runtime_state(&state, true)
+        .await
+        .map_err(|error| error_response(StatusCode::BAD_GATEWAY, error, "introspection_error"))?;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "refreshed_at_ms": runtime.last_refresh_ms,
+        "snapshot_count": runtime.introspection_snapshots.len(),
+        "models": runtime.router.models().len(),
+    })))
 }
 
 async fn status(
@@ -649,14 +740,17 @@ async fn status(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     authorize(&state, &headers)?;
+    let runtime = runtime_snapshot(&state);
     Ok(Json(serde_json::json!({
         "ok": true,
         "providers": state.providers.provider_ids().iter().map(ToString::to_string).collect::<Vec<_>>(),
-        "models": state.router.models().len(),
+        "models": runtime.router.models().len(),
         "introspection": {
-            "snapshot_count": state.introspection_snapshots.len(),
+            "snapshot_count": runtime.introspection_snapshots.len(),
             "cache_path": state.introspection_cache_path,
-            "providers": state.introspection_snapshots.iter().map(|snapshot| serde_json::json!({
+            "last_refresh_ms": runtime.last_refresh_ms,
+            "last_refresh_error": runtime.last_refresh_error,
+            "providers": runtime.introspection_snapshots.iter().map(|snapshot| serde_json::json!({
                 "provider": snapshot.provider.to_string(),
                 "source": &snapshot.source,
                 "account_pools": snapshot.account.as_ref().map_or(0, |account| account.pools.len()),
@@ -668,7 +762,7 @@ async fn status(
             "backend": state.telemetry.backend_kind(),
             "database_path": state.telemetry_database_path,
         },
-        "judge": state.llm_judge.as_ref().map(|judge| serde_json::json!({
+        "judge": runtime.llm_judge.as_ref().map(|judge| serde_json::json!({
             "model": judge.model.to_string(),
             "provider": judge.provider.as_ref().map(ToString::to_string),
             "score_gap_threshold": judge.trigger.score_gap_threshold,
@@ -805,8 +899,9 @@ fn embedding_model(
     state: &AppState,
     request: &EmbeddingsRequest,
 ) -> Result<RouteableModel, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = runtime_snapshot(state);
     if matches!(request.model.as_str(), "brouter/auto" | "auto") {
-        return state
+        return runtime
             .router
             .models()
             .iter()
@@ -820,7 +915,7 @@ fn embedding_model(
                 )
             });
     }
-    let model = state
+    let model = runtime
         .router
         .models()
         .iter()
@@ -910,6 +1005,7 @@ async fn forward_streaming_with_fallbacks(
                     mark_provider_success(state, &model.provider);
                 } else if should_try_fallback(status) {
                     mark_provider_failure(state, &model.provider);
+                    refresh_after_quota_error(state, status);
                 }
 
                 if status.is_success() || !should_try_fallback(status) {
@@ -959,6 +1055,7 @@ async fn forward_streaming_with_fallbacks(
     .into_response()
 }
 
+#[allow(clippy::too_many_lines)]
 async fn forward_with_fallbacks(
     state: &AppState,
     headers: &HeaderMap,
@@ -1023,6 +1120,7 @@ async fn forward_with_fallbacks(
                     mark_provider_success(state, &model.provider);
                 } else if should_try_fallback(status) {
                     mark_provider_failure(state, &model.provider);
+                    refresh_after_quota_error(state, status);
                 }
 
                 if status.is_success() || !should_try_fallback(status) {
@@ -1075,23 +1173,29 @@ fn model_by_id(
     state: &AppState,
     model_id: &ModelId,
 ) -> Result<RouteableModel, (StatusCode, Json<ErrorResponse>)> {
-    state
-        .router
-        .models()
-        .iter()
-        .find(|model| &model.id == model_id)
-        .cloned()
-        .ok_or_else(|| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "selected model is no longer configured",
-                "internal_error",
-            )
-        })
+    route_model(state, model_id).ok_or_else(|| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "selected model is no longer configured",
+            "internal_error",
+        )
+    })
 }
 
 fn should_try_fallback(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+fn refresh_after_quota_error(state: &AppState, status: StatusCode) {
+    if status != StatusCode::TOO_MANY_REQUESTS {
+        return;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        if let Err(error) = refresh_runtime_state(&state, true).await {
+            tracing::warn!(%error, "quota-triggered introspection refresh failed");
+        }
+    });
 }
 
 async fn within_budget(
@@ -1297,12 +1401,14 @@ async fn route_request(
         None => false,
     };
     let is_first_message = !has_session;
+    maybe_refresh_stale_runtime(state).await;
+    let runtime = runtime_snapshot(state);
     let allowed_models = group_models(state, &request.model);
     let session_context_tokens = session_id
         .as_deref()
         .and_then(|id| session_context_tokens(state, id));
     let profile = requested_profile(state, headers, request);
-    let decision = state
+    let decision = runtime
         .router
         .route_chat_with_options(
             request,
@@ -1311,7 +1417,7 @@ async fn route_request(
                 allowed_models,
                 profile,
                 session_context_tokens,
-                dynamic_policy_effects: state.dynamic_policy_effects.clone(),
+                dynamic_policy_effects: runtime.dynamic_policy_effects.clone(),
             },
         )
         .map_err(|error| router_error_response(&error))?;
@@ -1330,6 +1436,20 @@ async fn route_request(
     Ok(decision)
 }
 
+async fn maybe_refresh_stale_runtime(state: &AppState) {
+    if !state.config.router.metadata.refresh_before_expensive_route {
+        return;
+    }
+    let max_age = state.config.router.metadata.max_age_ms;
+    let age = now_millis().saturating_sub(runtime_snapshot(state).last_refresh_ms);
+    if age <= max_age {
+        return;
+    }
+    if let Err(error) = refresh_runtime_state(state, true).await {
+        tracing::warn!(%error, "on-demand introspection refresh failed");
+    }
+}
+
 fn apply_selected_request_controls(
     state: &AppState,
     request: &ChatCompletionRequest,
@@ -1343,30 +1463,37 @@ fn apply_selected_request_controls(
             .clone_from(&reasoning.reasoning_effort);
     }
 
+    let selected_model = route_model(state, &decision.selected_model);
     if controls.reasoning_effort.is_none() {
-        controls.reasoning_effort =
-            request
-                .reasoning_effort
-                .map(reasoning_effort_name)
-                .or_else(|| {
-                    Some(match decision.features.reasoning {
-                        brouter_router_models::ReasoningLevel::Low => "low".to_string(),
-                        brouter_router_models::ReasoningLevel::Medium => "medium".to_string(),
-                        brouter_router_models::ReasoningLevel::High => "high".to_string(),
-                    })
-                });
+        controls.reasoning_effort = request
+            .reasoning_effort
+            .map(reasoning_effort_name)
+            .or_else(|| {
+                selected_model
+                    .as_ref()
+                    .and_then(|model| model.attributes.get("reasoning_effort").cloned())
+            })
+            .or_else(|| {
+                Some(match decision.features.reasoning {
+                    brouter_router_models::ReasoningLevel::Low => "low".to_string(),
+                    brouter_router_models::ReasoningLevel::Medium => "medium".to_string(),
+                    brouter_router_models::ReasoningLevel::High => "high".to_string(),
+                })
+            });
     }
 
-    if controls.service_tier.is_none()
-        && let Some(model) = route_model(state, &decision.selected_model)
-    {
-        controls.service_tier = model.attributes.get("latency_class").cloned();
+    if controls.service_tier.is_none() {
+        controls.service_tier = selected_model.as_ref().and_then(|model| {
+            model
+                .attributes
+                .get("service_tier")
+                .or_else(|| model.attributes.get("latency_class"))
+                .cloned()
+        });
     }
 
     clamp_controls_to_dynamic_policy(state, decision, &mut controls);
-    if let Some(service_tier) = controls.service_tier.clone() {
-        align_selected_model_to_service_tier(state, decision, &service_tier);
-    }
+    align_selected_model_to_controls(state, decision, &controls);
     promote_selected_candidate(decision);
     controls.resource_pools = matching_resource_pool_ids(state, decision, &controls);
     decision.request_controls = controls;
@@ -1395,34 +1522,40 @@ fn promote_selected_candidate(decision: &mut RoutingDecision) {
     }
 }
 
-fn align_selected_model_to_service_tier(
+fn align_selected_model_to_controls(
     state: &AppState,
     decision: &mut RoutingDecision,
-    service_tier: &str,
+    controls: &SelectedRequestControls,
 ) {
-    let Some(current) = route_model(state, &decision.selected_model).cloned() else {
+    let Some(current) = route_model(state, &decision.selected_model) else {
         return;
     };
-    if current
-        .attributes
-        .get("latency_class")
-        .is_some_and(|value| value == service_tier)
-    {
+    if model_matches_controls(&current, controls) {
         return;
     }
-    if let Some(replacement) = state.router.models().iter().find(|model| {
+    let runtime = runtime_snapshot(state);
+    if let Some(replacement) = runtime.router.models().iter().find(|model| {
         model.provider == current.provider
             && model.upstream_model == current.upstream_model
-            && model
-                .attributes
-                .get("latency_class")
-                .is_some_and(|value| value == service_tier)
+            && model_matches_controls(model, controls)
     }) {
         decision.selected_model = replacement.id.clone();
-        decision.reasons.push(format!(
-            "matched judge-selected service tier {service_tier}"
-        ));
+        decision
+            .reasons
+            .push("matched selected request controls".to_string());
     }
+}
+
+fn model_matches_controls(model: &RouteableModel, controls: &SelectedRequestControls) -> bool {
+    controls.service_tier.as_ref().is_none_or(|service_tier| {
+        model.attributes.get("service_tier") == Some(service_tier)
+            || model.attributes.get("latency_class") == Some(service_tier)
+    }) && controls
+        .reasoning_effort
+        .as_ref()
+        .is_none_or(|reasoning_effort| {
+            model.attributes.get("reasoning_effort") == Some(reasoning_effort)
+        })
 }
 
 fn clamp_controls_to_dynamic_policy(
@@ -1433,10 +1566,11 @@ fn clamp_controls_to_dynamic_policy(
     let Some(model) = route_model(state, &decision.selected_model) else {
         return;
     };
-    for effect in &state.dynamic_policy_effects {
+    let runtime = runtime_snapshot(state);
+    for effect in &runtime.dynamic_policy_effects {
         match effect {
             DynamicPolicyEffect::Exclude { selector, .. }
-                if selector_matches_controls(selector, model, controls) =>
+                if selector_matches_controls(selector, &model, controls) =>
             {
                 downgrade_expensive_controls(controls);
             }
@@ -1445,7 +1579,7 @@ fn clamp_controls_to_dynamic_policy(
                 key,
                 value,
                 ..
-            } if selector_matches_controls(selector, model, controls) => {
+            } if selector_matches_controls(selector, &model, controls) => {
                 if key == "latency_class" && controls.service_tier.as_ref() == Some(value) {
                     controls.service_tier = Some("standard".to_string());
                 }
@@ -1475,22 +1609,24 @@ fn matching_resource_pool_ids(
     let Some(model) = route_model(state, &decision.selected_model) else {
         return Vec::new();
     };
-    state
+    let runtime = runtime_snapshot(state);
+    runtime
         .introspection_snapshots
         .iter()
         .filter_map(|snapshot| snapshot.account.as_ref())
         .flat_map(|account| &account.pools)
-        .filter(|pool| resource_selector_matches(pool, model, controls))
+        .filter(|pool| resource_selector_matches(pool, &model, controls))
         .map(|pool| pool.id.clone())
         .collect()
 }
 
-fn route_model<'a>(state: &'a AppState, model_id: &ModelId) -> Option<&'a RouteableModel> {
-    state
+fn route_model(state: &AppState, model_id: &ModelId) -> Option<RouteableModel> {
+    runtime_snapshot(state)
         .router
         .models()
         .iter()
         .find(|model| &model.id == model_id)
+        .cloned()
 }
 
 fn resource_selector_matches(
@@ -1541,11 +1677,12 @@ async fn invoke_llm_judge(
     state: &AppState,
     decision: &RoutingDecision,
 ) -> Result<Option<RoutingDecision>, RouterError> {
-    let Some(judge_config) = state.llm_judge.as_ref() else {
+    let runtime = runtime_snapshot(state);
+    let Some(judge_config) = runtime.llm_judge.as_ref() else {
         return Ok(None);
     };
     let rule_matched = decision.features.matched_rules.iter().any(|name| {
-        state
+        runtime
             .router
             .rules()
             .iter()
@@ -1583,7 +1720,7 @@ async fn invoke_llm_judge(
     let mut judge_model_ids: Vec<ModelId> = vec![judge_model_id.clone()];
     let mut by_provider: std::collections::BTreeMap<String, Vec<ModelId>> =
         std::collections::BTreeMap::new();
-    for m in state
+    for m in runtime
         .router
         .models()
         .iter()
@@ -1596,7 +1733,7 @@ async fn invoke_llm_judge(
     }
     // Sort each provider group by quality ascending (lower quality = cheaper/faster).
     for ids in by_provider.values_mut() {
-        let model_refs: Vec<_> = state.router.models().iter().collect();
+        let model_refs: Vec<_> = runtime.router.models().iter().collect();
         ids.sort_by_key(|id| {
             model_refs
                 .iter()
@@ -1628,7 +1765,7 @@ async fn invoke_llm_judge(
         debug!(model_id = %candidate_id, "trying judge model");
 
         // Look up the actual model config to get the correct provider.
-        let judge_model = state
+        let judge_model = runtime
             .router
             .models()
             .iter()
@@ -1692,7 +1829,8 @@ fn build_judge_session_context(state: &AppState) -> JudgeSessionContext {
 }
 
 fn resource_summary_lines(state: &AppState) -> Vec<String> {
-    state
+    let runtime = runtime_snapshot(state);
+    runtime
         .introspection_snapshots
         .iter()
         .flat_map(|snapshot| {
@@ -1912,8 +2050,8 @@ async fn record_model_attempt(
             timestamp_ms: now_millis(),
             session_id: session_id(headers, request),
             selected_model: ModelId::new(attempt.model_id.as_str()),
-            provider: model.map(|model| model.provider.to_string()),
-            upstream_model: model.map(|model| model.upstream_model.clone()),
+            provider: model.as_ref().map(|model| model.provider.to_string()),
+            upstream_model: model.as_ref().map(|model| model.upstream_model.clone()),
             service_tier: decision.request_controls.service_tier.clone(),
             reasoning_effort: decision.request_controls.reasoning_effort.clone(),
             resource_pools: decision.request_controls.resource_pools.clone(),
@@ -2394,6 +2532,7 @@ mod tests {
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
+                virtual_variants: brouter_config_models::VirtualVariantsConfig::default(),
                 attribute_mappings: BTreeMap::new(),
                 omit_request_fields: Vec::new(),
             },
@@ -2433,6 +2572,7 @@ mod tests {
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
+                virtual_variants: brouter_config_models::VirtualVariantsConfig::default(),
                 attribute_mappings: BTreeMap::new(),
                 omit_request_fields: Vec::new(),
             },
@@ -2451,6 +2591,7 @@ mod tests {
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
+                virtual_variants: brouter_config_models::VirtualVariantsConfig::default(),
                 attribute_mappings: BTreeMap::new(),
                 omit_request_fields: Vec::new(),
             },

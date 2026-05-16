@@ -185,6 +185,10 @@ pub struct MetadataConfig {
     pub max_age_ms: u64,
     #[serde(default = "default_metadata_refresh_on_startup")]
     pub refresh_on_startup: bool,
+    #[serde(default = "default_metadata_refresh_interval_ms")]
+    pub refresh_interval_ms: u64,
+    #[serde(default = "default_refresh_before_expensive_route")]
+    pub refresh_before_expensive_route: bool,
     #[serde(default = "default_allow_stale_on_provider_error")]
     pub allow_stale_on_provider_error: bool,
     #[serde(default = "default_allow_fallback_catalog")]
@@ -199,6 +203,8 @@ impl Default for MetadataConfig {
             strict: false,
             max_age_ms: default_metadata_max_age_ms(),
             refresh_on_startup: default_metadata_refresh_on_startup(),
+            refresh_interval_ms: default_metadata_refresh_interval_ms(),
+            refresh_before_expensive_route: default_refresh_before_expensive_route(),
             allow_stale_on_provider_error: default_allow_stale_on_provider_error(),
             allow_fallback_catalog: default_allow_fallback_catalog(),
             cache_path: None,
@@ -211,6 +217,14 @@ const fn default_metadata_max_age_ms() -> u64 {
 }
 
 const fn default_metadata_refresh_on_startup() -> bool {
+    true
+}
+
+const fn default_metadata_refresh_interval_ms() -> u64 {
+    300_000
+}
+
+const fn default_refresh_before_expensive_route() -> bool {
     true
 }
 
@@ -530,9 +544,20 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub resource_pools: Vec<ResourcePoolConfig>,
     #[serde(default)]
+    pub virtual_variants: VirtualVariantsConfig,
+    #[serde(default)]
     pub attribute_mappings: BTreeMap<String, BTreeMap<String, AttributeRequestMapping>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub omit_request_fields: Vec<String>,
+}
+
+/// Provider-level virtual request-control variants to expose as routeable candidates.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VirtualVariantsConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_tiers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_efforts: Vec<String>,
 }
 
 /// Configured provider resource pool used with live account usage.
