@@ -151,8 +151,8 @@ Built-in profiles available without config: `balanced`, `cheap`, `fast`, `strong
 - `auth_profile` optional string; sshenv profile containing ChatGPT/Codex tokens
 - `auth_vault_path` optional string; sshenv vault path. If omitted, brouter uses `$BROUTER_AUTH_VAULT` or `~/.local/state/brouter/auth/vault`.
 - `introspection` optional live introspection settings
-- `virtual_variants` optional provider-level request-control variants. `service_tiers` and `reasoning_efforts` generate virtual routeable models that share the same upstream model but carry different `latency_class`/`service_tier`/`reasoning_effort` attributes. OpenAI Codex providers default to `service_tiers = ["standard", "priority"]` and `reasoning_efforts = ["low", "medium", "high"]`.
-- `attribute_mappings` optional nested map from attribute name/value to provider request edits. Each mapping can add top-level `request_fields` or remove top-level `omit_request_fields`.
+- `controls` optional declarative provider controls. This is the preferred source of truth for virtual route variants and provider-specific request fields.
+- Legacy top-level `virtual_variants`, `attribute_mappings`, and `omit_request_fields` remain supported and are merged with `controls`.
 
 Provider introspection is generic: adapters translate provider API responses into provider-neutral catalog/account snapshots. Current adapters fetch OpenAI-compatible `/models` metadata, including OpenRouter-style `context_length`, `pricing`, and `supported_parameters` when present, OpenRouter-compatible `/auth/key` credit/account data, and Anthropic `/models` as a partial catalog. Discovered catalog models become routeable automatically. Missing fields continue through the generic resolver to user overrides and the fallback catalog.
 
@@ -178,6 +178,23 @@ refill_at_ms = 1764547200000
 ```
 
 Supported pool kinds include `monetary_credit`, `subscription_allowance`, `token_budget`, `request_budget`, `rate_limit`, and `priority_allowance`. Supported units include `usd`, `tokens`, `requests`, `requests_per_minute`, `tokens_per_minute`, and `percent`.
+
+Provider controls can declare both route variants and request-field translation:
+
+```toml
+[providers.openai.controls.virtual_variants]
+service_tiers = ["standard", "priority"]
+reasoning_efforts = ["low", "medium", "high"]
+
+[providers.openai.controls.attribute_mappings.latency_class.priority.request_fields]
+service_tier = "priority"
+
+[providers.openai.controls.attribute_mappings.latency_class.standard]
+omit_request_fields = ["service_tier"]
+
+[providers.deepseek.controls]
+omit_request_fields = ["reasoning_effort", "thinking"]
+```
 
 `openai-codex` expects brouter-owned sshenv keys such as
 `BROUTER_OPENAI_CODEX_ACCESS_TOKEN`, `BROUTER_OPENAI_CODEX_REFRESH_TOKEN`,
@@ -210,10 +227,14 @@ brouter auth openai-codex login --profile openai-max --headless
 Example provider-specific request mapping:
 
 ```toml
-[providers.openai.attribute_mappings.latency_class.priority.request_fields]
+[providers.openai.controls.virtual_variants]
+service_tiers = ["standard", "priority"]
+reasoning_efforts = ["low", "medium", "high"]
+
+[providers.openai.controls.attribute_mappings.latency_class.priority.request_fields]
 service_tier = "priority"
 
-[providers.openai.attribute_mappings.latency_class.standard]
+[providers.openai.controls.attribute_mappings.latency_class.standard]
 omit_request_fields = ["service_tier"]
 ```
 

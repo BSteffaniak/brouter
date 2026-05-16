@@ -4,7 +4,7 @@
 
 //! Serde-compatible configuration models for brouter.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -544,6 +544,71 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub resource_pools: Vec<ResourcePoolConfig>,
     #[serde(default)]
+    pub controls: ProviderControlsConfig,
+    #[serde(default)]
+    pub virtual_variants: VirtualVariantsConfig,
+    #[serde(default)]
+    pub attribute_mappings: BTreeMap<String, BTreeMap<String, AttributeRequestMapping>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub omit_request_fields: Vec<String>,
+}
+
+impl ProviderConfig {
+    /// Returns virtual variants merged from declarative controls and legacy fields.
+    #[must_use]
+    pub fn effective_virtual_variants(&self) -> VirtualVariantsConfig {
+        let mut variants = self.controls.virtual_variants.clone();
+        append_missing_strings(
+            &mut variants.service_tiers,
+            &self.virtual_variants.service_tiers,
+        );
+        append_missing_strings(
+            &mut variants.reasoning_efforts,
+            &self.virtual_variants.reasoning_efforts,
+        );
+        variants
+    }
+
+    /// Returns request field mappings merged from declarative controls and legacy fields.
+    #[must_use]
+    pub fn effective_attribute_mappings(
+        &self,
+    ) -> BTreeMap<String, BTreeMap<String, AttributeRequestMapping>> {
+        let mut mappings = self.controls.attribute_mappings.clone();
+        for (attribute, values) in &self.attribute_mappings {
+            let target = mappings.entry(attribute.clone()).or_default();
+            for (value, mapping) in values {
+                target
+                    .entry(value.clone())
+                    .and_modify(|existing| existing.merge_missing(mapping))
+                    .or_insert_with(|| mapping.clone());
+            }
+        }
+        mappings
+    }
+
+    /// Returns request fields to omit, merged from declarative controls and legacy fields.
+    #[must_use]
+    pub fn effective_omit_request_fields(&self) -> Vec<String> {
+        let mut fields = self.controls.omit_request_fields.clone();
+        append_missing_strings(&mut fields, &self.omit_request_fields);
+        fields
+    }
+}
+
+fn append_missing_strings(target: &mut Vec<String>, additions: &[String]) {
+    let mut seen = target.iter().cloned().collect::<BTreeSet<_>>();
+    for value in additions {
+        if seen.insert(value.clone()) {
+            target.push(value.clone());
+        }
+    }
+}
+
+/// Declarative provider controls for route variants and provider request fields.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderControlsConfig {
+    #[serde(default)]
     pub virtual_variants: VirtualVariantsConfig,
     #[serde(default)]
     pub attribute_mappings: BTreeMap<String, BTreeMap<String, AttributeRequestMapping>>,
@@ -643,6 +708,21 @@ pub struct AttributeRequestMapping {
     pub request_fields: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub omit_request_fields: Vec<String>,
+}
+
+impl AttributeRequestMapping {
+    fn merge_missing(&mut self, other: &Self) {
+        for field in &other.omit_request_fields {
+            if !self.omit_request_fields.contains(field) {
+                self.omit_request_fields.push(field.clone());
+            }
+        }
+        for (field, value) in &other.request_fields {
+            self.request_fields
+                .entry(field.clone())
+                .or_insert_with(|| value.clone());
+        }
+    }
 }
 
 /// Supported provider kinds.

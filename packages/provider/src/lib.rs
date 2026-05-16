@@ -614,8 +614,8 @@ fn openai_compatible_request_body(
         | None => {}
     }
     // Remove fields that this provider doesn't support.
-    for field_name in &provider.omit_request_fields {
-        object.remove(field_name);
+    for field_name in provider.effective_omit_request_fields() {
+        object.remove(&field_name);
     }
     apply_attribute_mappings(provider, model, &mut body);
     body
@@ -629,12 +629,9 @@ pub(crate) fn apply_attribute_mappings(
     let Some(object) = body.as_object_mut() else {
         return;
     };
+    let mappings = provider.effective_attribute_mappings();
     for (key, value) in &model.attributes {
-        let Some(mapping) = provider
-            .attribute_mappings
-            .get(key)
-            .and_then(|values| values.get(value))
-        else {
+        let Some(mapping) = mappings.get(key).and_then(|values| values.get(value)) else {
             continue;
         };
         for field in &mapping.omit_request_fields {
@@ -1301,6 +1298,7 @@ mod tests {
             auth_vault_path: None,
             introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
             resource_pools: Vec::new(),
+            controls: brouter_config_models::ProviderControlsConfig::default(),
             virtual_variants: brouter_config_models::VirtualVariantsConfig::default(),
             attribute_mappings: BTreeMap::new(),
             omit_request_fields: Vec::new(),
@@ -1343,6 +1341,7 @@ mod tests {
             auth_vault_path: None,
             introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
             resource_pools: Vec::new(),
+            controls: brouter_config_models::ProviderControlsConfig::default(),
             virtual_variants: brouter_config_models::VirtualVariantsConfig::default(),
             attribute_mappings: BTreeMap::new(),
             omit_request_fields: Vec::new(),
@@ -1671,6 +1670,7 @@ mod tests {
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
+                controls: brouter_config_models::ProviderControlsConfig::default(),
                 virtual_variants: brouter_config_models::VirtualVariantsConfig::default(),
                 attribute_mappings: BTreeMap::new(),
                 omit_request_fields: Vec::new(),
@@ -1716,6 +1716,7 @@ mod tests {
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
+                controls: brouter_config_models::ProviderControlsConfig::default(),
                 virtual_variants: brouter_config_models::VirtualVariantsConfig::default(),
                 attribute_mappings: BTreeMap::new(),
                 omit_request_fields: Vec::new(),

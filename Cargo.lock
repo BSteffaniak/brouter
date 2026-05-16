@@ -667,6 +667,7 @@ dependencies = [
  "brouter_introspection_models",
  "brouter_provider_models",
  "brouter_router_models",
+ "serde_json",
  "thiserror 2.0.18",
  "toml 1.1.2+spec-1.1.0",
 ]

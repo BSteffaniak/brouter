@@ -159,24 +159,24 @@ timeout_ms = 60000
 # # [providers.openai_max.introspection]
 # # disabled = false
 # # usage_endpoints = ["https://chatgpt.com/backend-api/codex/usage"]
-# # OpenAI Codex also gets these virtual route variants by default:
-# # [providers.openai_max.virtual_variants]
+# # OpenAI Codex also gets these declarative provider controls by default:
+# # [providers.openai_max.controls.virtual_variants]
 # # service_tiers = ["standard", "priority"]
 # # reasoning_efforts = ["low", "medium", "high"]
 #
-# Attribute mappings translate brouter's generic model attributes into
+# Declarative controls translate brouter's generic route attributes into
 # provider-specific request fields only when the selected model has that
 # attribute value.
-# [providers.openai_max.attribute_mappings.latency_class.priority.request_fields]
+# [providers.openai_max.controls.attribute_mappings.latency_class.priority.request_fields]
 # service_tier = "priority"
 #
-# [providers.openai_max.attribute_mappings.latency_class.standard]
+# [providers.openai_max.controls.attribute_mappings.latency_class.standard]
 # omit_request_fields = ["service_tier"]
 #
-# Provider-level omit_request_fields removes fields from ALL requests to this provider.
+# Provider-level controls.omit_request_fields removes fields from ALL requests to this provider.
 # This is useful for providers that error on certain fields (e.g., reasoning_effort).
-# Manual config here takes priority over auto-detected defaults.
-# [providers.deepseek]
+# Legacy top-level omit_request_fields/attribute_mappings/virtual_variants still work.
+# [providers.deepseek.controls]
 # omit_request_fields = ["reasoning_effort", "thinking"]
 
 [models.fast_local]

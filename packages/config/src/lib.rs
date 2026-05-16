@@ -260,6 +260,7 @@ fn insert_auto_provider(config: &mut BrouterConfig, provider_id: &str, preset: &
         auth_vault_path: None,
         introspection: ProviderIntrospectionConfig::default(),
         resource_pools: Vec::new(),
+        controls: brouter_config_models::ProviderControlsConfig::default(),
         virtual_variants: brouter_config_models::VirtualVariantsConfig::default(),
         attribute_mappings: std::collections::BTreeMap::new(),
         omit_request_fields: Vec::new(),
@@ -288,11 +289,13 @@ fn default_omit_request_fields(_kind: ProviderKind, base_url: Option<&str>) -> V
 /// Priority: Attribute-level > Provider-level Manual > Provider-level Auto-detected
 fn apply_default_omit_request_fields(config: &mut BrouterConfig) {
     for provider in config.providers.values_mut() {
-        // Only auto-detect if manual config is empty
-        if provider.omit_request_fields.is_empty() {
+        // Only auto-detect if declarative and legacy manual config is empty.
+        if provider.controls.omit_request_fields.is_empty()
+            && provider.omit_request_fields.is_empty()
+        {
             let detected = default_omit_request_fields(provider.kind, provider.base_url.as_deref());
             if !detected.is_empty() {
-                provider.omit_request_fields = detected;
+                provider.controls.omit_request_fields = detected;
             }
         }
     }
@@ -308,14 +311,7 @@ fn apply_default_provider_introspection(config: &mut BrouterConfig) {
                 provider.introspection.enabled = true;
                 provider.introspection.account = true;
                 provider.introspection.limits = true;
-                if provider.virtual_variants.service_tiers.is_empty() {
-                    provider.virtual_variants.service_tiers =
-                        vec!["standard".to_string(), "priority".to_string()];
-                }
-                if provider.virtual_variants.reasoning_efforts.is_empty() {
-                    provider.virtual_variants.reasoning_efforts =
-                        vec!["low".to_string(), "medium".to_string(), "high".to_string()];
-                }
+                apply_openai_codex_control_defaults(provider);
             }
             ProviderKind::OpenAiCompatible => {
                 if provider.base_url.is_some() {
@@ -332,6 +328,73 @@ fn apply_default_provider_introspection(config: &mut BrouterConfig) {
                     provider.introspection.catalog = true;
                 }
             }
+        }
+    }
+}
+
+fn apply_openai_codex_control_defaults(provider: &mut ProviderConfig) {
+    if provider.controls.virtual_variants.service_tiers.is_empty()
+        && provider.virtual_variants.service_tiers.is_empty()
+    {
+        provider.controls.virtual_variants.service_tiers =
+            vec!["standard".to_string(), "priority".to_string()];
+    }
+    if provider
+        .controls
+        .virtual_variants
+        .reasoning_efforts
+        .is_empty()
+        && provider.virtual_variants.reasoning_efforts.is_empty()
+    {
+        provider.controls.virtual_variants.reasoning_efforts =
+            vec!["low".to_string(), "medium".to_string(), "high".to_string()];
+    }
+    ensure_control_mapping(
+        provider,
+        "latency_class",
+        "priority",
+        Some((
+            "service_tier",
+            serde_json::Value::String("priority".to_string()),
+        )),
+        &[],
+    );
+    ensure_control_mapping(
+        provider,
+        "latency_class",
+        "standard",
+        None,
+        &["service_tier"],
+    );
+}
+
+fn ensure_control_mapping(
+    provider: &mut ProviderConfig,
+    attribute: &str,
+    value: &str,
+    request_field: Option<(&str, serde_json::Value)>,
+    omit_fields: &[&str],
+) {
+    let mapping = provider
+        .controls
+        .attribute_mappings
+        .entry(attribute.to_string())
+        .or_default()
+        .entry(value.to_string())
+        .or_default();
+    if let Some((field, field_value)) = request_field {
+        mapping
+            .request_fields
+            .entry(field.to_string())
+            .or_insert(field_value);
+    }
+    for field in omit_fields {
+        if !mapping
+            .omit_request_fields
+            .iter()
+            .any(|existing| existing == field)
+        {
+            mapping.omit_request_fields.push((*field).to_string());
         }
     }
 }
@@ -1252,13 +1315,14 @@ fn append_virtual_variants(config: &BrouterConfig, models: &mut Vec<RouteableMod
         let Some(provider) = config.providers.get(model.provider.as_str()) else {
             continue;
         };
-        let mut service_tiers = provider.virtual_variants.service_tiers.clone();
+        let virtual_variants = provider.effective_virtual_variants();
+        let mut service_tiers = virtual_variants.service_tiers;
         if model.attributes.contains_key("latency_class")
             || model.attributes.contains_key("service_tier")
         {
             service_tiers.clear();
         }
-        let reasoning_efforts = provider.virtual_variants.reasoning_efforts.clone();
+        let reasoning_efforts = virtual_variants.reasoning_efforts;
         if service_tiers.is_empty() && reasoning_efforts.is_empty() {
             continue;
         }
@@ -1886,6 +1950,7 @@ mod tests {
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
+                controls: brouter_config_models::ProviderControlsConfig::default(),
                 virtual_variants: brouter_config_models::VirtualVariantsConfig::default(),
                 attribute_mappings: std::collections::BTreeMap::new(),
                 omit_request_fields: Vec::new(),
@@ -1928,10 +1993,14 @@ mod tests {
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
-                virtual_variants: brouter_config_models::VirtualVariantsConfig {
-                    service_tiers: vec!["priority".to_string()],
-                    reasoning_efforts: vec!["high".to_string()],
+                controls: brouter_config_models::ProviderControlsConfig {
+                    virtual_variants: brouter_config_models::VirtualVariantsConfig {
+                        service_tiers: vec!["priority".to_string()],
+                        reasoning_efforts: vec!["high".to_string()],
+                    },
+                    ..brouter_config_models::ProviderControlsConfig::default()
                 },
+                virtual_variants: brouter_config_models::VirtualVariantsConfig::default(),
                 attribute_mappings: std::collections::BTreeMap::new(),
                 omit_request_fields: Vec::new(),
             },
@@ -1992,6 +2061,7 @@ mod tests {
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
+                controls: brouter_config_models::ProviderControlsConfig::default(),
                 virtual_variants: brouter_config_models::VirtualVariantsConfig::default(),
                 attribute_mappings: std::collections::BTreeMap::new(),
                 omit_request_fields: Vec::new(),
@@ -2041,6 +2111,7 @@ mod tests {
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
+                controls: brouter_config_models::ProviderControlsConfig::default(),
                 virtual_variants: brouter_config_models::VirtualVariantsConfig::default(),
                 attribute_mappings: std::collections::BTreeMap::new(),
                 omit_request_fields: Vec::new(),
@@ -2099,6 +2170,7 @@ mod tests {
                 auth_vault_path: None,
                 introspection: brouter_config_models::ProviderIntrospectionConfig::default(),
                 resource_pools: Vec::new(),
+                controls: brouter_config_models::ProviderControlsConfig::default(),
                 virtual_variants: brouter_config_models::VirtualVariantsConfig::default(),
                 attribute_mappings: std::collections::BTreeMap::new(),
                 omit_request_fields: Vec::new(),
