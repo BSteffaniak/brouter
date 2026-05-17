@@ -734,15 +734,20 @@ async fn models(
     headers: HeaderMap,
 ) -> Result<Json<ModelListResponse>, (StatusCode, Json<ErrorResponse>)> {
     authorize(&state, &headers)?;
-    let mut models = vec![ModelObject::new("brouter/auto", "brouter")];
     let runtime = runtime_snapshot(&state);
-    models.extend(
-        runtime
-            .router
-            .models()
-            .iter()
-            .map(|model| ModelObject::new(model.id.as_str(), model.provider.as_str())),
-    );
+    let auto_context_window = runtime
+        .router
+        .models()
+        .iter()
+        .map(|model| model.context_window)
+        .max()
+        .unwrap_or(128_000);
+    let mut models =
+        vec![ModelObject::new("brouter/auto", "brouter").with_context_length(auto_context_window)];
+    models.extend(runtime.router.models().iter().map(|model| {
+        ModelObject::new(model.id.as_str(), model.provider.as_str())
+            .with_context_length(model.context_window)
+    }));
     Ok(Json(ModelListResponse::model_list(models)))
 }
 
@@ -3389,6 +3394,42 @@ mod tests {
             .await
             .expect("request should complete");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn models_include_openrouter_context_metadata() {
+        let upstream = spawn_echo_upstream().await;
+        let config = single_provider_config(upstream);
+        let app = build_app(&config, TelemetryStore::memory());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .expect("models request should build"),
+            )
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let data = body["data"]
+            .as_array()
+            .expect("models response should contain data");
+        let auto = data
+            .iter()
+            .find(|model| model["id"] == "brouter/auto")
+            .expect("auto model should be listed");
+        assert_eq!(auto["context_length"], 128_000);
+        assert_eq!(auto["top_provider"]["context_length"], 128_000);
+        let cheap = data
+            .iter()
+            .find(|model| model["id"] == "cheap_cloud")
+            .expect("configured model should be listed");
+        assert_eq!(cheap["context_length"], 128_000);
+        assert_eq!(cheap["top_provider"]["context_length"], 128_000);
     }
 
     #[tokio::test]

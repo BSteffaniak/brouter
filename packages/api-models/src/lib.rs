@@ -174,6 +174,10 @@ pub struct ModelObject {
     pub object: String,
     pub created: u64,
     pub owned_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_provider: Option<ModelTopProvider>,
 }
 
 impl ModelObject {
@@ -185,6 +189,36 @@ impl ModelObject {
             object: "model".to_string(),
             created: 0,
             owned_by: owned_by.into(),
+            context_length: None,
+            top_provider: None,
+        }
+    }
+
+    /// Adds OpenRouter-compatible context metadata.
+    #[must_use]
+    pub const fn with_context_length(mut self, context_length: u32) -> Self {
+        self.context_length = Some(context_length);
+        self.top_provider = Some(ModelTopProvider::context_length(context_length));
+        self
+    }
+}
+
+/// OpenRouter-compatible top-provider model metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelTopProvider {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<u32>,
+}
+
+impl ModelTopProvider {
+    /// Creates top-provider metadata with context length.
+    #[must_use]
+    pub const fn context_length(context_length: u32) -> Self {
+        Self {
+            context_length: Some(context_length),
+            max_completion_tokens: None,
         }
     }
 }

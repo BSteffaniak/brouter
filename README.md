@@ -41,8 +41,13 @@ conversion, OpenAI-compatible embeddings forwarding, configurable scoring/routin
 `switchy_database`. Successful chat responses include brouter headers such as
 `x-brouter-request-id`, `x-brouter-event-id`, `x-brouter-selected-model`,
 `x-brouter-provider`, `x-brouter-service-tier`, `x-brouter-reasoning-effort`,
-`x-brouter-resource-pools`, `x-brouter-attributes`, and
-`x-brouter-display-badges`. `/v1/brouter/usage` supports `session_id`, `model`,
+`x-brouter-context-window`, `x-brouter-context-tokens`,
+`x-brouter-context-percent`, `x-brouter-resource-pools`,
+`x-brouter-attributes`, and `x-brouter-display-badges`. `/v1/models` includes
+OpenRouter-compatible `context_length`/`top_provider.context_length` metadata;
+`brouter/auto` advertises the largest currently routeable context window, while
+response headers report the exact selected model's runtime window.
+`/v1/brouter/usage` supports `session_id`, `model`,
 `success`, `since_ms`, and `until_ms` query filters. Session event APIs and
 `brouter sessions timeline` expose route decisions, top candidates, judge
 rationales, selected request controls, and provider attempts. Clients can send
